@@ -1,0 +1,133 @@
+name: Publish backend to PyPI
+
+# Builds the pupa-backend wheel + sdist and publishes to PyPI via Trusted
+# Publishing (OIDC) — no stored API token.
+#
+# Trigger: every push to `main` (releases reach `main` by fast-forward from
+# `dev`). The `gate` job only lets the publish run when the version in
+# `backend/pyproject.toml` is NOT yet on PyPI, so ordinary merges that don't
+# bump the version are a harmless no-op (PyPI versions are immutable). When a new
+# version is detected the `test` job must pass before `build-and-publish`
+# uploads and pushes a `v<version>` provenance tag — so a broken build can never
+# reach PyPI, where uploads are immutable and can only be yanked, not replaced.
+#
+# NOTE: PyPI Trusted Publishing matches on repo + this workflow's FILENAME
+# (`publish.yml`) + the `pypi` environment — NOT on the trigger. Keep all three
+# stable or re-register the trusted publisher on PyPI.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/publish.yml"
+
+jobs:
+  gate:
+    name: gate (version is new?)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      should_publish: ${{ steps.check.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read version and check PyPI
+        id: check
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' backend/pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Query PyPI. A brand-new project 404s for every version until its
+          # first release; a published version returns 200. Only these two are
+          # definitive — anything else (transient outage, rate limit, network
+          # error) must FAIL loudly rather than silently skip a release.
+          code="$(curl -s -o /dev/null -w '%{http_code}' --retry 3 --retry-all-errors --max-time 20 "https://pypi.org/pypi/pupa-backend/${version}/json" || echo 000)"
+          case "$code" in
+            404)
+              echo "should_publish=true" >> "$GITHUB_OUTPUT"
+              echo "pupa-backend $version is not on PyPI — will publish." ;;
+            200)
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              echo "pupa-backend $version already on PyPI — nothing to do." ;;
+            *)
+              echo "::error::Could not determine PyPI state for pupa-backend $version (HTTP $code). Failing so the release is not silently skipped — re-run this job."
+              exit 1 ;;
+          esac
+
+  test:
+    name: test (must pass before publish)
+    needs: gate
+    # Only run the gate suite when we're actually about to publish; ordinary
+    # merges are already covered by backend-tests.yml.
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run pytest
+        run: uv run --frozen pytest
+
+  build-and-publish:
+    name: build + publish
+    # needs BOTH: the version must be new AND the tests must pass. If `test`
+    # fails (or is skipped because should_publish is false), this job does not
+    # run — nothing is uploaded to PyPI.
+    needs: [gate, test]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    environment: pypi
+    permissions:
+      # id-token: PyPI Trusted Publishing (OIDC token exchange).
+      # contents: push the v<version> provenance tag.
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel + sdist
+        run: uv build
+
+      - name: Publish to PyPI
+        # Trusted Publishing: the PyPI project must have this repo + workflow
+        # registered as a trusted publisher (Settings → Publishing). No token.
+        # skip-existing guards against a race where the version was published
+        # between the gate check and here.
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: backend/dist/
+          skip-existing: true
+
+      - name: Tag the release
+        working-directory: ${{ github.workspace }}
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists — nothing to do."
+          else
+            git tag "v${VERSION}"
+            git push origin "v${VERSION}"
+          fi

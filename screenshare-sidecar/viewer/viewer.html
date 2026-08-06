@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pupa Screenshare — debug viewer</title>
+<style>
+  body { font-family: -apple-system, sans-serif; padding: 1rem; background: #111; color: #eee; }
+  form { display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem; max-width: 700px; }
+  input { padding: 0.4rem; background: #222; color: #eee; border: 1px solid #444; }
+  button { grid-column: 2; padding: 0.5rem; background: #2a6; color: #fff; border: 0; cursor: pointer; }
+  button:hover { background: #3b7; }
+  video { display: block; margin-top: 1rem; width: 100%; max-width: 1280px; background: #000; border: 1px solid #333; }
+  pre { background: #000; padding: 0.75rem; border: 1px solid #333; max-height: 360px; overflow-y: auto; font-size: 12px; }
+  .row { margin-top: 1rem; }
+  .status { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 3px; background: #333; font-size: 12px; margin-right: 0.5rem; }
+</style>
+</head>
+<body>
+<h2>Pupa screenshare — debug viewer</h2>
+<p>Run the sidecar with <code>pupa-backend screenshare</code>, copy the share id it prints, paste below, hit Connect. Open DevTools (⌥⌘I) for the full event stream.</p>
+<form id="config">
+  <label>Broker WS</label><input id="broker" value="ws://localhost:8004/screenshare/ws" />
+  <label>Share ID</label><input id="shareId" placeholder="paste the UUID the sidecar printed" />
+  <button type="submit">Connect</button>
+</form>
+<div class="row">
+  <span class="status" id="wsStatus">ws: -</span>
+  <span class="status" id="pcStatus">pc: -</span>
+  <span class="status" id="iceStatus">ice: -</span>
+  <span class="status" id="videoStatus">video: -</span>
+</div>
+<video id="remote" autoplay playsinline muted></video>
+<h3>Log</h3>
+<pre id="log"></pre>
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const log = (msg) => {
+  const stamp = new Date().toISOString().slice(11, 23);
+  const line = `[${stamp}] ${msg}`;
+  logEl.textContent += line + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log('[viewer]', line);
+};
+const setStatus = (id, text) => { $(id).textContent = text; };
+
+window.addEventListener('error', (e) => log('window error: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => log('unhandled rejection: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+
+$('config').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const broker = $('broker').value.trim();
+  const shareId = $('shareId').value.trim();
+  if (!shareId) { log('missing share id'); return; }
+  if (!window.RTCPeerConnection) {
+    log('this browser does not expose RTCPeerConnection (secure-context required) — try http://localhost:8005/viewer.html');
+    return;
+  }
+  log(`connecting to ${broker}?role=viewer&share_id=${shareId}`);
+
+  const wsURL = new URL(broker);
+  wsURL.searchParams.set('role', 'viewer');
+  wsURL.searchParams.set('share_id', shareId);
+
+  const ws = new WebSocket(wsURL.toString());
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  let remoteStream = null;
+
+  pc.ontrack = (event) => {
+    log(`pc.ontrack: kind=${event.track.kind} muted=${event.track.muted} state=${event.track.readyState} streams=${event.streams.length}`);
+    const stream = event.streams[0] || new MediaStream([event.track]);
+    if (remoteStream !== stream) {
+      remoteStream = stream;
+      $('remote').srcObject = stream;
+      log(`attached MediaStream(id=${stream.id}, tracks=${stream.getTracks().length}) to <video>`);
+    }
+    event.track.addEventListener('mute', () => log('track muted'));
+    event.track.addEventListener('unmute', () => log('track unmuted'));
+    event.track.addEventListener('ended', () => log('track ended'));
+  };
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'ice', candidate: event.candidate.toJSON() }));
+      log(`> ice ${event.candidate.candidate.split(' ').slice(0, 6).join(' ')}…`);
+    } else {
+      log('local ICE gathering complete');
+    }
+  };
+  pc.onconnectionstatechange = () => { setStatus('pcStatus', 'pc: ' + pc.connectionState); log('pc state: ' + pc.connectionState); };
+  pc.oniceconnectionstatechange = () => { setStatus('iceStatus', 'ice: ' + pc.iceConnectionState); log('ice state: ' + pc.iceConnectionState); };
+
+  ws.onopen = () => { setStatus('wsStatus', 'ws: open'); log('ws connected'); };
+  ws.onerror = (e) => { setStatus('wsStatus', 'ws: error'); log('ws error (check console — usually broker not reachable or wrong share_id)'); };
+  ws.onclose = (e) => { setStatus('wsStatus', `ws: closed (${e.code})`); log(`ws closed code=${e.code} reason=${e.reason || '(none)'}`); };
+  ws.onmessage = async (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (err) { log('non-JSON message: ' + event.data); return; }
+    log('< ' + msg.type + (msg.sdp ? ` (sdp ${msg.sdp.length} chars)` : ''));
+    if (msg.type === 'offer') {
+      // Log the codecs in the offer so we can spot codec mismatches.
+      const codecLines = (msg.sdp.match(/^a=rtpmap:.*/gm) || []).slice(0, 6);
+      codecLines.forEach((line) => log('  ' + line));
+      await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+      log('setRemoteDescription(offer) ok');
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      log('setLocalDescription(answer) ok');
+      ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+      log('> answer (sdp ' + answer.sdp.length + ' chars)');
+    } else if (msg.type === 'ice') {
+      try { await pc.addIceCandidate(msg.candidate); }
+      catch (err) { log('addIceCandidate failed: ' + err); }
+    } else if (msg.type === 'bye') {
+      log('publisher said bye');
+      pc.close();
+      ws.close();
+    }
+  };
+
+  // After 5s, if the video isn't showing frames, dump stats.
+  setTimeout(async () => {
+    const v = $('remote');
+    if (v.videoWidth > 0) {
+      setStatus('videoStatus', `video: ${v.videoWidth}x${v.videoHeight}`);
+      log(`video element has frames: ${v.videoWidth}x${v.videoHeight}`);
+    } else {
+      setStatus('videoStatus', 'video: no frames');
+      log('no frames in <video> after 5s. dumping inbound-rtp stats…');
+      const stats = await pc.getStats();
+      stats.forEach((report) => {
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          log(`  inbound-rtp: packets=${report.packetsReceived} bytes=${report.bytesReceived} frames=${report.framesReceived} decoded=${report.framesDecoded} keyframes=${report.keyFramesDecoded}`);
+        }
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          log(`  active pair: local=${report.localCandidateId} remote=${report.remoteCandidateId} bytesReceived=${report.bytesReceived}`);
+        }
+      });
+    }
+  }, 5000);
+});
+</script>
+</body>
+</html>

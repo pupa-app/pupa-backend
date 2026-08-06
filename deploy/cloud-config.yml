@@ -1,0 +1,94 @@
+# Multi-tenant deployment defaults. Baked into the Docker image at
+# /root/.pupa-backend/config.yml. Same schema as a local
+# ~/.pupa-backend/config.yml (written by `make setup`), so the loader in
+# backend/pupa_config.py treats both identically.
+#
+# Railway env vars override these — shell env always wins. Secrets
+# (ANTHROPIC_API_KEY, AWS_*, OPENROUTER_API_KEY, PUPA_API_KEY, LANGFUSE_*,
+# DATABASE_URL, TAVILY_API_KEY) live in Railway → Variables, never in this file.
+
+default_llm_provider: anthropic
+llm_providers:
+  anthropic:
+    provider: anthropic
+    # ANTHROPIC_API_KEY supplied via Railway env vars.
+  bedrock:
+    provider: bedrock
+    # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION
+    # supplied via Railway env vars.
+# `default_llm_provider` + `llm_providers` only pick the DEFAULT model (used
+# when a client sends no `forwardedProps["llm"]`). Every model in
+# MODEL_REGISTRY (backend/agent.py) — Anthropic, Bedrock, and the OpenRouter
+# menu (GLM/Qwen/MiniMax/Kimi/DeepSeek) — is selectable per-request regardless
+# of this block. To make the full picker actually usable on Railway, supply
+# each provider's creds as env vars (additive, not a switch):
+# ANTHROPIC_API_KEY + AWS_* + OPENROUTER_API_KEY. OpenRouter is registry-driven
+# (one key, no llm_providers entry needed). See docs/deploy.md → "Enabling the
+# full model menu".
+
+# Deployment safety posture — explicit `false`, not defaults of omission.
+# These gates require an explicit "1" to enable; baking them `false` here
+# means an operator can't accidentally turn them on without also setting
+# the corresponding env var on Railway (which we explicitly warn against
+# in docs/deploy.md).
+shell_tool_enabled: false
+screenshare: false
+
+# The claude_code tool spawns a full Claude Code agent (claude -p) as a
+# subprocess on the host. It's read-only by default, but on the shared
+# multi-tenant cloud we pin it OFF — it would run another agent's tool loop on
+# the host with operator credentials, and the CLI isn't part of the cloud image.
+# `claude_code_disabled` is the opt-out gate → PUPA_CLAUDE_CODE_DISABLED=1.
+claude_code_disabled: true
+
+# The claude_code agent loop is a self-hosted, single-tenant capability:
+# subscription-billed (one operator's Claude Pro/Max login) and stateful — each
+# thread pins a live ClaudeSDKClient to one backend instance. Neither fits the
+# shared multi-tenant cloud, so cloud stays on LangGraph and forbids native host
+# tools + any API-billing fallback. (String values → quote them.)
+agent_loop: "deepagents"
+claude_loop_native: "off"
+# claude_loop_allow_api_billing intentionally absent (gate stays off; the
+# api-billing path is not implemented in this build regardless).
+
+# Config-driven MCP servers — off by default in multi-tenant cloud (the block is
+# simply absent). Each entry would launch an external process (stdio) or reach a
+# remote endpoint with operator-supplied credentials, so leave this empty here
+# and wire servers per self-hosted install via ~/.pupa-backend/config.yml.
+# Browser automation (Playwright) is now an ordinary entry here too — no separate
+# flag. Every server's tools are gated behind a single `get_tools(server=...)`
+# tool. See backend/mcp_servers.py.
+# mcp_servers:
+#   atlassian:
+#     command: uvx
+#     args: [mcp-atlassian]
+#     description: Confluence search + page read/write
+#     env:
+#       CONFLUENCE_URL: https://your-domain.atlassian.net/wiki
+#       CONFLUENCE_USERNAME: you@corp.com
+#       CONFLUENCE_API_TOKEN: ${CONFLUENCE_API_TOKEN}
+#   playwright:
+#     command: npx
+#     args: [@playwright/mcp@latest]
+#     description: Browser automation — navigate, click, screenshot
+
+# Agent skills are ON by default for local installs, but pinned OFF in
+# multi-tenant cloud: skill bodies are model-facing instructions and the
+# untrusted-skill / install-from-marketplace mitigations (signing, moderation,
+# per-device isolation) are still a follow-up. `skills_disabled`
+# is the opt-out gate → PUPA_SKILLS_DISABLED=1.
+skills_disabled: true
+
+# Hard requirement: the resolved checkpointer + store must be Postgres.
+# Startup fails loudly if DATABASE_URL is missing or resolves to a different
+# backend. Prevents silent fallback to in-memory (chat history wiped every
+# restart) or SQLite (data dies with Railway's ephemeral filesystem).
+# DATABASE_URL itself is supplied by Railway → reference the Postgres
+# service in the backend service's Variables (${{Postgres.DATABASE_URL}}).
+persistence:
+  require_db_scheme: postgresql
+
+# Tracing is opt-out: on automatically once LANGFUSE_PUBLIC_KEY +
+# LANGFUSE_SECRET_KEY are supplied as Railway env vars; without them the
+# tracer no-ops. Set `langfuse.disabled: true` (→ PUPA_LANGFUSE_DISABLED=1)
+# to force it off while keeping the credentials in the environment.

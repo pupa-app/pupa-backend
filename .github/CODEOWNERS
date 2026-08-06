@@ -1,0 +1,4 @@
+# Default owners for everything in the repo. These owners are requested for
+# review on every pull request. See:
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+*       @pupa-app

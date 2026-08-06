@@ -1,0 +1,78 @@
+name: Backend tests
+
+# Runs the Python backend pytest suite.
+#
+# On pull requests this workflow ALWAYS runs, so the required `pytest` check is
+# always reported — but it only executes the suite when backend code (or this
+# workflow) actually changed; otherwise the job reports success without spending
+# CI. That lets `pytest` stay a REQUIRED check without deadlocking docs-only or
+# sidecar-only PRs: a path-filtered required check would otherwise sit
+# "Expected — waiting for status to be reported" forever and block the merge.
+# Pushes to main/dev keep the path filter (they aren't gated by required checks).
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-tests.yml"
+  pull_request:
+
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need base+head history to diff which paths changed.
+          fetch-depth: 0
+
+      - name: Detect backend changes
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            head='${{ github.event.pull_request.head.sha }}'
+          else
+            base='${{ github.event.before }}'
+            head='${{ github.sha }}'
+          fi
+          # Unknown/empty base (new branch, first push) → run to be safe.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Base commit unavailable — running the suite to be safe."
+            exit 0
+          fi
+          if git diff --name-only "${base}...${head}" -- 'backend/' '.github/workflows/backend-tests.yml' | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Backend changes detected — running the suite."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No backend changes — reporting success without running the suite."
+          fi
+
+      - name: Install uv
+        if: steps.detect.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          # Match the local dev Python; pyproject requires >=3.11.
+          python-version: "3.12"
+
+      # --frozen installs exactly from uv.lock (no re-resolution); the `dev`
+      # extra provides pytest + pytest-asyncio. conftest.py injects dummy AWS
+      # creds, so no real Bedrock/Anthropic secrets are needed in CI.
+      - name: Install dependencies
+        if: steps.detect.outputs.run == 'true'
+        working-directory: backend
+        run: uv sync --frozen --extra dev
+
+      - name: Run pytest
+        if: steps.detect.outputs.run == 'true'
+        working-directory: backend
+        run: uv run --frozen pytest

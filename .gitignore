@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+.python-version
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/*
+!.claude/skills/
+*.swp
+
+# Swift (screenshare sidecar)
+.build/
+build/
+.swiftpm/
+Package.resolved
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+.api-key
+
+# Local shell startup script (personal, not shared)
+backend/shell_startup.local.sh
+
+# Backend runtime artifacts
+backend/sqlite_db
+sqlite_db
+
+# Paired-device token store (per-operator runtime state; contains hashed
+# bearer tokens). Default path is now ~/.pupa-backend/pupa-auth.json (outside
+# the repo); these patterns defensively ignore any stray in-repo copies from
+# an explicit PUPA_AUTH_DB_PATH or a legacy CWD-relative run.
+pupa-auth.json
+pupa-auth.json.tmp
+backend/pupa-auth.json
+backend/pupa-auth.json.tmp
+
+backend/.playwright-mcp
+.playwright-mcp

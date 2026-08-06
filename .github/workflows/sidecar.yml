@@ -1,0 +1,92 @@
+name: Sidecar
+
+# Compiles the macOS screen-share sidecar (Swift / SwiftPM) and runs its test
+# suite if one exists.
+#
+# On pull requests this ALWAYS runs so the required `swift build + test` check is
+# always reported — but it only builds when the sidecar (or this workflow)
+# actually changed; otherwise it reports success immediately. macOS standard
+# runners are free for public repos, so the no-op path is cheap. This lets
+# `swift build + test` stay a REQUIRED check without deadlocking the many PRs
+# that don't touch the sidecar. Pushes keep the path filter.
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "screenshare-sidecar/**"
+      - ".github/workflows/sidecar.yml"
+  pull_request:
+
+concurrency:
+  group: sidecar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: swift build + test
+    # macos-15 ships Xcode 16 / Swift 6, required by swift-tools-version:6.0.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need base+head history to diff which paths changed.
+          fetch-depth: 0
+
+      - name: Detect sidecar changes
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            head='${{ github.event.pull_request.head.sha }}'
+          else
+            base='${{ github.event.before }}'
+            head='${{ github.sha }}'
+          fi
+          # Unknown/empty base (new branch, first push) → build to be safe.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Base commit unavailable — building to be safe."
+            exit 0
+          fi
+          if git diff --name-only "${base}...${head}" -- 'screenshare-sidecar/' '.github/workflows/sidecar.yml' | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Sidecar changes detected — building."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No sidecar changes — reporting success without building."
+          fi
+
+      - name: Swift toolchain
+        if: steps.detect.outputs.run == 'true'
+        working-directory: screenshare-sidecar
+        run: swift --version
+
+      # Cache the resolved WebRTC binary (~50 MB) and build products.
+      - name: Cache SwiftPM build
+        if: steps.detect.outputs.run == 'true'
+        uses: actions/cache@v6
+        with:
+          path: screenshare-sidecar/.build
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('screenshare-sidecar/Package.swift', 'screenshare-sidecar/Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+
+      - name: Build
+        if: steps.detect.outputs.run == 'true'
+        working-directory: screenshare-sidecar
+        run: swift build
+
+      # No test target exists yet. Run the suite when one is added (a Tests/
+      # directory + .testTarget in Package.swift); until then the build above
+      # is the compile-time check.
+      - name: Test
+        if: steps.detect.outputs.run == 'true'
+        working-directory: screenshare-sidecar
+        run: |
+          if [ -d Tests ]; then
+            swift test
+          else
+            echo "No Swift test target present yet — build succeeded; skipping 'swift test'."
+            echo "Add tests under screenshare-sidecar/Tests/ and a .testTarget in Package.swift to enable them."
+          fi

@@ -1,0 +1,43 @@
+# Keep the image small — only `backend/` + `deploy/cloud-config.yml` are
+# needed at runtime.
+
+# Native / non-backend trees
+ios/
+screenshare-sidecar/
+pupa-app/
+pupa-electron/
+
+# Docs and meta
+docs/
+*.md
+LICENSE
+CHANGELOG.md
+
+# VCS / tooling
+.git/
+.github/
+.gitignore
+.gitattributes
+.claude/
+.idea/
+.vscode/
+.DS_Store
+
+# Python build/cache
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+
+# Tests aren't run inside the container
+backend/tests/
+
+# Local config that should never leak into a published image
+.env
+.env.*
+**/pupa-auth.json
+**/*.sqlite
+**/*.db

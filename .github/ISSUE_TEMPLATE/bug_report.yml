@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a problem with pupa-backend
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please do **not** include secrets (API keys,
+        tokens, credentials) in logs or config you paste here.
+        For security vulnerabilities, use the private channel in
+        [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: pupa-backend version
+      description: Output of `pupa-backend --version` (or the value from `GET /auth/config`).
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - pipx / pip from PyPI
+        - one-line install.sh
+        - from a clone (make / uv)
+        - cloud image (Docker / Railway)
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, persistence backend (SQLite / Postgres), LLM provider.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any relevant log output. Redact secrets first.
+      render: shell
