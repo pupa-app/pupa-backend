@@ -1,6 +1,6 @@
 # Pupa backend 
 
-[![pupa-backend](https://img.shields.io/badge/backend-0.0.80-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
+[![pupa-backend](https://img.shields.io/badge/backend-0.0.82-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
 [![screenshare](https://img.shields.io/badge/screenshare-0.0.6-f05138?logo=swift&logoColor=white)](screenshare-sidecar/Sources/PupaScreenshare/Version.swift)
 
 Spin up your own server so a **local agent drives the
