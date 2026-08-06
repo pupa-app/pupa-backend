@@ -20,6 +20,13 @@ on:
     paths:
       - "backend/**"
       - ".github/workflows/publish.yml"
+  # Manual escape hatch: lets you run the gate (and, if the version is new, the
+  # release) without pushing a commit — e.g. re-driving a release after a
+  # transient PyPI failure, or the first release on a fresh repo where the
+  # initial push predates Actions being active. The `gate` job still refuses to
+  # republish a version that is already on PyPI, so this cannot clobber
+  # anything.
+  workflow_dispatch:
 
 jobs:
   gate:
