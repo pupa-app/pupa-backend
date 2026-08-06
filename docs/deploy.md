@@ -94,14 +94,35 @@ Shell env wins over YAML, so `LLM_PROVIDER=bedrock` overrides the YAML's `defaul
 After the deploy is green (Railway → service → URL gives you `https://<svc>.up.railway.app`):
 
 ```bash
+make pair URL=https://<svc>.up.railway.app KEY="$PUPA_API_KEY_RAILWAY" \
+          LABEL="My iPhone" CODE_TTL=3600 DEVICE_TTL=432000
+```
+
+This prints the 8-char code **and renders a scannable QR** encoding a
+`pupa-pair://` deep link with the Railway URL baked in — so the phone doesn't
+have to type either. Open iOS Settings → Backend → Edit and scan it (or paste
+URL + code by hand).
+
+- `CODE_TTL` — how long the bootstrap code stays redeemable. Seconds, `1..86400`
+  (the API rejects anything longer). Default 300.
+- `DEVICE_TTL` — lifetime of the *device token* the code mints. Seconds, no cap.
+  `432000` = 5 days; `2592000` = 30 days. Omit for a token that never expires —
+  fine for your own phone on a LAN backend, not for a shared cloud deploy.
+- `KEY` — that backend's `PUPA_API_KEY`. Only needed when it differs from your
+  local one, which it does for Railway. Shell env wins over
+  `~/.pupa-backend/config.yml`, so this cleanly overrides the local key.
+
+The raw HTTP equivalent, if you'd rather not use `make`:
+
+```bash
 curl -X POST \
-  -H "Authorization: Bearer $PUPA_API_KEY" \
+  -H "Authorization: Bearer $PUPA_API_KEY_RAILWAY" \
   -H "Content-Type: application/json" \
-  -d '{"label":"My iPhone","codeTtlSeconds":600,"deviceTokenTtlSeconds":259200}' \
+  -d '{"label":"My iPhone","codeTtlSeconds":3600,"deviceTokenTtlSeconds":432000}' \
   https://<svc>.up.railway.app/auth/pair/begin
 ```
 
-The response includes an 8-char `code`. Open iOS Settings → Backend → Edit → paste the URL and the code. The token expires after 3 days (`259200` seconds) — re-pair when it lapses. For a longer-lived token (e.g. 30 days) pass `"deviceTokenTtlSeconds":2592000`. Omit the field entirely for a non-expiring token.
+No QR — the response is just JSON with the `code`.
 
 ### 5. (Recommended) Remove the bootstrap key
 

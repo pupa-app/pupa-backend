@@ -86,8 +86,12 @@ tunnel-named:  ## Run the configured Cloudflare *named* tunnel (stable URL on yo
 tunneled:  ## Run backend-tunneled + tunnel together (Ctrl+C stops both)
 	$(MAKE) -j2 backend-tunneled tunnel
 
-pair:  ## Mint a one-time pairing code for a new device. Reads PUPA_API_KEY from env or ~/.pupa-backend/config.yml. Pass LABEL="iPhone" to pre-fill the device label.
-	@cd $(BACKEND) && .venv/bin/python -m pupa_backend.scripts.pair $(if $(LABEL),--label "$(LABEL)",)
+pair:  ## Mint a one-time pairing code + QR. LABEL="iPhone" pre-fills the label; URL=https://... targets a remote deploy; KEY=... is that backend's PUPA_API_KEY; CODE_TTL / DEVICE_TTL are lifetimes in seconds.
+	@cd $(BACKEND) && $(if $(KEY),PUPA_API_KEY="$(KEY)" ,).venv/bin/python -m pupa_backend.scripts.pair \
+		$(if $(LABEL),--label "$(LABEL)",) \
+		$(if $(URL),--public-url "$(URL)",) \
+		$(if $(CODE_TTL),--code-ttl $(CODE_TTL),) \
+		$(if $(DEVICE_TTL),--device-ttl $(DEVICE_TTL),)
 
 mcp:  ## Manage MCP servers in ~/.pupa-backend/config.yml. e.g. make mcp ARGS="add", make mcp ARGS="list", make mcp ARGS="remove atlassian"
 	@cd $(BACKEND) && .venv/bin/python -m pupa_backend.scripts.mcp $(ARGS)

@@ -4,6 +4,23 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.45] — 2026-08-07
+
+### Added
+
+- **`make pair` now takes the flags the underlying CLI always had.** `URL=` for
+  a remote deploy, `KEY=` for that backend's `PUPA_API_KEY`, and `CODE_TTL=` /
+  `DEVICE_TTL=` for the bootstrap-code and device-token lifetimes. Pairing a
+  phone against Railway previously meant a raw `curl` — which returns JSON and
+  therefore no QR code, so the URL and code had to be typed by hand.
+
+### Fixed
+
+- The deploy runbook described the baked cloud config as pinning
+  `langfuse.enabled: true`. No such key exists — tracing is opt-out, active as
+  soon as `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are present, with
+  `langfuse.disabled` as the only switch.
+
 ## [0.0.44] — 2026-08-06
 
 Baseline entry. This repository was reset at this commit; entries above it

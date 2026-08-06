@@ -33,7 +33,7 @@ contract. Runs locally or in the cloud (Railway + Postgres).
 
 | Component | Version | Where |
 |---|---|---|
-| **Backend** (Python · FastAPI · Claude Code + deepagents/LangGraph harnesses) | `0.0.81` | [`backend/pyproject.toml`](backend/pyproject.toml) |
+| **Backend** (Python · FastAPI · Claude Code + deepagents/LangGraph harnesses) | `0.0.82` | [`backend/pyproject.toml`](backend/pyproject.toml) |
 | **Screen-share sidecar** (Swift CLI, macOS-only, optional) | `0.0.6` | [`screenshare-sidecar/Sources/PupaScreenshare/Version.swift`](screenshare-sidecar/Sources/PupaScreenshare/Version.swift) |
 
 Patch-only bumps (`0.0.X` → `0.0.X+1`). See
