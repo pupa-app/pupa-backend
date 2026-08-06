@@ -9,7 +9,7 @@ Runtime config layout in the cloud:
 
 | Source | What it sets | Where |
 |---|---|---|
-| `deploy/cloud-config.yml` (baked into image) | Same schema as a local `~/.pupa-backend/config.yml`. Lists both supported providers under `llm_providers` with `default_llm_provider: anthropic`. Pins the multi-tenant safety posture (`shell_tool_enabled: false`, `screenshare: false`, no `mcp_servers` block) and `langfuse.enabled: true`. | `/root/.pupa-backend/config.yml` inside container |
+| `deploy/cloud-config.yml` (baked into image) | Same schema as a local `~/.pupa-backend/config.yml`. Lists both supported providers under `llm_providers` with `default_llm_provider: anthropic`. Pins the multi-tenant safety posture (`shell_tool_enabled: false`, `screenshare: false`, no `mcp_servers` block). Tracing needs no key here — it is opt-out, active as soon as the Langfuse credentials are present in the environment. | `/root/.pupa-backend/config.yml` inside container |
 | Railway env vars | Secrets (LLM creds, `PUPA_API_KEY`, Langfuse keys, optional Tavily) and `DATABASE_URL` (auto-injected by the Postgres plugin). Shell env overrides YAML — see [`backend/pupa_backend/pupa_config.py`](../backend/pupa_backend/pupa_config.py). | Railway UI → Variables |
 
 ## One-time setup
