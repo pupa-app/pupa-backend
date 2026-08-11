@@ -14,7 +14,7 @@ Report privately via either channel:
 
 - GitHub's [private vulnerability reporting](https://github.com/pupa-app/pupa-backend/security/advisories/new)
   ("Report a vulnerability" under the repository's **Security** tab), or
-- email **pupa-app-help@proton.me**.
+- email **hello@pupa-backend.uk**.
 
 We aim to acknowledge a report within a few days and will coordinate a fix and
 disclosure timeline with you.
