@@ -4,6 +4,17 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.83] — 2026-08-11
+
+### Added
+
+- **Per-turn extended-thinking level for the Claude Code loop.** The client
+  picks a level via `forwardedProps.llm.thinking` (`auto`/`off`/`low`/`medium`/
+  `high`); the loop maps it to `ClaudeAgentOptions.thinking` (`adaptive` /
+  `disabled` / `enabled` with an ascending token budget). No key → option unset
+  (CLI default), so existing threads are unchanged. `GET /harnesses` now reports
+  a `thinking` menu per harness (`[]` for harnesses without the capability).
+
 ## [0.0.45] — 2026-08-07
 
 ### Added

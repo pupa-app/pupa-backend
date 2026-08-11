@@ -52,6 +52,9 @@ class AgentHarness(Protocol):
     def models(self) -> list[dict]: ...
     def tools(self) -> list[dict]: ...
     def permission_schema(self) -> list[dict]: ...
+    # Optional: extended-thinking levels this harness supports (`[]` = none). The
+    # discovery route reads it via getattr, so a harness may omit the method.
+    def thinking(self) -> list[dict]: ...
 
 
 class ClaudeCodeHarness:
@@ -71,6 +74,11 @@ class ClaudeCodeHarness:
         from pupa_backend.harnesses.claude.models import loop_model_menu
 
         return loop_model_menu()
+
+    def thinking(self) -> list[dict]:
+        from pupa_backend.harnesses.claude.thinking import loop_thinking_menu
+
+        return loop_thinking_menu()
 
     def tools(self) -> list[dict]:
         # No static backend-tool registry — the loop's power is Claude Code's
