@@ -10,6 +10,7 @@ Response shape per harness::
 
     {"id", "label", "isDefault",
      "models":      [{"provider", "modelId", "label"}],
+     "thinking":    [{"level", "label"}],   # extended-thinking levels ([] = none)
      "tools":       [{"name", "description", "enabledByEnv"}],
      "permissions": [{"key", "type", "label", ...}]}
 
@@ -38,6 +39,8 @@ async def list_harnesses(request: Request) -> list[dict]:
             "label": h.label,
             "isDefault": h.id == default_id,
             "models": h.models(),
+            # Optional per-harness capability — deepagents omits it.
+            "thinking": getattr(h, "thinking", list)() or [],
             "tools": h.tools(),
             "permissions": h.permission_schema(),
         }

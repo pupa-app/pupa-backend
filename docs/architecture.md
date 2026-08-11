@@ -409,6 +409,15 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   `claude-*` id is accepted so a pinned config / stale client still works. The
   model the SDK reports is logged on the first assistant message and stored on the
   session (`sdk_model`).
+- **Thinking.** Extended-thinking level is also selected per turn via
+  `forwardedProps.llm.thinking`
+  ([`resolve_thinking`](../backend/pupa_backend/harnesses/claude/thinking.py)):
+  `auto` → `{type: adaptive}` (model decides), `off` → `{type: disabled}`,
+  `low`/`medium`/`high` → `{type: enabled, budget_tokens: …}` (ascending budget),
+  spread into `ClaudeAgentOptions.thinking`. No key / unknown value → option left
+  unset (CLI default), so existing threads are unchanged. `GET /harnesses`
+  reports the level menu under `thinking` for the `claude_code` harness
+  (deepagents omits it → `[]`).
 
 **Billing is subscription-only and fail-closed**
 ([`env.py`](../backend/pupa_backend/harnesses/claude/env.py)). The SDK wraps the `claude` CLI and

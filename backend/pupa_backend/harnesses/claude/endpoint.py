@@ -53,6 +53,7 @@ from .env import (
 )
 from .frontend_tools import SERVER_NAME, build_frontend_mcp, frontend_qualified_names
 from .models import LOOP_MODEL_ALIASES, is_loop_model
+from .thinking import resolve_thinking
 from .gate import (
     auto_approved_native_tools,
     interpret_approval,
@@ -377,6 +378,11 @@ def _options_for(
         # `CLAUDE_CODE_MODEL` config/env default, else Opus 4.8. See
         # `_resolve_loop_model`.
         model=_resolve_loop_model(input),
+        # Per-request extended-thinking level (iOS `forwardedProps.llm.thinking`).
+        # Spread as `thinking=` only when a known level was picked; otherwise the
+        # option stays unset and the CLI/subscription default applies. See
+        # `resolve_thinking`.
+        **(resolve_thinking(input) or {}),
         resume=resume_id,
         # Stream assistant text token-by-token: the SDK then yields partial
         # `StreamEvent`s that `_pump` maps to incremental `TextMessageContent`
