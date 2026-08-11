@@ -238,12 +238,12 @@ bakes it into the QR code, so the app connects straight away.
   uses the Tailscale address.
 - **[Cloudflare](https://www.cloudflare.com/products/tunnel/) tunnel** — expose
   the backend over HTTPS without opening a port:
-  - *Quick tunnel* (no signup, throwaway URL): run `make tunnel`
-    (`cloudflared tunnel --url http://localhost:8004`) alongside
-    `make backend-tunneled`.
+  Set `connectivity: cloudflared`; `pupa-backend run` starts `cloudflared` for
+  you.
+  - *Quick tunnel* (no signup): throwaway `trycloudflare.com` URL, changes on
+    every restart — re-pair each time.
   - *Named tunnel* (stable URL on your own domain): configure once with
-    `make setup` (cloudflared login + your domain), then `make tunnel-named`. Set
-    `connectivity: cloudflared`.
+    `pupa-backend setup` (cloudflared login + your domain); pair once.
 
 Auth still applies whichever path you use — the app carries its paired-device
 token (see [Auth model](#auth-model)). For a remote deployment you can skip

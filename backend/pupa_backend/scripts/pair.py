@@ -89,7 +89,7 @@ def _backend_public_url() -> str:
         if not _TUNNEL_URL_FILE.exists():
             sys.exit(
                 "cloudflared tunnel URL not found.\n"
-                "Start the backend first (`make backend`) — it auto-starts the tunnel."
+                "Start the backend first (`pupa-backend run`) — it auto-starts the tunnel."
             )
         return _TUNNEL_URL_FILE.read_text().strip()
 

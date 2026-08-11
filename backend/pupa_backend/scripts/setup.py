@@ -656,7 +656,7 @@ def main() -> None:
         "How will your iPhone reach the backend?",
         [
             ("tailscale", "Tailscale — stable private mesh (free, recommended for remote use)"),
-            ("cloudflared", "Cloudflare tunnel — run `make tunnel` before pairing (URL changes on restart)"),
+            ("cloudflared", "Cloudflare tunnel — `pupa-backend run` starts it (quick-tunnel URL changes on restart)"),
             ("localhost", "Localhost — same machine only"),
         ],
         default=existing_conn,
@@ -712,11 +712,11 @@ def main() -> None:
             hostname = cf_block["hostname"]
             print()
             print(f"  {_D}Named tunnel ready. `pupa-backend run` starts it for you")
-            print(f"  (or run it standalone with `make tunnel-named`).{_X}")
+            print(f"  (or run it standalone with `cloudflared tunnel run {cf_block['tunnel']}`).{_X}")
             print()
         else:
             print(f"  {_D}Cloudflare quick tunnel — Cloudflare provides HTTPS, no certificate needed.")
-            print(f"  Before pairing: run `make tunnel` in another terminal, then `make pair`.")
+            print(f"  `pupa-backend run` starts the tunnel; then `pupa-backend pair`.")
             print(f"  Note: the tunnel URL changes on every restart — you will need to re-pair.{_X}")
             print()
     else:  # localhost
@@ -786,7 +786,7 @@ def main() -> None:
         if cf:
             backend_url = f"https://{cf['hostname']}"
         else:
-            backend_url = "https://<dynamic>.trycloudflare.com  (see `make tunnel`)"
+            backend_url = "https://<dynamic>.trycloudflare.com  (printed on run)"
     else:
         protocol = "https" if "tls" in config else "http"
         effective_hostname = config.get("tls", {}).get("hostname") or hostname or "localhost"
