@@ -115,13 +115,28 @@ def _forward(label: str, rest: list[str], target) -> int:
         sys.argv = saved
 
 
+def _local_backend_url() -> str:
+    """Where the backend listens on *this* machine.
+
+    A configured `tls.cert` doesn't settle it: under `tailscale serve --https`
+    tailscaled terminates TLS and the backend serves plain HTTP on loopback, so
+    posting `https://` there just logs "Invalid HTTP request received".
+    """
+    from pupa_backend.tailscale_proxy import cert_domain, should_proxy
+
+    tls_local = bool(os.environ.get("PUPA_TLS_CERT")) and not (
+        should_proxy() and cert_domain()
+    )
+    scheme = "https" if tls_local else "http"
+    return f"{scheme}://localhost:{os.environ.get('PORT', '8004')}"
+
+
 def _pair(rest: list[str]) -> int:
     from pupa_backend.scripts.pair import main as pair_main
 
     if "BACKEND_URL" not in os.environ:
         _load_config()
-        scheme = "https" if os.environ.get("PUPA_TLS_CERT") else "http"
-        os.environ.setdefault("BACKEND_URL", f"{scheme}://localhost:8004")
+        os.environ.setdefault("BACKEND_URL", _local_backend_url())
     return _forward("pair", rest, pair_main)
 
 
