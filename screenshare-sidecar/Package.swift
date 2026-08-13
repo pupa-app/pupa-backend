@@ -17,7 +17,7 @@ let package = Package(
         // stasel/WebRTC is a SwiftPM-packaged wrapper around the official
         // Google `WebRTC.xcframework`. Adds ~50 MB to the build but keeps the
         // Pupa iOS app on SPM-only (no CocoaPods).
-        .package(url: "https://github.com/stasel/WebRTC.git", from: "137.0.0"),
+        .package(url: "https://github.com/stasel/WebRTC.git", from: "151.0.0"),
     ],
     targets: [
         .executableTarget(
