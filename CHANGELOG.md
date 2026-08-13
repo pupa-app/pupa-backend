@@ -4,6 +4,33 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.84] — 2026-08-12
+
+### Fixed
+
+- **Tailscale deploys are reachable again on macOS.** macOS gates connections to
+  `0.0.0.0`-bound sockets behind the Local Network privacy grant; without it
+  nothing reached the backend — not the phone, not `pupa-backend pair` on the
+  same machine (SYNs stalled in `SYN_RCVD`). With `connectivity: tailscale` the
+  backend now binds `127.0.0.1` and publishes itself to the tailnet via
+  `tailscale serve`, torn down on shutdown. When the tailnet has HTTPS enabled,
+  serve terminates TLS on :443 with a real auto-renewing Let's Encrypt cert for
+  the MagicDNS name and the backend speaks plain HTTP on loopback — **the
+  device pairs against a normally-trusted URL with no cert fingerprint at all**.
+  Without tailnet HTTPS it falls back to raw-TCP passthrough (self-signed cert
+  end-to-end, fingerprint pinned) and logs how to enable HTTPS.
+  `PUPA_TAILSCALE_SERVE=0` opts out, `=tcp`/`=https` forces a mode, and
+  `PUPA_HOST` overrides the bind address.
+- **Self-signed certs iOS will actually accept.** `pupa-backend setup` minted
+  10-year certs; Apple refuses any TLS server cert valid for more than 398 days
+  and any cert without the `serverAuth` EKU, rejecting the connection *before*
+  the client's fingerprint pinning runs — pairing failed with "the backend
+  refused a secure connection". New certs are 397 days with the EKU set, and
+  startup warns when the configured cert is over-long, expired, or within 30
+  days of expiry. **Existing tailscale/localhost setups must re-run
+  `pupa-backend setup` and re-pair their devices** (the cert, and so the pinned
+  fingerprint, changes).
+
 ## [0.0.83] — 2026-08-11
 
 ### Added

@@ -274,19 +274,43 @@ def main() -> None:
     for `python -m pupa_backend`."""
     import uvicorn
 
-    tls_cert = os.getenv("PUPA_TLS_CERT")
-    tls_key = os.getenv("PUPA_TLS_KEY")
-    ssl_kwargs: dict = {}
-    if tls_cert and tls_key:
-        ssl_kwargs = {"ssl_certfile": tls_cert, "ssl_keyfile": tls_key}
-        logger.info("TLS enabled — cert=%s key=%s", tls_cert, tls_key)
-
     # Railway (and most PaaS providers) inject the port to bind via $PORT.
     # Local dev keeps the historic 8004 when the var is unset.
     port = int(os.getenv("PORT", "8004"))
-    uvicorn.run(
-        "pupa_backend.app:app", host="0.0.0.0", port=port, reload=False, **ssl_kwargs
-    )
+
+    # With `connectivity: tailscale`, let tailscaled forward the tailnet into a
+    # loopback-bound listener — a wildcard bind is unreachable on macOS without
+    # the Local Network privacy grant. See tailscale_proxy.py.
+    from pupa_backend.tailscale_proxy import bind_host, start_serve_proxy
+
+    proxy = start_serve_proxy(port)
+
+    tls_cert = os.getenv("PUPA_TLS_CERT")
+    tls_key = os.getenv("PUPA_TLS_KEY")
+    ssl_kwargs: dict = {}
+    if proxy is not None and proxy.terminates_tls:
+        # tailscaled holds a real, auto-renewing cert for the MagicDNS name and
+        # proxies plain HTTP here over loopback — serving our own TLS underneath
+        # it would only break that hop.
+        logger.info("TLS handled by tailscale serve — backend speaks HTTP on loopback.")
+    elif tls_cert and tls_key:
+        ssl_kwargs = {"ssl_certfile": tls_cert, "ssl_keyfile": tls_key}
+        logger.info("TLS enabled — cert=%s key=%s", tls_cert, tls_key)
+        from pupa_backend.tls_check import warn_unusable_cert
+
+        warn_unusable_cert(tls_cert)
+
+    try:
+        uvicorn.run(
+            "pupa_backend.app:app",
+            host=bind_host(proxied=proxy is not None),
+            port=port,
+            reload=False,
+            **ssl_kwargs,
+        )
+    finally:
+        if proxy is not None:
+            proxy.stop()
 
 
 if __name__ == "__main__":

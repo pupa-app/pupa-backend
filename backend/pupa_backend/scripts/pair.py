@@ -76,6 +76,20 @@ def _cert_fingerprint() -> str | None:
 _TUNNEL_URL_FILE = Path.home() / ".pupa-backend" / "tunnel_url"
 
 
+def _tailnet_https_url() -> str | None:
+    """The `https://<magicdns>` URL when `tailscale serve` is terminating TLS.
+
+    In that mode the cert is a real, publicly-trusted one held by tailscaled, so
+    the device needs no fingerprint — and the URL carries no port (:443).
+    """
+    from pupa_backend.tailscale_proxy import cert_domain, should_proxy
+
+    if not should_proxy():
+        return None
+    domain = cert_domain()
+    return f"https://{domain}" if domain else None
+
+
 def _backend_public_url() -> str:
     """Derive the URL the phone should use based on the configured connectivity."""
     connectivity = os.environ.get("PUPA_CONNECTIVITY", "")
@@ -203,6 +217,10 @@ def main() -> None:
     if args.public_url:
         public_url = args.public_url.rstrip("/")
         fp: str | None = None
+    elif tailnet_url := _tailnet_https_url():
+        # tailscaled terminates TLS with a trusted cert — nothing to pin.
+        public_url = tailnet_url
+        fp = None
     else:
         public_url = _backend_public_url()
         fp = _cert_fingerprint()
@@ -224,17 +242,19 @@ def main() -> None:
     print(f"  expires at  : {expires}")
     if fp:
         print(f"  cert SHA-256: {fp}")
-    print(f"  pair url    : {pair_url}")
     print("")
-    print("  Option A — deep link (easiest):")
-    print("    AirDrop / Messages the 'pair url' above to your iPhone and tap it.")
+    fields = "the URL, the code, and the cert fingerprint" if fp else "the URL and the code"
+    print("  Option A — scan QR (easiest):")
+    print("    iOS Settings → Backend → Pair via QR, then scan. Fills in")
+    print(f"    {fields} together.")
+    _print_qr(pair_url)
     print("")
     print("  Option B — manual entry:")
     print("    iOS Settings → Backend → Edit → fill in URL + code + cert fingerprint.")
     print("")
-    print("  Option C — scan QR:")
-    _print_qr(pair_url)
-    print("  iOS Settings → Backend → Pair via QR, then scan.")
+    print("  (The `pupa-pair://` scheme is deliberately unregistered in the app, so")
+    print("   sending this link to the device and tapping it does nothing — the QR")
+    print("   is the only automatic path.)")
     print("")
 
 

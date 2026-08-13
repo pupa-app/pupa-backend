@@ -386,6 +386,10 @@ def _check_claude_subscription() -> tuple[bool, str]:
     )
 
 
+# Apple's cap for TLS server certs is 398 days; stay a day under it.
+CERT_VALIDITY_DAYS = 397
+
+
 def _generate_tls_cert(hostname: str) -> tuple[Path, Path, str]:
     """Generate a self-signed CA + server cert in ~/.pupa-backend/tls/.
 
@@ -432,10 +436,20 @@ def _generate_tls_cert(hostname: str) -> tuple[Path, Path, str]:
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=3650))
+        # Apple rejects TLS server certs valid for more than 398 days
+        # (iOS 13+ / macOS 10.15+) — a longer cert is refused outright, before
+        # the client's fingerprint pinning ever runs. Re-run `pupa-backend
+        # setup` before it lapses; that mints a new cert and you re-pair.
+        .not_valid_after(now + datetime.timedelta(days=CERT_VALIDITY_DAYS))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(
             x509.SubjectAlternativeName(san_dns + san_ip),
+            critical=False,
+        )
+        # Also an Apple requirement: TLS server certs must carry the
+        # id-kp-serverAuth EKU.
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
             critical=False,
         )
         .sign(key, hashes.SHA256())
@@ -678,19 +692,39 @@ def main() -> None:
             print(f"  {_R}[!] Tailscale not detected — install and start it first.{_X}")
             print(f"  {_D}    https://tailscale.com/download{_X}")
             print()
-        hostname = _ask(
-            "Hostname/IP to embed in certificate (MagicDNS name recommended)",
-            default=existing.get("PUPA_HOSTNAME", ts_default),
-        )
-        print(f"  {_D}Generating self-signed certificate…{_X}", end=" ", flush=True)
-        cert_path, key_path, fingerprint = _generate_tls_cert(hostname)
-        print(f"{_G}done.{_X}")
-        config["tls"] = {
-            "cert": str(cert_path),
-            "key": str(key_path),
-            "hostname": hostname,
-            "cert_fingerprint": fingerprint,
-        }
+        from pupa_backend.tailscale_proxy import cert_domain
+
+        tailnet_https = cert_domain()
+        print()
+        print(f"  {_D}`pupa-backend run` binds 127.0.0.1 and publishes it to your{_X}")
+        print(f"  {_D}tailnet with `tailscale serve` — a 0.0.0.0 bind is unreachable{_X}")
+        print(f"  {_D}on macOS without the Local Network permission.{_X}")
+        print()
+        if tailnet_https:
+            hostname = tailnet_https
+            print(f"  {_G}✓ tailnet HTTPS is on — serve terminates TLS with a real{_X}")
+            print(f"  {_G}  Let's Encrypt cert for {hostname}.{_X}")
+            print(f"  {_D}  No self-signed cert, no fingerprint to type when pairing.{_X}")
+        else:
+            print(f"  {_Y}[!] tailnet HTTPS is off, so the backend must serve a{_X}")
+            print(f"  {_Y}    self-signed cert — iOS often refuses those outright.{_X}")
+            print(f"  {_D}    Enable it (one click, free) for a trusted cert:{_X}")
+            print(f"  {_C}    https://login.tailscale.com/admin/dns{_X}")
+            print(f"  {_D}    → HTTPS Certificates → Enable HTTPS, then re-run setup.{_X}")
+            print()
+            hostname = _ask(
+                "Hostname/IP to embed in certificate (MagicDNS name recommended)",
+                default=existing.get("PUPA_HOSTNAME", ts_default),
+            )
+            print(f"  {_D}Generating self-signed certificate…{_X}", end=" ", flush=True)
+            cert_path, key_path, fingerprint = _generate_tls_cert(hostname)
+            print(f"{_G}done.{_X}")
+            config["tls"] = {
+                "cert": str(cert_path),
+                "key": str(key_path),
+                "hostname": hostname,
+                "cert_fingerprint": fingerprint,
+            }
     elif connectivity == "cloudflared":
         print()
         existing_cf = existing_yaml.get("cloudflared") or {}
@@ -787,6 +821,9 @@ def main() -> None:
             backend_url = f"https://{cf['hostname']}"
         else:
             backend_url = "https://<dynamic>.trycloudflare.com  (printed on run)"
+    elif connectivity == "tailscale" and "tls" not in config:
+        # tailscaled terminates TLS on :443 with a trusted cert.
+        backend_url = f"https://{hostname}"
     else:
         protocol = "https" if "tls" in config else "http"
         effective_hostname = config.get("tls", {}).get("hostname") or hostname or "localhost"

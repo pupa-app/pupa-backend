@@ -701,11 +701,36 @@ at startup. Shell env always wins. The schema covers:
   checkpointer + store config (env wins via `DATABASE_URL` /
   `PUPA_REQUIRE_DB_SCHEME`).
 - `tls.cert` / `tls.key` — paths to a self-signed cert for local
-  HTTPS. When set, `app.py` starts uvicorn with TLS.
+  HTTPS. When set, `app.py` starts uvicorn with TLS. The cert `setup` mints is
+  **397 days** and carries the `serverAuth` EKU: Apple clients refuse a TLS
+  server cert valid for more than 398 days or missing that EKU, and they refuse
+  it *before* the app's fingerprint pinning runs, so the failure surfaces as a
+  generic "refused a secure connection". Startup warns when the configured cert
+  breaks those rules or is near expiry; renewing means re-running
+  `pupa-backend setup` and re-pairing (new cert ⇒ new pinned fingerprint).
 - `connectivity` (`tailscale` / `cloudflared` / `localhost`) — how the
   phone reaches the backend (→ `PUPA_CONNECTIVITY`). With `cloudflared`,
   `app.py` starts a tunnel at boot as a managed child process (terminated
   on shutdown): a **named** tunnel if one is configured, else a quick tunnel.
+  With `tailscale`, `app.py` binds **`127.0.0.1`** and registers a
+  `tailscale serve` forward at boot
+  ([`tailscale_proxy.py`](../backend/pupa_backend/tailscale_proxy.py)),
+  removing it on shutdown. This exists because macOS gates connections to
+  `0.0.0.0`-bound sockets behind the Local Network privacy grant; without it
+  *nothing* reaches the backend, including `pupa-backend pair` on the same
+  machine. Two modes, chosen by whether the tailnet has HTTPS enabled
+  (`tailscale status --json` → `CertDomains`):
+  - **https** — `serve --https=443 http://127.0.0.1:<port>`. tailscaled
+    terminates TLS with an auto-renewing Let's Encrypt cert for the MagicDNS
+    name; the backend serves plain HTTP and `pupa-backend pair` publishes
+    `https://<magicdns>` with **no fingerprint**. Preferred: iOS refuses
+    self-signed certs before the client's pinning delegate runs.
+  - **tcp** — `serve --tcp=<port> tcp://127.0.0.1:<port>`, raw passthrough.
+    The backend serves its self-signed cert end-to-end and the client pins the
+    fingerprint.
+
+  `PUPA_TAILSCALE_SERVE=0` opts out; `=tcp` / `=https` forces a mode;
+  `PUPA_HOST` overrides the bind address.
 - `cloudflared.hostname` / `cloudflared.tunnel` — set only for a Cloudflare
   **named** tunnel on the operator's own domain (→ `PUPA_CLOUDFLARED_HOSTNAME`
   / `PUPA_CLOUDFLARED_TUNNEL`). The hostname gives a **stable** public URL
