@@ -471,18 +471,20 @@ async def retire(thread_id: str) -> None:
         else:
             pump = session.pump_task
             if pump is not None and not pump.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(pump), timeout=retire_drain_timeout()
-                    )
-                except asyncio.TimeoutError:
+                # `asyncio.wait` (not `wait_for(shield(...))`): it neither cancels
+                # the pump on timeout nor re-raises its outcome. A pump that was
+                # cancelled elsewhere would otherwise surface CancelledError —
+                # a BaseException that escapes `except Exception` and would fail
+                # the user's POST on what is meant to be best-effort teardown.
+                done, _pending = await asyncio.wait(
+                    {pump}, timeout=retire_drain_timeout()
+                )
+                if not done:
                     logger.info(
                         "claude_code loop: retire drain timed out thread_id=%s — "
                         "tearing down anyway",
                         thread_id,
                     )
-                except Exception:  # noqa: BLE001 — the pump's own failure is its to report
-                    logger.debug("claude_code loop: retire drain failed", exc_info=True)
 
     await remove(thread_id, session)
 

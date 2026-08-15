@@ -130,10 +130,46 @@ async def test_retire_is_bounded_when_the_pump_never_settles(
 
     assert client.events == ["interrupt", "disconnect"]
     assert registry.get("t-retire-bounded") is None
-    # `cancel()` is requested, not awaited, by dispose() — wait for it to land
-    # rather than sampling a task mid-cancellation.
-    with pytest.raises(asyncio.CancelledError):
-        await session.pump_task
+    # `cancel()` is requested, not awaited, by dispose() — give it a moment to
+    # land rather than sampling a task mid-cancellation.
+    await asyncio.wait({session.pump_task}, timeout=1.0)
+    assert session.pump_task.cancelled()
+
+
+async def test_retire_survives_a_pump_cancelled_from_elsewhere() -> None:
+    """A pump already cancelled must not turn teardown into a failed request.
+
+    `CancelledError` is a BaseException: awaiting the pump in a way that re-raises
+    it would escape the best-effort teardown and fail the user's new-turn POST.
+    """
+    client = _FakeClient()
+    session = _parked_session("t-retire-cancelled-pump", client)
+    session.pump_task = asyncio.ensure_future(asyncio.Event().wait())
+    await asyncio.sleep(0)
+    session.pump_task.cancel()
+
+    await asyncio.wait_for(registry.retire("t-retire-cancelled-pump"), timeout=2.0)
+
+    assert client.events == ["interrupt", "disconnect"]
+    assert registry.get("t-retire-cancelled-pump") is None
+
+
+async def test_retire_survives_a_pump_that_raised() -> None:
+    """A pump that died with an error is its own business — teardown still wins."""
+    client = _FakeClient()
+    session = _parked_session("t-retire-failed-pump", client)
+
+    async def _boom() -> None:
+        await client.interrupted.wait()
+        raise RuntimeError("pump exploded")
+
+    session.pump_task = asyncio.ensure_future(_boom())
+
+    await asyncio.wait_for(registry.retire("t-retire-failed-pump"), timeout=2.0)
+
+    assert client.events == ["interrupt", "disconnect"]
+    assert registry.get("t-retire-failed-pump") is None
+    assert isinstance(session.pump_task.exception(), RuntimeError)
 
 
 async def test_retire_survives_a_client_that_cannot_interrupt() -> None:
@@ -262,7 +298,12 @@ async def test_new_turn_retires_the_parked_session_gracefully(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = asyncio.ensure_future(client.post("/", json=_body("wake-thread", "r1")))
-        await asyncio.sleep(0.05)  # let the first turn park in receive_response
+        # Poll rather than sleep a fixed slice — a slow runner must not decide
+        # whether the second POST sees a live session.
+        for _ in range(200):
+            if registry.get("wake-thread") is not None and _RecordingSDKClient.instances:
+                break
+            await asyncio.sleep(0.01)
         assert registry.get("wake-thread") is not None
 
         await asyncio.wait_for(
