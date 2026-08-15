@@ -686,6 +686,12 @@ def register_claude_loop_endpoint(
             return _stream(parked)
 
         # --- New-turn POST: build the session and start the pump ---------------
+        # Any session still on this thread is parked mid-tool-call (the app went
+        # away and came back with something new). Wind it down cleanly first —
+        # closing its transport from under an in-flight hook leaves the SDK
+        # session interrupted, and the next resume answers a synthetic no-op
+        # instead of this prompt. Bounded; see `registry.retire`.
+        await registry.retire(thread_id)
         session = registry.create(thread_id)
         session.current_run_id = run_id
         # Stash the turn's request + shared MCP so the pump can rebuild options for

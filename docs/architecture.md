@@ -285,9 +285,19 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   `live=0`, i.e. a silent chat. If the pump already queued its own terminal that
   one is drained first. `registry.remove()` is identity-checked (`remove(tid,
   session)`) so a stale session's late drain never evicts the replacement that
-  already claimed the thread. Discarding a client mid-turn makes the CLI child
-  log `Stream closed` / `Tool permission stream closed before response received`
-  from its in-flight `hook_0` (PreToolUse) roundtrip — expected teardown noise.
+  already claimed the thread.
+- **A new turn retires the parked session first.** `dispose()` is the hard path:
+  it cancels the pump and closes the transport at once, which rejects the CLI
+  child's in-flight `hook_0` (PreToolUse) / permission roundtrip — the
+  `Stream closed` / `Tool permission stream closed before response received`
+  errors — and leaves the SDK session interrupted, so the next turn's `resume`
+  is answered with a `Continue from where you left off.` no-op instead of the
+  user's prompt. The new-turn POST therefore calls `registry.retire(thread_id)`
+  before `create()`: release the parked handlers (`release_pending`), `interrupt()`
+  the child, wait a bounded `PUPA_CLAUDE_RETIRE_DRAIN` (default 2s) for the pump
+  to reach its terminal, then dispose. Every step is best-effort — the thread
+  always ends up free for the newcomer. Matters most on app wake, where the
+  returning app sends a fresh message on a thread parked mid-tool.
 - **Assistant text streams token-by-token.** `ClaudeAgentOptions` sets
   `include_partial_messages=True`, so `receive_response()` yields partial
   `StreamEvent`s alongside the whole messages. `_pump` maps each text delta to an
