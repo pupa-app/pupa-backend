@@ -40,6 +40,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 from pupa_backend.agui.tool_results import parse_tool_results
+from pupa_backend.sse_replay import register_reattach_observer
 
 from . import events, registry
 from .config_mcp import SERVER_NAME as CONFIG_MCP_SERVER
@@ -593,6 +594,11 @@ def register_claude_loop_endpoint(
     """
     # Subscription pre-flight runs here so an unsafe deploy fails at startup.
     assert_subscription_billing()
+    # A re-attach POST is short-circuited by the replay middleware and never
+    # reaches this handler, so register a hook to hear about it — a returning
+    # client must re-arm the liveness grace of a turn parked on its thread.
+    # Registration is idempotent, so mounting on both `/` and `/harnesses/…` is fine.
+    register_reattach_observer(registry.note_reattach)
     scope = resolve_native_scope(None)
     model = os.getenv("CLAUDE_CODE_MODEL") or "(Claude Code default)"
     logger.info(

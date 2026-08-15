@@ -38,6 +38,12 @@ loop — and answers with a fresh SSE that replays every logged frame with
 An unknown thread re-attaches to nothing: `204 No Content` (client should give
 up cleanly and fall back to normal sends).
 
+Because a re-attach never reaches an agent loop, a loop that needs to know the
+client came back registers a callback via `register_reattach_observer` — the
+Claude loop uses it to re-arm the liveness grace of a turn parked on that
+thread. This module is above the harness boundary, so the dependency points
+that way and never the reverse.
+
 ## Completed-turn snapshot (catch-up after app kill)
 
 The log is retained for `PUPA_SSE_REPLAY_TTL` seconds (default 21600 = 6h) after the
@@ -287,6 +293,38 @@ def reset_logs() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Re-attach observers
+# ---------------------------------------------------------------------------
+
+# A re-attach is short-circuited here and never reaches an agent loop, so a loop
+# parking a turn would otherwise never learn that the client came back — which
+# matters because the Claude loop suspends its liveness grace while the client
+# reports itself backgrounded. This module sits *above* the harness boundary and
+# so must not import one; instead a loop registers a callback at mount time.
+_REATTACH_OBSERVERS: list[Any] = []
+
+
+def register_reattach_observer(observer: Any) -> None:
+    """Call `observer(thread_id)` whenever a re-attach POST is served.
+
+    Idempotent: harnesses register once per mounted path (`/` and
+    `/harnesses/{id}` can both point at the same loop).
+    """
+    if observer not in _REATTACH_OBSERVERS:
+        _REATTACH_OBSERVERS.append(observer)
+
+
+def notify_reattach(thread_id: str) -> None:
+    """Fire every registered observer. Best-effort — the replay tail is the point
+    of a re-attach and no observer may cost the client that."""
+    for observer in list(_REATTACH_OBSERVERS):
+        try:
+            observer(thread_id)
+        except Exception:  # noqa: BLE001 — an observer must never break a re-attach
+            logger.exception("sse_replay: reattach observer failed thread_id=%s", thread_id)
+
+
+# ---------------------------------------------------------------------------
 # Request parsing
 # ---------------------------------------------------------------------------
 
@@ -398,6 +436,9 @@ class SSEReplayMiddleware(BaseHTTPMiddleware):
                 "sse_replay: reattach thread_id=%s after_seq=%d (next=%d live=%d)",
                 thread_id, after_seq, log.next_seq, log.live_pumps,
             )
+            # The client is demonstrably alive: let any loop parking a turn on
+            # this thread re-arm its liveness clock.
+            notify_reattach(thread_id)
             return StreamingResponse(
                 log.tail(after_seq),
                 media_type=_SSE_MEDIA_TYPE,
