@@ -16,6 +16,13 @@ With `include_partial_messages` on, `receive_response()` also yields partial
 `AssistantMessage` still follows — the pump calls `translate_assistant_message`
 with `skip_text=True` there so the already-streamed text isn't re-sent (tool
 calls, which don't stream, are emitted from the whole message).
+
+`skip_text` is decided **per message** via `text_already_streamed`, not set
+blanket-true: the CLI fabricates some assistant messages locally (rate-limit
+notices, API errors, the "No response requested." reply to a queued query) and
+those never stream. Skipping them unconditionally deleted the only explanation
+the user would get — the run emitted `RUN_STARTED` + `RUN_FINISHED` and nothing
+else, which reads as a dropped connection.
 """
 
 from __future__ import annotations
@@ -90,14 +97,36 @@ def _tool_call_events(call_id: str, name: str, args: Any, parent_message_id: str
     ]
 
 
+def new_stream_state() -> dict[str, Any]:
+    """Fresh per-turn cursor for `translate_stream_event` / `text_already_streamed`.
+
+    `streamed_text_ids` records every message id that opened a *text* block, so the
+    pump can skip re-emitting exactly those and no others.
+    """
+    return {"message_id": None, "text_open": False, "streamed_text_ids": set()}
+
+
+def text_already_streamed(msg: Any, state: dict[str, Any]) -> bool:
+    """True when this `AssistantMessage`'s text reached the client as deltas.
+
+    Drives the pump's `skip_text`. False for anything the CLI fabricated locally
+    (no partial events, and usually `model="<synthetic>"`) and false for a message
+    with no id, which must never collide with an unrecorded one.
+    """
+    message_id = getattr(msg, "message_id", None)
+    if message_id is None:
+        return False
+    return message_id in state.get("streamed_text_ids", ())
+
+
 def translate_stream_event(raw_event: dict[str, Any], state: dict[str, Any]) -> list[Any]:
     """Map one raw Anthropic partial-message stream event → AG-UI text events.
 
     Called per `StreamEvent` when `include_partial_messages` is on, so assistant
     **text** streams as incremental `TextMessageContent` deltas instead of one
-    buffered block. `state` (`{"message_id", "text_open"}`) is mutated across calls
-    within a turn: `message_start` records the id; a text `content_block_start`
-    opens a start/…/end run; `content_block_stop` closes it.
+    buffered block. `state` (see `new_stream_state`) is mutated across calls within
+    a turn: `message_start` records the id; a text `content_block_start` opens a
+    start/…/end run and marks the id as streamed; `content_block_stop` closes it.
 
     Text only — `thinking_delta`s stay hidden, and tool calls are dispatched from
     the whole `AssistantMessage` (frontend dispatch needs complete args JSON, which
@@ -111,6 +140,8 @@ def translate_stream_event(raw_event: dict[str, Any], state: dict[str, Any]) -> 
     if etype == "content_block_start":
         if (raw_event.get("content_block") or {}).get("type") == "text":
             state["text_open"] = True
+            if state.get("message_id") is not None:
+                state.setdefault("streamed_text_ids", set()).add(state["message_id"])
             return [
                 TextMessageStartEvent(
                     type=EventType.TEXT_MESSAGE_START,
