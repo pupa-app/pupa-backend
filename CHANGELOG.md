@@ -4,6 +4,23 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.86] — 2026-08-15
+
+### Fixed
+
+- **Sending a new message on a thread parked mid-tool no longer breaks the
+  turn.** Reopening the app and typing something new tore the parked Claude Code
+  session down by cancelling its pump and closing the SDK transport outright.
+  That rejected the CLI child's in-flight PreToolUse / permission roundtrip
+  (`Error in hook callback hook_0: … Stream closed`) and left the SDK session
+  interrupted, so the next turn's `resume` was answered with the CLI's
+  `Continue from where you left off.` no-op — the user's actual prompt sat queued
+  behind it and the turn produced nothing. A new-turn POST now retires the parked
+  session first: release its waiting tool handlers, `interrupt()` the child, wait
+  a bounded window for the turn to wind down, then dispose. Tunable with
+  `PUPA_CLAUDE_RETIRE_DRAIN` (default 2s); every step is best-effort, so a wedged
+  child still frees the thread.
+
 ## [0.0.85] — 2026-08-15
 
 ### Fixed

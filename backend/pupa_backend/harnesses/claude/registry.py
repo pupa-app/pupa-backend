@@ -120,6 +120,16 @@ ERROR = object()  # run errored; a RunErrorEvent precedes this on the queue
 # Default idle timeout before the sweeper evicts a parked session (seconds).
 _DEFAULT_IDLE_TIMEOUT = 900.0
 
+# Window a retiring session gets to wind its turn down before the transport is
+# closed under it. Long enough for the CLI child to answer an `interrupt()` with
+# a `ResultMessage`, short enough that a wedged child can't stall the user's next
+# send. Tunable via `PUPA_CLAUDE_RETIRE_DRAIN`.
+_RETIRE_DRAIN_DEFAULT = 2.0
+
+
+def retire_drain_timeout() -> float:
+    return _env_timeout("PUPA_CLAUDE_RETIRE_DRAIN", _RETIRE_DRAIN_DEFAULT)
+
 
 def _args_key(args: Any) -> str:
     """Stable JSON key for matching handler args against a recorded ToolUseBlock."""
@@ -327,6 +337,22 @@ class LiveSession:
 
     # -- teardown -------------------------------------------------------------
 
+    async def release_pending(self, error: str) -> None:
+        """Hand every still-unresolved call a synthesised error so its handler
+        returns instead of blocking the SDK, and deny a parked approval.
+
+        Called before any teardown: a handler still sitting in `claim_call` when
+        the transport closes leaves the CLI child waiting on a control response
+        that will never come.
+        """
+        async with self.cond:
+            for pc in self.pending.values():
+                if pc.result is _UNSET:
+                    pc.result = json.dumps({"ok": False, "error": error})
+            self.cond.notify_all()
+        if self.pending_decision is not None and not self.pending_decision.done():
+            self.pending_decision.set_result(False)  # deny on teardown
+
     async def dispose(self) -> None:
         """End the run, unblock waiting handlers, cancel the pump, drop the client.
 
@@ -348,15 +374,9 @@ class LiveSession:
             "(replaced by a new turn or evicted while idle)"
         ))
         self.mark_error()
-        async with self.cond:
-            # Unblock any handler still waiting on a result so it doesn't hang the
-            # SDK teardown — hand it a synthesised error rather than nothing.
-            for pc in self.pending.values():
-                if pc.result is _UNSET:
-                    pc.result = json.dumps({"ok": False, "error": "session_disposed"})
-            self.cond.notify_all()
-        if self.pending_decision is not None and not self.pending_decision.done():
-            self.pending_decision.set_result(False)  # deny on teardown
+        # Unblock any handler still waiting on a result so it doesn't hang the
+        # SDK teardown — hand it a synthesised error rather than nothing.
+        await self.release_pending("session_disposed")
         if self.pump_task is not None and not self.pump_task.done():
             self.pump_task.cancel()
         client = self.client
@@ -419,6 +439,52 @@ async def remove(thread_id: str, session: LiveSession | None = None) -> None:
     _REGISTRY.pop(thread_id, None)
     if current is not None:
         await current.dispose()
+
+
+async def retire(thread_id: str) -> None:
+    """Wind down the session on `thread_id` before a new turn claims the thread.
+
+    A parked session is mid-tool-call as far as the CLI child is concerned.
+    `dispose()` alone cancels the pump and closes the SDK transport immediately,
+    which rejects the child's in-flight PreToolUse / permission control requests
+    — the `Stream closed` errors from `hook_0` — and leaves the SDK session
+    interrupted for the next turn to resume, which the CLI answers with a
+    `Continue from where you left off.` no-op instead of the user's prompt.
+
+    So wind down in order: release the parked handlers, ask the child to
+    `interrupt()`, wait a bounded `retire_drain_timeout()` for the pump to reach
+    its terminal, then dispose as usual. Every step is best-effort — a thread
+    must always end up free for the newcomer.
+    """
+    session = _REGISTRY.get(thread_id)
+    if session is None or session.disposed:
+        return
+
+    await session.release_pending("superseded_by_new_turn")
+
+    interrupt = getattr(session.client, "interrupt", None)
+    if callable(interrupt):
+        try:
+            await interrupt()
+        except Exception:  # noqa: BLE001 — a child that won't interrupt still gets torn down
+            logger.debug("claude_code loop: retire interrupt failed", exc_info=True)
+        else:
+            pump = session.pump_task
+            if pump is not None and not pump.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(pump), timeout=retire_drain_timeout()
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "claude_code loop: retire drain timed out thread_id=%s — "
+                        "tearing down anyway",
+                        thread_id,
+                    )
+                except Exception:  # noqa: BLE001 — the pump's own failure is its to report
+                    logger.debug("claude_code loop: retire drain failed", exc_info=True)
+
+    await remove(thread_id, session)
 
 
 async def attach(session: LiveSession):
