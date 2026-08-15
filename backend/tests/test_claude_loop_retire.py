@@ -129,8 +129,11 @@ async def test_retire_is_bounded_when_the_pump_never_settles(
     await asyncio.wait_for(registry.retire("t-retire-bounded"), timeout=2.0)
 
     assert client.events == ["interrupt", "disconnect"]
-    assert session.pump_task.cancelled() or session.pump_task.done()
     assert registry.get("t-retire-bounded") is None
+    # `cancel()` is requested, not awaited, by dispose() — wait for it to land
+    # rather than sampling a task mid-cancellation.
+    with pytest.raises(asyncio.CancelledError):
+        await session.pump_task
 
 
 async def test_retire_survives_a_client_that_cannot_interrupt() -> None:
