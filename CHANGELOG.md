@@ -4,6 +4,22 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.85] — 2026-08-15
+
+### Fixed
+
+- **Silent empty turns in the Claude Code loop now explain themselves.** The pump
+  suppressed the text of every whole `AssistantMessage`, on the assumption it had
+  already streamed as deltas. But the CLI fabricates some assistant messages
+  locally and those never stream — rate-limit notices ("You've hit your session
+  limit · resets …"), API errors, and the `No response requested.` reply it gives
+  a prompt queued behind a resumed session's `Continue from where you left off.`
+  Their text was deleted, so the run emitted `RUN_STARTED` + `RUN_FINISHED` and
+  nothing else and the app rendered it as a dropped connection — most visibly
+  after waking the app on a thread whose previous turn was torn down mid-tool.
+  Suppression is now decided per message from the ids that actually streamed, so
+  a non-streamed message keeps its text.
+
 ## [0.0.84] — 2026-08-12
 
 ### Fixed

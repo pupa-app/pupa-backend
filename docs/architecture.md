@@ -292,9 +292,17 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   `include_partial_messages=True`, so `receive_response()` yields partial
   `StreamEvent`s alongside the whole messages. `_pump` maps each text delta to an
   incremental `TextMessageContent` (`events.translate_stream_event`); the trailing
-  whole `AssistantMessage` is translated with `skip_text=True` so the text isn't
+  whole `AssistantMessage` is translated with `skip_text` so the text isn't
   re-sent (tool calls, which don't stream, are still emitted from it). Parity with
   the deepagents harness — iOS accumulates deltas either way.
+- **`skip_text` is per message, never blanket.** `translate_stream_event` records
+  each message id that opened a text block; `events.text_already_streamed` decides
+  `skip_text` from that set. The CLI fabricates some assistant messages locally —
+  rate-limit notices, API errors, and the `No response requested.` reply it gives
+  a `query()` queued behind a resumed session's `Continue from where you left
+  off.` — and those never stream. Skipping them unconditionally deleted their
+  text, leaving a run that emitted only `RUN_STARTED` + `RUN_FINISHED`, which the
+  app renders as a dropped connection.
 - **Native + server tool calls render display-only.** Claude's own in-process
   tools (`Read`/`Bash`/`Grep`/… and `ServerToolUseBlock` web_search / web_fetch)
   emit `ToolCallStart/Args/End` so the app shows a tool bubble, but are **not**

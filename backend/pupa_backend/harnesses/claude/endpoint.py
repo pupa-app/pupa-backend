@@ -474,7 +474,7 @@ async def _pump(session: registry.LiveSession) -> None:
     client = session.client
     thread_id = session.thread_id
     # Per-turn text-streaming cursor for partial `StreamEvent`s (see below).
-    stream_state: dict[str, Any] = {"message_id": None, "text_open": False}
+    stream_state = events.new_stream_state()
     try:
         async for msg in client.receive_response():
             # Remember the SDK session id from the EARLIEST message that carries it
@@ -501,9 +501,14 @@ async def _pump(session: registry.LiveSession) -> None:
                 if model and session.sdk_model is None:
                     session.sdk_model = model
                     logger.info("claude_code loop: model=%s (thread=%s)", model, thread_id)
-                # Text already streamed via StreamEvents above → skip_text avoids a
-                # duplicate whole-block emit; tool calls (never streamed) still surface.
-                evs, frontend_calls = events.translate_assistant_message(msg, skip_text=True)
+                # Skip only the text that actually streamed above (avoids a duplicate
+                # whole-block emit). Messages the CLI fabricates locally — rate-limit
+                # notices, API errors, the "No response requested." reply to a query
+                # queued behind a resumed session — never stream, so their text is
+                # emitted here or the user sees a run with no content at all.
+                evs, frontend_calls = events.translate_assistant_message(
+                    msg, skip_text=events.text_already_streamed(msg, stream_state)
+                )
                 for e in evs:
                     session.emit(e)
                 if frontend_calls and session.pending_widen_descriptors is not None:

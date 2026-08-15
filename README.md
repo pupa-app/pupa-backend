@@ -1,6 +1,6 @@
 # Pupa backend 
 
-[![pupa-backend](https://img.shields.io/badge/backend-0.0.84-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
+[![pupa-backend](https://img.shields.io/badge/backend-0.0.85-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
 [![screenshare](https://img.shields.io/badge/screenshare-0.0.6-f05138?logo=swift&logoColor=white)](screenshare-sidecar/Sources/PupaScreenshare/Version.swift)
 
 Spin up your own server so a **local agent drives the
@@ -33,7 +33,7 @@ contract. Runs locally or in the cloud (Railway + Postgres).
 
 | Component | Version | Where |
 |---|---|---|
-| **Backend** (Python · FastAPI · Claude Code + deepagents/LangGraph harnesses) | `0.0.84` | [`backend/pyproject.toml`](backend/pyproject.toml) |
+| **Backend** (Python · FastAPI · Claude Code + deepagents/LangGraph harnesses) | `0.0.85` | [`backend/pyproject.toml`](backend/pyproject.toml) |
 | **Screen-share sidecar** (Swift CLI, macOS-only, optional) | `0.0.6` | [`screenshare-sidecar/Sources/PupaScreenshare/Version.swift`](screenshare-sidecar/Sources/PupaScreenshare/Version.swift) |
 
 Patch-only bumps (`0.0.X` → `0.0.X+1`). See
