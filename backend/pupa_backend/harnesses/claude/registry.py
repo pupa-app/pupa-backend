@@ -441,6 +441,24 @@ async def remove(thread_id: str, session: LiveSession | None = None) -> None:
         await current.dispose()
 
 
+def note_reattach(thread_id: str) -> None:
+    """A re-attach POST landed for `thread_id` — treat it as a liveness ping.
+
+    Registered with `sse_replay.register_reattach_observer`, which serves
+    re-attaches by short-circuit and so never reaches this loop. Without it a
+    client that backgrounded (suspending the grace in `claim_call`) stayed marked
+    backgrounded, on a stale last-ping clock, at the exact moment it proved it
+    was back.
+
+    Synchronous by necessity — the observer runs on the middleware's path — so
+    the actual `keepalive()` is scheduled rather than awaited.
+    """
+    session = _REGISTRY.get(thread_id)
+    if session is None or session.disposed:
+        return
+    asyncio.ensure_future(session.keepalive(backgrounded=False))
+
+
 async def retire(thread_id: str) -> None:
     """Wind down the session on `thread_id` before a new turn claims the thread.
 

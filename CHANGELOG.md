@@ -4,6 +4,20 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.87] — 2026-08-15
+
+### Fixed
+
+- **Re-attaching now counts as proof the app is alive.** A re-attach POST is
+  served by the replay middleware without reaching an agent loop, so a turn
+  parked on that thread never heard about it: a client that had reported itself
+  backgrounded (which suspends the liveness grace) stayed marked backgrounded on
+  a stale last-ping clock at the very moment it reconnected, and a parked
+  frontend tool could still be failed by the grace. The middleware now fires
+  `notify_reattach`, and the Claude loop re-arms the session's liveness clock
+  from it. Observers are best-effort, so a failing hook can't cost the client its
+  replay tail.
+
 ## [0.0.86] — 2026-08-15
 
 ### Fixed

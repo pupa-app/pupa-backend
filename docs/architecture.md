@@ -275,7 +275,16 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   back to the absolute wall so a briefly-backgrounded subagent isn't killed; a
   plain ping on foreground re-arms it. Clients that never ping keep the
   full-wall behaviour. A truly-abandoned turn relies on the wall or new-turn
-  disposal (`registry.create`), not a socket-close signal.
+  retirement (`registry.retire`), not a socket-close signal.
+- **A re-attach counts as a ping.** `SSEReplayMiddleware` serves a re-attach by
+  short-circuit, so it never reaches a loop — a returning app would otherwise
+  stay marked `background` on a stale clock at the exact moment it proved it was
+  alive. The middleware therefore fires `sse_replay.notify_reattach(thread_id)`,
+  and the Claude loop registers `registry.note_reattach` as an observer at mount
+  time. Observers are best-effort (a raising hook can't cost the client its
+  replay tail) and registration is idempotent, since one loop mounts on both `/`
+  and `/harnesses/{id}`. The callback direction keeps the harness boundary
+  one-way: `sse_replay` never imports a harness.
 - **Teardown always ends the run.** `LiveSession.dispose()` queues a terminal
   `RunError` + `ERROR` sentinel *before* it unblocks parked handlers, cancels
   the pump and disconnects the SDK client, so a session torn down mid-turn
