@@ -12,6 +12,5 @@
 ## Checklist
 
 - [ ] Base branch is `dev` (not `main`).
-- [ ] Commits are signed off (`git commit -s`) — the DCO check requires it.
 - [ ] Version bumped if code in a sub-package changed (see [CONTRIBUTING.md](../CONTRIBUTING.md) → Releases).
 - [ ] Docs updated if behaviour changed ([docs/architecture.md](../docs/architecture.md), [CHANGELOG.md](../CHANGELOG.md)).
