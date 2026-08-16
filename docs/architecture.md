@@ -285,6 +285,18 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   replay tail) and registration is idempotent, since one loop mounts on both `/`
   and `/harnesses/{id}`. The callback direction keeps the harness boundary
   one-way: `sse_replay` never imports a harness.
+- **One consumer per session queue.** A second POST can land on a live session —
+  the client re-sends a resume whose response was lost, while the pump (which
+  survives a client disconnect by design) is still draining. Two `attach()`
+  generators on one `asyncio.Queue` each take a *share* of the events: the turn
+  splits across two SSE responses and both append into the same `sse_replay` log
+  through independent task chains, so the log's frame order stops matching the
+  turn's. `attach()` therefore displaces the consumer already holding the
+  session: it sets that attachment's `stop`, waits (bounded — a generator nobody
+  is iterating must not stall the request replacing it) for its `done`, and the
+  displaced generator hands back any event it had in flight via
+  `LiveSession.pushback`, which the new consumer drains ahead of the queue so the
+  handover can't reorder the turn.
 - **Teardown always ends the run.** `LiveSession.dispose()` queues a terminal
   `RunError` + `ERROR` sentinel *before* it unblocks parked handlers, cancels
   the pump and disconnects the SDK client, so a session torn down mid-turn

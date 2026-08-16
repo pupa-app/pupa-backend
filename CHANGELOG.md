@@ -4,6 +4,17 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.88] — 2026-08-16
+
+### Fixed
+
+- **A retried request no longer splits a reply in two.** When a client re-sends
+  a request whose response was lost, the second one could land while the first
+  was still streaming — and the two then took turns pulling from the same queue,
+  so each got a fragment of the reply and the thread's saved copy came out in the
+  wrong order. The newer request now takes the stream over cleanly, and anything
+  the older one was holding is handed across rather than dropped.
+
 ## [0.0.87] — 2026-08-15
 
 ### Fixed

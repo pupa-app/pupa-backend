@@ -120,6 +120,20 @@ ERROR = object()  # run errored; a RunErrorEvent precedes this on the queue
 # Default idle timeout before the sweeper evicts a parked session (seconds).
 _DEFAULT_IDLE_TIMEOUT = 900.0
 
+# How long a new `attach()` waits for the consumer it displaced to hand the
+# queue over. Bounded: a generator nobody is iterating (client gone, close not
+# yet delivered) must not stall the request that replaced it.
+_ATTACH_HANDOVER_TIMEOUT = 2.0
+
+
+@dataclass
+class _Attachment:
+    """One `attach()` generator's hold on a session queue. `stop` asks it to let
+    go; `done` reports that it has (set even on GeneratorExit)."""
+
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
 # Window a retiring session gets to wind its turn down before the transport is
 # closed under it. Long enough for the CLI child to answer an `interrupt()` with
 # a `ResultMessage`, short enough that a wedged child can't stall the user's next
@@ -195,6 +209,12 @@ class LiveSession:
     auto_approve: bool = False
     last_activity: float = field(default_factory=time.monotonic)
     disposed: bool = False
+    # The generator currently draining this session's queue, or None. A new
+    # attach displaces it and waits for the handover. See `attach`.
+    attachment: "_Attachment | None" = None
+    # Events a displaced consumer had in hand when it stopped. Drained ahead of
+    # the queue so the handover doesn't reorder the turn.
+    pushback: list = field(default_factory=list)
     # Client liveness heartbeat. None until the first ping this park —
     # clients that never ping keep the full-wall behaviour.
     last_keepalive: float | None = None
@@ -513,18 +533,67 @@ async def attach(session: LiveSession):
     Yields AG-UI event objects (the endpoint encodes them). On INTERRUPT the
     generator returns leaving the session parked; on FINISH/ERROR it removes the
     session from the registry after the trailing events have been yielded.
+
+    One consumer at a time. A second POST can land on a live session — a resume
+    whose response was lost is re-sent while the pump is still draining — and two
+    generators on one queue each take a *share* of the events: the turn is split
+    across two SSE responses, and both append into the same replay log through
+    independent task chains, so the log's frame order stops matching the turn's.
+    A new attach therefore displaces the old one, which stops at its next wake
+    and hands back anything it had in flight.
     """
+    previous = session.attachment
+    mine = _Attachment()
+    session.attachment = mine
+    if previous is not None:
+        previous.stop.set()
+        try:
+            await asyncio.wait_for(previous.done.wait(), timeout=_ATTACH_HANDOVER_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.info(
+                "claude_code loop: attach handover timed out thread_id=%s — "
+                "proceeding; the displaced consumer stops at its next wake",
+                session.thread_id,
+            )
     session.touch()
-    while True:
-        item = await session.queue.get()
-        if item is INTERRUPT:
+    try:
+        while True:
+            if session.pushback:
+                item = session.pushback.pop(0)
+            else:
+                get = asyncio.ensure_future(session.queue.get())
+                displaced = asyncio.ensure_future(mine.stop.wait())
+                done, _pending = await asyncio.wait(
+                    {get, displaced}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if displaced in done:
+                    # Both can complete on the same wake. The item belongs to the
+                    # new consumer, and it is OLDER than anything still queued —
+                    # hand it back at the front rather than dropping or
+                    # re-queueing it behind newer frames.
+                    if get in done:
+                        session.pushback.insert(0, get.result())
+                    else:
+                        get.cancel()
+                    return
+                displaced.cancel()
+                item = get.result()
+            if item is INTERRUPT:
+                session.touch()
+                return
+            if item is FINISH or item is ERROR:
+                await remove(session.thread_id, session)
+                return
+            yield item
             session.touch()
-            return
-        if item is FINISH or item is ERROR:
-            await remove(session.thread_id, session)
-            return
-        yield item
-        session.touch()
+    finally:
+        # Unblocks the displacing attach — including on GeneratorExit, when the
+        # client disconnected and FastAPI closed this generator.
+        mine.done.set()
+        # Only clear the slot if it is still ours: a displacing attach has
+        # already installed its own.
+        if session.attachment is mine:
+            session.attachment = None
 
 
 async def sweep_idle(timeout: float = _DEFAULT_IDLE_TIMEOUT) -> int:
