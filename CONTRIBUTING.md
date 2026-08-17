@@ -18,8 +18,18 @@ The merge/release steps below are written for humans and intentionally avoid cop
 
 pupa-backend is licensed under the **MIT license** (see [LICENSE](LICENSE)).
 
-By submitting a contribution you agree it is licensed under the MIT license,
-and you confirm you have the right to submit it.
+By submitting a contribution you agree that:
+
+1. Contributions are accepted under the MIT license (see [LICENSE](LICENSE)).
+2. You certify the [Developer Certificate of Origin 1.1](DCO) — i.e. you have
+   the right to submit the code. Sign off every commit:
+
+   ```sh
+   git commit -s
+   ```
+
+   which appends a `Signed-off-by: Your Name <email>` line. PRs with unsigned
+   commits fail the DCO check.
 
 We deliberately do **not** use a Contributor License Agreement: contributions
 stay owned by their authors, licensed inbound under exactly the same terms as
