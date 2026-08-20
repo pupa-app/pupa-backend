@@ -4,6 +4,16 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.89] — 2026-08-20
+
+### Added
+
+- **Token and cache usage now show up in the server log.** The Claude loop
+  prints a yellow line for every model call — input, output, cache reads, cache
+  writes, and how much of the prompt came from cache — plus a totals line at the
+  end of each turn with the cost, the number of model turns, and the time spent
+  waiting on the API.
+
 ## [0.0.88] — 2026-08-16
 
 ### Fixed

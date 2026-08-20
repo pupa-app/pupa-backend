@@ -448,6 +448,17 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   `claude-*` id is accepted so a pinned config / stale client still works. The
   model the SDK reports is logged on the first assistant message and stored on the
   session (`sdk_model`).
+- **Token / cache logging.** The pump logs usage in yellow at INFO
+  ([`usage.py`](../backend/pupa_backend/harnesses/claude/usage.py)): one
+  `claude_code tokens:` line per `AssistantMessage` — `in` / `out` /
+  `cache_read` / `cache_write` plus the cache-hit share of the prompt, the only
+  per-API-call view of the cache split — and one `claude_code turn totals:` line
+  at the `ResultMessage` adding `total_cost_usd`, `num_turns`, API duration and
+  the per-model `model_usage` breakdown. Totals are logged before the tool-unlock
+  continuation hand-off, so a continued turn still reports what its predecessor
+  burned. Keys are read tolerantly (`usage` is snake_case, `model_usage`
+  camelCase); a missing `usage` skips the per-call line and degrades the totals
+  line to `no token usage reported`.
 - **Thinking.** Extended-thinking level is also selected per turn via
   `forwardedProps.llm.thinking`
   ([`resolve_thinking`](../backend/pupa_backend/harnesses/claude/thinking.py)):

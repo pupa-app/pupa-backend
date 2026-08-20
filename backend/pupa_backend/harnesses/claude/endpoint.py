@@ -42,7 +42,7 @@ from fastapi.responses import StreamingResponse
 from pupa_backend.agui.tool_results import parse_tool_results
 from pupa_backend.sse_replay import register_reattach_observer
 
-from . import events, registry
+from . import events, registry, usage
 from .config_mcp import SERVER_NAME as CONFIG_MCP_SERVER
 from .config_mcp import build_config_mcp
 from .env import (
@@ -502,6 +502,12 @@ async def _pump(session: registry.LiveSession) -> None:
                 if model and session.sdk_model is None:
                     session.sdk_model = model
                     logger.info("claude_code loop: model=%s (thread=%s)", model, thread_id)
+                # Per-API-call token + cache stats (yellow). This is the only
+                # place the cache read/write split is visible per call — the
+                # ResultMessage below only has turn totals.
+                token_line = usage.message_line(getattr(msg, "usage", None), thread_id)
+                if token_line:
+                    logger.info(token_line)
                 # Skip only the text that actually streamed above (avoids a duplicate
                 # whole-block emit). Messages the CLI fabricates locally — rate-limit
                 # notices, API errors, the "No response requested." reply to a query
@@ -531,6 +537,10 @@ async def _pump(session: registry.LiveSession) -> None:
                     session.emit(events.run_finished(thread_id, session.current_run_id or ""))
                     session.mark_interrupt()
             elif isinstance(msg, ResultMessage):
+                # Turn totals + cost (yellow). Logged before the continuation
+                # hand-off so a widened continuation still reports the tokens
+                # its predecessor turn burned.
+                logger.info(usage.result_line(msg, thread_id))
                 descriptors = session.pending_widen_descriptors
                 if descriptors is not None and session.sdk_session_id:
                     # A gate tool unlocked more tools; the endpoint interrupted the
