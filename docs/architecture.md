@@ -458,7 +458,32 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   continuation hand-off, so a continued turn still reports what its predecessor
   burned. Keys are read tolerantly (`usage` is snake_case, `model_usage`
   camelCase); a missing `usage` skips the per-call line and degrades the totals
-  line to `no token usage reported`.
+  line to `no token usage reported`. The per-call line is emitted once per
+  message id — the SDK yields one `AssistantMessage` per content block and every
+  one carries the same message-level usage.
+- **Prompt-cache diagnosis.** Anthropic caches an exact `tools` → `system` →
+  `messages` prefix and the `claude` CLI owns the `cache_control` breakpoints
+  (`ClaudeAgentOptions` exposes no cache knob), so a turn that writes cache and
+  never reads it means *our* prefix moved. `_options_for` rebuilds all three from
+  scratch on every POST, so it fingerprints what it built — model, base system
+  prompt, tool set / order / schemas, permission mode, thinking, skills, cwd, and
+  each `input.context` entry's description and value separately — and logs which
+  keys moved since the thread's previous turn:
+
+  ```
+  claude_code cache: prefix changed [ctx.live-canvas-state.value], tools=81 system=9,241ch — cache write expected (thread=…)
+  claude_code cache: prefix unchanged, tools=81 system=9,241ch — cache read expected (thread=…)
+  ```
+
+  The key names mirror the CLI's own cache-miss reasons. Two structural costs are
+  visible this way: a gate unlock widens the tool set, and tools are the *first*
+  block, so the whole prefix re-writes (accepted — the alternative is advertising
+  every tool up front); and the ambient context sits in the **system** prompt,
+  which precedes `messages`, so any drift in it re-caches the entire transcript
+  behind it — a cost that grows with conversation length. A run where the line
+  says `prefix unchanged` but the tokens line still shows a large `cache_write`
+  points at the messages block instead (transcript re-serialisation across the
+  `resume`), not at the options build.
 - **Thinking.** Extended-thinking level is also selected per turn via
   `forwardedProps.llm.thinking`
   ([`resolve_thinking`](../backend/pupa_backend/harnesses/claude/thinking.py)):

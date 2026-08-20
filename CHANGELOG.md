@@ -13,6 +13,10 @@ bumps (`0.0.X` → `0.0.X+1`).
   writes, and how much of the prompt came from cache — plus a totals line at the
   end of each turn with the cost, the number of model turns, and the time spent
   waiting on the API.
+- **The log now says why a turn re-paid for its cache.** Each turn also prints
+  what changed since the thread's last one — the model, the tool set, or a named
+  piece of the context the app sends every turn (live canvas state, memories,
+  skills). A turn that changed nothing says so, and should be cheap.
 
 ## [0.0.88] — 2026-08-16
 
