@@ -138,6 +138,18 @@ def _digest(value: Any) -> str:
     return hashlib.sha1(blob, usedforsecurity=False).hexdigest()[:8]
 
 
+def context_label(description: str, index: int) -> str:
+    """Short stable name for one ambient-context entry, from its description.
+
+    The descriptions are long prose ("Live canvas state — thin enum. …"), so we
+    keep the first few words: enough to say *which* entry moved without dumping
+    the block into the log. Falls back to the position when there's no prose.
+    """
+    words = "".join(c if c.isalnum() or c.isspace() else " " for c in description).split()
+    slug = "-".join(w.lower() for w in words[:3])
+    return slug or f"entry{index}"
+
+
 def fingerprint(
     *,
     model: str | None,
@@ -148,6 +160,7 @@ def fingerprint(
     thinking: Any,
     skills: Any,
     cwd: str | None,
+    context_pairs: list[tuple[str, str]] | None = None,
 ) -> dict[str, str]:
     """Hash every input that lands in the cacheable prefix.
 
@@ -155,12 +168,24 @@ def fingerprint(
     advertised surface (frontend + config MCP). `base_system` is the loop prompt
     *without* the per-turn ambient-context block, so a drifting system prompt can
     be attributed to the volatile tail rather than the stable head.
+
+    `context_pairs` are the ambient-context entries `(description, value)`,
+    hashed one by one. A bare "system changed" doesn't say *what* the client sent
+    differently; `ctx.live-canvas-state.value` does. The description (the app's
+    policy prose / AGENTS.md) and the value (the JSON payload) are hashed apart
+    because they drift for different reasons.
     """
     names = [name for name, _desc, _schema in tool_specs]
+    per_entry: dict[str, str] = {}
+    for index, (desc, val) in enumerate(context_pairs or []):
+        label = context_label(desc, index)
+        per_entry[f"ctx.{label}.desc"] = _digest(desc)
+        per_entry[f"ctx.{label}.value"] = _digest(val)
     return {
         "model": model or "",
         "base_system": _digest(base_system),
         "system": _digest(system),
+        **per_entry,
         "tool_set": _digest(sorted(names)),
         "tool_order": _digest(names),
         "tool_schemas": _digest(tool_specs),
@@ -187,6 +212,11 @@ def cache_line(thread_id: str, fp: dict[str, str], tool_count: int, system_chars
         body = f"first turn on this thread, {shape} — full cache write expected"
     else:
         changed = sorted(k for k, v in fp.items() if prev.get(k) != v)
+        # `system` is the concatenation of base_system + every ctx entry, so it
+        # always moves with them; naming it too is noise. Keep it only when it
+        # moved *alone* (the ambient block appearing/disappearing wholesale).
+        if len(changed) > 1 and "system" in changed:
+            changed.remove("system")
         if changed:
             body = f"prefix changed [{', '.join(changed)}], {shape} — cache write expected"
         else:

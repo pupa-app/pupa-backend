@@ -185,6 +185,7 @@ def _fp(**over):
         thinking={},
         skills=None,
         cwd=None,
+        context_pairs=[],
     )
     base.update(over)
     return usage.fingerprint(**base)
@@ -266,3 +267,42 @@ def test_fingerprint_tracking_is_bounded() -> None:
     for i in range(usage._MAX_TRACKED_THREADS + 50):
         usage.cache_line(f"t{i}", _fp(), tool_count=1, system_chars=40)
     assert len(usage._PREV_FINGERPRINT) == usage._MAX_TRACKED_THREADS
+
+
+def test_cache_line_names_which_context_entry_moved() -> None:
+    """A bare "system changed" doesn't say what the client sent differently."""
+    usage.reset_fingerprints()
+    canvas = "Live canvas state — thin enum. Shape: {components: [...]}"
+    memories = "User memories — sandboxed markdown FileSystem persisted across sessions."
+    usage.cache_line(
+        "t", _fp(context_pairs=[(canvas, '{"components":[]}'), (memories, '{"paths":[]}')]),
+        tool_count=1, system_chars=40,
+    )
+    line = usage.cache_line(
+        "t",
+        _fp(context_pairs=[(canvas, '{"components":[{"id":"a"}]}'), (memories, '{"paths":[]}')]),
+        tool_count=1, system_chars=52,
+    )
+    assert "ctx.live-canvas-state.value" in line
+    assert "ctx.user-memories.value" not in line   # that one held
+    assert "ctx.live-canvas-state.desc" not in line  # the prose held; the payload moved
+
+
+def test_cache_line_drops_redundant_system_when_an_entry_is_named() -> None:
+    """`system` is base_system + every entry concatenated, so it always moves with
+    them — printing both just pads the line."""
+    usage.reset_fingerprints()
+    pairs = [("Live canvas state — thin enum.", "{}")]
+    usage.cache_line("t", _fp(context_pairs=pairs), tool_count=1, system_chars=40)
+    line = usage.cache_line(
+        "t", _fp(context_pairs=[("Live canvas state — thin enum.", '{"x":1}')]),
+        tool_count=1, system_chars=44,
+    )
+    assert "ctx.live-canvas-state.value" in line
+    assert "[system]" not in line and ", system" not in line
+
+
+def test_context_label_survives_punctuation_and_empty_prose() -> None:
+    assert usage.context_label("Live canvas state — thin enum.", 0) == "live-canvas-state"
+    assert usage.context_label("Subagents —  Delegates in pupa/agents/", 1) == "subagents-delegates-in"
+    assert usage.context_label("", 3) == "entry3"

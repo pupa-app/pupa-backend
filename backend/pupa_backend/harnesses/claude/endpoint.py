@@ -243,6 +243,25 @@ def _image_blocks(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
+def _context_pairs(context: list[Any] | None) -> list[tuple[str, str]]:
+    """AG-UI `input.context` as ordered `(description, value)` string pairs.
+
+    Tolerates both the pydantic `Context` model and a plain dict. Shared by
+    `_render_context` and the cache fingerprint, so the diagnosis hashes exactly
+    the text that reaches the prompt.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in context or []:
+        desc = getattr(entry, "description", None)
+        if desc is None and isinstance(entry, dict):
+            desc = entry.get("description")
+        val = getattr(entry, "value", None)
+        if val is None and isinstance(entry, dict):
+            val = entry.get("value")
+        pairs.append(((desc or "").strip(), (val or "").strip()))
+    return pairs
+
+
 def _render_context(context: list[Any] | None) -> str:
     """Flatten AG-UI `input.context` into a text block (`description` then its
     stringified `value`, entries blank-line separated).
@@ -253,14 +272,8 @@ def _render_context(context: list[Any] | None) -> str:
     system prompt / AGENTS.md) only reaches the model if rendered in here.
     """
     blocks: list[str] = []
-    for entry in context or []:
-        desc = getattr(entry, "description", None)
-        if desc is None and isinstance(entry, dict):
-            desc = entry.get("description")
-        val = getattr(entry, "value", None)
-        if val is None and isinstance(entry, dict):
-            val = entry.get("value")
-        block = f"{(desc or '').strip()}\n{(val or '').strip()}".strip()
+    for desc, val in _context_pairs(context):
+        block = f"{desc}\n{val}".strip()
         if block:
             blocks.append(block)
     return "\n\n".join(blocks)
@@ -378,6 +391,7 @@ def _options_for(
                 model=model,
                 base_system=base_system,
                 system=system,
+                context_pairs=_context_pairs(input.context),
                 tool_specs=tool_specs,
                 permission_mode=permission_mode,
                 thinking=thinking,
