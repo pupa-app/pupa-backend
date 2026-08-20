@@ -484,6 +484,16 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   says `prefix unchanged` but the tokens line still shows a large `cache_write`
   points at the messages block instead (transcript re-serialisation across the
   `resume`), not at the options build.
+- **Ambient context is canonicalised.** `_context_pairs` re-serialises each
+  context `value` that parses as a JSON object/array with `sort_keys=True`
+  (`_canonical_json`; array order and non-JSON values untouched). The client
+  builds these from Swift `Dictionary`s, whose iteration order is randomised, so
+  an unchanged canvas/skills/type snapshot arrived with shuffled keys every turn
+  — and because the block sits in the **system** prompt, ahead of `messages`, each
+  reshuffle re-cached the whole transcript behind it (~11k of avoidable
+  `cache_write` per turn, growing with conversation length). Normalising here
+  covers every client, including shipped builds without the client-side
+  `.sortedKeys`.
 - **Prompt dump.** `PUPA_CLAUDE_PROMPT_DUMP=<dir>` (unset = off) writes the whole
   prefix per options build to `<dir>/<thread>/NNN.json` — tools, base system
   prompt, each ambient-context entry, composed system prompt, fingerprint — plus

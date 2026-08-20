@@ -22,6 +22,7 @@ Subscription-only billing is asserted at registration time (fail-closed) — see
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -243,12 +244,36 @@ def _image_blocks(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
+def _canonical_json(text: str) -> str:
+    """Re-serialise a JSON payload with sorted keys; pass anything else through.
+
+    The client builds these payloads from Swift `Dictionary`s, whose iteration
+    order is randomised — so the same canvas/skills/type snapshot arrives with
+    its keys shuffled on every turn. The bytes differ, the meaning doesn't, and
+    since this block lands in the **system** prompt (which precedes `messages` in
+    the cache prefix) each reshuffle re-cached the entire transcript behind it.
+
+    Normalising here fixes it for every client, including builds already shipped
+    that will never carry the client-side `.sortedKeys`. Array order is left
+    alone — only object keys are sorted — and a value that isn't a JSON object or
+    array is returned untouched.
+    """
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(parsed, (dict, list)):
+        return text
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def _context_pairs(context: list[Any] | None) -> list[tuple[str, str]]:
     """AG-UI `input.context` as ordered `(description, value)` string pairs.
 
     Tolerates both the pydantic `Context` model and a plain dict. Shared by
     `_render_context` and the cache fingerprint, so the diagnosis hashes exactly
-    the text that reaches the prompt.
+    the text that reaches the prompt. Values are canonicalised (see
+    `_canonical_json`) so a client's key ordering can't bust the prompt cache.
     """
     pairs: list[tuple[str, str]] = []
     for entry in context or []:
@@ -258,7 +283,7 @@ def _context_pairs(context: list[Any] | None) -> list[tuple[str, str]]:
         val = getattr(entry, "value", None)
         if val is None and isinstance(entry, dict):
             val = entry.get("value")
-        pairs.append(((desc or "").strip(), (val or "").strip()))
+        pairs.append(((desc or "").strip(), _canonical_json((val or "").strip())))
     return pairs
 
 
