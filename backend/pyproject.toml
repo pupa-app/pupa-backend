@@ -1,6 +1,6 @@
 [project]
 name = "pupa-backend"
-version = "0.0.88"
+version = "0.0.89"
 description = "Pupa A2UI agent backend"
 readme = "README.md"
 requires-python = ">=3.11"

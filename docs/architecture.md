@@ -448,6 +448,62 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   `claude-*` id is accepted so a pinned config / stale client still works. The
   model the SDK reports is logged on the first assistant message and stored on the
   session (`sdk_model`).
+- **Token / cache logging.** The pump logs usage in yellow at INFO
+  ([`usage.py`](../backend/pupa_backend/harnesses/claude/usage.py)): one
+  `claude_code tokens:` line per `AssistantMessage` — `in` / `out` /
+  `cache_read` / `cache_write` plus the cache-hit share of the prompt, the only
+  per-API-call view of the cache split — and one `claude_code turn totals:` line
+  at the `ResultMessage` adding `total_cost_usd`, `num_turns`, API duration and
+  the per-model `model_usage` breakdown. Totals are logged before the tool-unlock
+  continuation hand-off, so a continued turn still reports what its predecessor
+  burned. Keys are read tolerantly (`usage` is snake_case, `model_usage`
+  camelCase); a missing `usage` skips the per-call line and degrades the totals
+  line to `no token usage reported`. The per-call line is emitted once per
+  message id — the SDK yields one `AssistantMessage` per content block and every
+  one carries the same message-level usage.
+- **Prompt-cache diagnosis.** Anthropic caches an exact `tools` → `system` →
+  `messages` prefix and the `claude` CLI owns the `cache_control` breakpoints
+  (`ClaudeAgentOptions` exposes no cache knob), so a turn that writes cache and
+  never reads it means *our* prefix moved. `_options_for` rebuilds all three from
+  scratch on every POST, so it fingerprints what it built — model, base system
+  prompt, tool set / order / schemas, permission mode, thinking, skills, cwd, and
+  each `input.context` entry's description and value separately — and logs which
+  keys moved since the thread's previous turn:
+
+  ```
+  claude_code cache: prefix changed [ctx.live-canvas-state.value], tools=81 system=9,241ch — cache write expected (thread=…)
+  claude_code cache: prefix unchanged, tools=81 system=9,241ch — cache read expected (thread=…)
+  ```
+
+  The key names mirror the CLI's own cache-miss reasons. Two structural costs are
+  visible this way: a gate unlock widens the tool set, and tools are the *first*
+  block, so the whole prefix re-writes (accepted — the alternative is advertising
+  every tool up front); and the ambient context sits in the **system** prompt,
+  which precedes `messages`, so any drift in it re-caches the entire transcript
+  behind it — a cost that grows with conversation length. A run where the line
+  says `prefix unchanged` but the tokens line still shows a large `cache_write`
+  points at the messages block instead (transcript re-serialisation across the
+  `resume`), not at the options build.
+- **Ambient context is canonicalised.** `_context_pairs` re-serialises each
+  context `value` that parses as a JSON object/array with `sort_keys=True`
+  (`_canonical_json`; array order and non-JSON values untouched). The client
+  builds these from Swift `Dictionary`s, whose iteration order is randomised, so
+  an unchanged canvas/skills/type snapshot arrived with shuffled keys every turn
+  — and because the block sits in the **system** prompt, ahead of `messages`, each
+  reshuffle re-cached the whole transcript behind it (~11k of avoidable
+  `cache_write` per turn, growing with conversation length). Normalising here
+  covers every client, including shipped builds without the client-side
+  `.sortedKeys`.
+- **Prompt dump.** `PUPA_CLAUDE_PROMPT_DUMP=<dir>` (unset = off) writes the whole
+  prefix per options build to `<dir>/<thread>/NNN.json` — tools, base system
+  prompt, each ambient-context entry, composed system prompt, fingerprint — plus
+  `NNN.diff`, a unified diff against the thread's previous turn (`(identical)`
+  when nothing moved). Long text is stored as arrays of lines so the diff lands
+  on the line that changed. **Off by default and not for a shared deploy**: the
+  payload is user data at rest (canvas state, memories, AGENTS.md, every tool
+  schema). Client-supplied thread ids are sanitised before use as directory
+  names, and a failing dump is swallowed rather than costing the turn. See
+  [`prompt_dump.py`](../backend/pupa_backend/harnesses/claude/prompt_dump.py).
 - **Thinking.** Extended-thinking level is also selected per turn via
   `forwardedProps.llm.thinking`
   ([`resolve_thinking`](../backend/pupa_backend/harnesses/claude/thinking.py)):

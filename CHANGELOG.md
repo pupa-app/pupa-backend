@@ -4,6 +4,36 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.89] — 2026-08-20
+
+### Added
+
+- **Token and cache usage now show up in the server log.** The Claude loop
+  prints a yellow line for every model call — input, output, cache reads, cache
+  writes, and how much of the prompt came from cache — plus a totals line at the
+  end of each turn with the cost, the number of model turns, and the time spent
+  waiting on the API.
+- **The log now says why a turn re-paid for its cache.** Each turn also prints
+  what changed since the thread's last one — the model, the tool set, or a named
+  piece of the context the app sends every turn (live canvas state, memories,
+  skills). A turn that changed nothing says so, and should be cheap.
+- **Opt-in prompt dump for chasing a cache miss.** Point
+  `PUPA_CLAUDE_PROMPT_DUMP` at a scratch folder and each turn writes down exactly
+  what was sent to the model, alongside a diff against the previous turn — so
+  "nothing changed but it re-charged me" is answerable from the file rather than
+  guessed at. Off unless you set it: the files hold your app's own content.
+
+### Fixed
+
+- **Turns stopped re-paying for context that never changed.** The app describes
+  itself to the model every turn — canvas, memories, skills, subagents — and the
+  same description was arriving with its fields written in a different order each
+  time. Nothing had changed, but the model had to be re-told everything behind
+  it, including the whole conversation so far. That was roughly half the cost of
+  a short turn, and it grew as the chat got longer. The backend now reads those
+  payloads in a fixed order, so an unchanged app costs nothing to re-describe —
+  including for app versions already installed.
+
 ## [0.0.88] — 2026-08-16
 
 ### Fixed

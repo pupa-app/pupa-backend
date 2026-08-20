@@ -22,6 +22,7 @@ Subscription-only billing is asserted at registration time (fail-closed) — see
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -42,9 +43,9 @@ from fastapi.responses import StreamingResponse
 from pupa_backend.agui.tool_results import parse_tool_results
 from pupa_backend.sse_replay import register_reattach_observer
 
-from . import events, registry
+from . import events, prompt_dump, registry, usage
 from .config_mcp import SERVER_NAME as CONFIG_MCP_SERVER
-from .config_mcp import build_config_mcp
+from .config_mcp import build_config_mcp, config_tool_specs
 from .env import (
     assert_subscription_billing,
     build_sdk_env,
@@ -52,7 +53,12 @@ from .env import (
     loop_skills,
     loop_system_prompt,
 )
-from .frontend_tools import SERVER_NAME, build_frontend_mcp, frontend_qualified_names
+from .frontend_tools import (
+    SERVER_NAME,
+    build_frontend_mcp,
+    frontend_qualified_names,
+    frontend_tool_specs,
+)
 from .models import LOOP_MODEL_ALIASES, is_loop_model
 from .thinking import resolve_thinking
 from .gate import (
@@ -238,6 +244,49 @@ def _image_blocks(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
+def _canonical_json(text: str) -> str:
+    """Re-serialise a JSON payload with sorted keys; pass anything else through.
+
+    The client builds these payloads from Swift `Dictionary`s, whose iteration
+    order is randomised — so the same canvas/skills/type snapshot arrives with
+    its keys shuffled on every turn. The bytes differ, the meaning doesn't, and
+    since this block lands in the **system** prompt (which precedes `messages` in
+    the cache prefix) each reshuffle re-cached the entire transcript behind it.
+
+    Normalising here fixes it for every client, including builds already shipped
+    that will never carry the client-side `.sortedKeys`. Array order is left
+    alone — only object keys are sorted — and a value that isn't a JSON object or
+    array is returned untouched.
+    """
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(parsed, (dict, list)):
+        return text
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _context_pairs(context: list[Any] | None) -> list[tuple[str, str]]:
+    """AG-UI `input.context` as ordered `(description, value)` string pairs.
+
+    Tolerates both the pydantic `Context` model and a plain dict. Shared by
+    `_render_context` and the cache fingerprint, so the diagnosis hashes exactly
+    the text that reaches the prompt. Values are canonicalised (see
+    `_canonical_json`) so a client's key ordering can't bust the prompt cache.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in context or []:
+        desc = getattr(entry, "description", None)
+        if desc is None and isinstance(entry, dict):
+            desc = entry.get("description")
+        val = getattr(entry, "value", None)
+        if val is None and isinstance(entry, dict):
+            val = entry.get("value")
+        pairs.append(((desc or "").strip(), _canonical_json((val or "").strip())))
+    return pairs
+
+
 def _render_context(context: list[Any] | None) -> str:
     """Flatten AG-UI `input.context` into a text block (`description` then its
     stringified `value`, entries blank-line separated).
@@ -248,14 +297,8 @@ def _render_context(context: list[Any] | None) -> str:
     system prompt / AGENTS.md) only reaches the model if rendered in here.
     """
     blocks: list[str] = []
-    for entry in context or []:
-        desc = getattr(entry, "description", None)
-        if desc is None and isinstance(entry, dict):
-            desc = entry.get("description")
-        val = getattr(entry, "value", None)
-        if val is None and isinstance(entry, dict):
-            val = entry.get("value")
-        block = f"{(desc or '').strip()}\n{(val or '').strip()}".strip()
+    for desc, val in _context_pairs(context):
+        block = f"{desc}\n{val}".strip()
         if block:
             blocks.append(block)
     return "\n\n".join(blocks)
@@ -356,10 +399,60 @@ def _options_for(
     # `read` scope ≈ Claude's plan mode (investigate, don't change); otherwise the
     # gate is the authority so we stay in default permission mode.
     permission_mode = "plan" if scope == "read" else "default"
+    base_system = loop_system_prompt(state)
+    system = _compose_system_prompt(base_system, input.context)
+    thinking = resolve_thinking(input) or {}
+    model = _resolve_loop_model(input)
+    skills = loop_skills()
+    cwd = os.getenv("CLAUDE_CODE_WORKSPACE") or None
+    # Anthropic caches on an exact `tools` → `system` → `messages` prefix and the
+    # CLI owns the breakpoints, so anything drifting here re-writes the whole
+    # cache instead of reading it. Log what moved since this thread's last turn.
+    tool_specs = frontend_tool_specs(list(tools_descriptors or [])) + config_tool_specs(mcp)
+    context_pairs = _context_pairs(input.context)
+    fingerprint = usage.fingerprint(
+        model=model,
+        base_system=base_system,
+        system=system,
+        context_pairs=context_pairs,
+        tool_specs=tool_specs,
+        permission_mode=permission_mode,
+        thinking=thinking,
+        skills=skills,
+        cwd=cwd,
+    )
+    logger.info(
+        usage.cache_line(
+            session.thread_id,
+            fingerprint,
+            tool_count=len(tool_specs),
+            system_chars=len(system),
+        )
+    )
+    # `PUPA_CLAUDE_PROMPT_DUMP=<dir>` (off by default — the payload is user data)
+    # writes this exact prefix plus a unified diff against the thread's previous
+    # turn, for when the fingerprint key isn't enough to see what moved.
+    if prompt_dump.dump_dir() is not None:
+        prompt_dump.write(
+            session.thread_id,
+            prompt_dump.build_payload(
+                thread_id=session.thread_id,
+                model=model,
+                base_system=base_system,
+                system=system,
+                context_pairs=context_pairs,
+                tool_specs=tool_specs,
+                permission_mode=permission_mode,
+                thinking=thinking,
+                skills=skills,
+                cwd=cwd,
+                fingerprint=fingerprint,
+            ),
+        )
     return ClaudeAgentOptions(
-        system_prompt=_compose_system_prompt(loop_system_prompt(state), input.context),
+        system_prompt=system,
         mcp_servers=mcp_servers,
-        skills=loop_skills(),
+        skills=skills,
         allowed_tools=allowed,
         disallowed_tools=_DISALLOWED_BUILTINS,
         can_use_tool=make_can_use_tool(state, session),
@@ -374,16 +467,16 @@ def _options_for(
         # (skills are discovered from them) — the PreToolUse hook still fires and is
         # the permission authority regardless of settings-level allow-rules.
         setting_sources=loop_setting_sources(),
-        cwd=os.getenv("CLAUDE_CODE_WORKSPACE") or None,
+        cwd=cwd,
         # Per-request model (iOS `forwardedProps.llm.model`) wins, else the
         # `CLAUDE_CODE_MODEL` config/env default, else Opus 4.8. See
         # `_resolve_loop_model`.
-        model=_resolve_loop_model(input),
+        model=model,
         # Per-request extended-thinking level (iOS `forwardedProps.llm.thinking`).
         # Spread as `thinking=` only when a known level was picked; otherwise the
         # option stays unset and the CLI/subscription default applies. See
         # `resolve_thinking`.
-        **(resolve_thinking(input) or {}),
+        **thinking,
         resume=resume_id,
         # Stream assistant text token-by-token: the SDK then yields partial
         # `StreamEvent`s that `_pump` maps to incremental `TextMessageContent`
@@ -502,6 +595,14 @@ async def _pump(session: registry.LiveSession) -> None:
                 if model and session.sdk_model is None:
                     session.sdk_model = model
                     logger.info("claude_code loop: model=%s (thread=%s)", model, thread_id)
+                # Per-API-call token + cache stats (yellow). The SDK yields one
+                # `AssistantMessage` per content block, all carrying the same
+                # message-level usage, so log once per message id — otherwise a
+                # text+tool_use reply prints the identical line several times.
+                if events.record_usage_logged(msg, stream_state):
+                    token_line = usage.message_line(getattr(msg, "usage", None), thread_id)
+                    if token_line:
+                        logger.info(token_line)
                 # Skip only the text that actually streamed above (avoids a duplicate
                 # whole-block emit). Messages the CLI fabricates locally — rate-limit
                 # notices, API errors, the "No response requested." reply to a query
@@ -531,6 +632,10 @@ async def _pump(session: registry.LiveSession) -> None:
                     session.emit(events.run_finished(thread_id, session.current_run_id or ""))
                     session.mark_interrupt()
             elif isinstance(msg, ResultMessage):
+                # Turn totals + cost (yellow). Logged before the continuation
+                # hand-off so a widened continuation still reports the tokens
+                # its predecessor turn burned.
+                logger.info(usage.result_line(msg, thread_id))
                 descriptors = session.pending_widen_descriptors
                 if descriptors is not None and session.sdk_session_id:
                     # A gate tool unlocked more tools; the endpoint interrupted the
