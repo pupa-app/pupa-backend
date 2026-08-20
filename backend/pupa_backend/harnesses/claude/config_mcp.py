@@ -76,6 +76,22 @@ def _make_handler(lc_tool: Any):
     return _handler
 
 
+def config_tool_specs(mcp: Any) -> list[tuple[str, str, dict[str, Any]]]:
+    """Ordered `(name, description, schema)` for the bridged config MCP tools.
+
+    Mirrors what `build_config_mcp` hands the model, for prefix fingerprinting.
+    """
+    tools = list(getattr(mcp, "tools", None) or []) if mcp is not None else []
+    specs: list[tuple[str, str, dict[str, Any]]] = []
+    for lc_tool in tools:
+        name = getattr(lc_tool, "name", None)
+        if name:
+            specs.append(
+                (qualified_name(name), getattr(lc_tool, "description", "") or "", _input_schema(lc_tool))
+            )
+    return specs
+
+
 def build_config_mcp(mcp: Any) -> tuple[Any, set[str]]:
     """Wrap the shared `MCPServersLifecycle` tools as one in-process SDK server.
 

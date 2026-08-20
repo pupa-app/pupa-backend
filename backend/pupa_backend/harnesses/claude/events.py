@@ -103,7 +103,30 @@ def new_stream_state() -> dict[str, Any]:
     `streamed_text_ids` records every message id that opened a *text* block, so the
     pump can skip re-emitting exactly those and no others.
     """
-    return {"message_id": None, "text_open": False, "streamed_text_ids": set()}
+    return {
+        "message_id": None,
+        "text_open": False,
+        "streamed_text_ids": set(),
+        "usage_logged_ids": set(),
+    }
+
+
+def record_usage_logged(msg: Any, state: dict[str, Any]) -> bool:
+    """True the first time this turn sees `msg`'s message id — else False.
+
+    The SDK emits one `AssistantMessage` per content block and every one carries
+    the same message-level `usage`, so the pump would log identical token lines
+    once per block. A message with no id is always logged (it can't be deduped
+    against anything).
+    """
+    message_id = getattr(msg, "message_id", None)
+    if message_id is None:
+        return True
+    seen = state.setdefault("usage_logged_ids", set())
+    if message_id in seen:
+        return False
+    seen.add(message_id)
+    return True
 
 
 def text_already_streamed(msg: Any, state: dict[str, Any]) -> bool:

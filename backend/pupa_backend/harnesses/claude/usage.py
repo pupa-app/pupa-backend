@@ -14,6 +14,8 @@ The `claude` CLI reports usage twice per turn:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 _Y = "\033[33m"  # yellow — token stats
@@ -109,3 +111,89 @@ def result_line(msg: Any, thread_id: str) -> str:
     if per_model:
         parts.append(per_model)
     return f"{_Y}claude_code turn totals: {' '.join(parts)} (thread={thread_id}){_X}"
+
+
+# --------------------------------------------------------------------------- #
+# Prompt-cache diagnosis
+# --------------------------------------------------------------------------- #
+#
+# Anthropic caches on an exact prefix: `tools` → `system` → `messages`. The
+# `claude` CLI sets the `cache_control` breakpoints itself (there is no knob on
+# `ClaudeAgentOptions`, and a non-zero `cache_write` proves it is asking for a
+# cache), so a run that writes on every turn and never reads is not a "we forgot
+# to request caching" problem — it means the prefix we hand the CLI changed.
+#
+# The loop rebuilds `ClaudeAgentOptions` from scratch on every POST, so any of
+# these drifting silently costs a full re-cache. We fingerprint the parts we
+# control and log which ones moved since the thread's previous turn; the names
+# mirror the CLI's own cache-miss reasons ("system prompt changed", "tools
+# changed", "tool prompt/schema changed, same tool set", "model changed", …).
+
+_MAX_TRACKED_THREADS = 256
+_PREV_FINGERPRINT: dict[str, dict[str, str]] = {}
+
+
+def _digest(value: Any) -> str:
+    blob = json.dumps(value, sort_keys=True, default=str).encode()
+    return hashlib.sha1(blob, usedforsecurity=False).hexdigest()[:8]
+
+
+def fingerprint(
+    *,
+    model: str | None,
+    base_system: str,
+    system: str,
+    tool_specs: list[tuple[str, str, Any]],
+    permission_mode: str | None,
+    thinking: Any,
+    skills: Any,
+    cwd: str | None,
+) -> dict[str, str]:
+    """Hash every input that lands in the cacheable prefix.
+
+    `tool_specs` is the ordered `(name, description, schema)` list for the whole
+    advertised surface (frontend + config MCP). `base_system` is the loop prompt
+    *without* the per-turn ambient-context block, so a drifting system prompt can
+    be attributed to the volatile tail rather than the stable head.
+    """
+    names = [name for name, _desc, _schema in tool_specs]
+    return {
+        "model": model or "",
+        "base_system": _digest(base_system),
+        "system": _digest(system),
+        "tool_set": _digest(sorted(names)),
+        "tool_order": _digest(names),
+        "tool_schemas": _digest(tool_specs),
+        "permission_mode": permission_mode or "",
+        "thinking": _digest(thinking),
+        "skills": _digest(skills),
+        "cwd": cwd or "",
+    }
+
+
+def cache_line(thread_id: str, fp: dict[str, str], tool_count: int, system_chars: int) -> str:
+    """Yellow line naming what moved in the cacheable prefix since last turn.
+
+    Also records `fp` as the thread's new baseline, so this is called exactly
+    once per options build.
+    """
+    prev = _PREV_FINGERPRINT.get(thread_id)
+    _PREV_FINGERPRINT[thread_id] = fp
+    while len(_PREV_FINGERPRINT) > _MAX_TRACKED_THREADS:
+        _PREV_FINGERPRINT.pop(next(iter(_PREV_FINGERPRINT)))
+
+    shape = f"tools={tool_count} system={_n(system_chars)}ch"
+    if prev is None:
+        body = f"first turn on this thread, {shape} — full cache write expected"
+    else:
+        changed = sorted(k for k, v in fp.items() if prev.get(k) != v)
+        if changed:
+            body = f"prefix changed [{', '.join(changed)}], {shape} — cache write expected"
+        else:
+            body = f"prefix unchanged, {shape} — cache read expected"
+    return f"{_Y}claude_code cache: {body} (thread={thread_id}){_X}"
+
+
+def reset_fingerprints() -> None:
+    """Drop all remembered prefixes (tests)."""
+    _PREV_FINGERPRINT.clear()

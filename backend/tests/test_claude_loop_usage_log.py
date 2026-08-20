@@ -135,3 +135,134 @@ async def test_pump_logs_per_call_and_turn_totals(caplog) -> None:
     assert "claude_code turn totals:" in logged
     assert "cache_read=18,000" in logged
     assert "cost=$0.0123" in logged
+
+
+async def test_pump_logs_one_token_line_per_message_not_per_block(caplog) -> None:
+    """The SDK yields one `AssistantMessage` per content block, each carrying the
+    same message-level usage — the pump must not print the identical line twice."""
+
+    def _block(text):
+        return AssistantMessage(
+            content=[TextBlock(text=text)],
+            model="fake",
+            message_id="m1",  # same message, different blocks
+            session_id="sdk-1",
+            usage=USAGE,
+        )
+
+    class _Client:
+        async def receive_response(self):
+            yield _block("part one")
+            yield _block("part two")
+            yield _block("part three")
+            yield ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                num_turns=1, session_id="sdk-1", usage=USAGE,
+            )
+
+    session = registry.LiveSession(thread_id="t-dedupe")
+    session.client = _Client()
+    session.current_run_id = "run-1"
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        await cl_endpoint._pump(session)
+
+    assert sum("claude_code tokens:" in m for m in caplog.messages) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Prompt-cache prefix diagnosis
+# --------------------------------------------------------------------------- #
+
+def _fp(**over):
+    """A fingerprint of a plausible prefix; `over` perturbs one input."""
+    base = dict(
+        model="claude-opus-4-8",
+        base_system="you are pupa",
+        system="you are pupa\n\nambient: canvas empty",
+        tool_specs=[("mcp__pupa_frontend__a", "does a", {"type": "object"})],
+        permission_mode="default",
+        thinking={},
+        skills=None,
+        cwd=None,
+    )
+    base.update(over)
+    return usage.fingerprint(**base)
+
+
+def test_unchanged_prefix_predicts_a_cache_read() -> None:
+    usage.reset_fingerprints()
+    first = usage.cache_line("t", _fp(), tool_count=1, system_chars=40)
+    assert "first turn on this thread" in first
+    assert "full cache write expected" in first
+
+    second = usage.cache_line("t", _fp(), tool_count=1, system_chars=40)
+    assert "prefix unchanged" in second
+    assert "cache read expected" in second
+
+
+def test_volatile_ambient_context_is_attributed_to_system_not_base() -> None:
+    """The ambient block is appended to the system prompt every turn; when it
+    moves, `system` changes while `base_system` holds — that distinction is the
+    whole point of hashing both."""
+    usage.reset_fingerprints()
+    usage.cache_line("t", _fp(), tool_count=1, system_chars=40)
+    line = usage.cache_line(
+        "t", _fp(system="you are pupa\n\nambient: canvas has 3 items"),
+        tool_count=1, system_chars=52,
+    )
+    assert "prefix changed [system]" in line
+    assert "base_system" not in line
+    assert "cache write expected" in line
+
+
+def test_a_widened_tool_set_changes_set_order_and_schemas() -> None:
+    usage.reset_fingerprints()
+    usage.cache_line("t", _fp(), tool_count=1, system_chars=40)
+    line = usage.cache_line(
+        "t",
+        _fp(tool_specs=[
+            ("mcp__pupa_frontend__a", "does a", {"type": "object"}),
+            ("mcp__pupa_frontend__b", "does b", {"type": "object"}),
+        ]),
+        tool_count=2, system_chars=40,
+    )
+    assert "tool_set" in line and "tool_order" in line and "tool_schemas" in line
+
+
+def test_reordered_tools_break_the_prefix_even_with_the_same_set() -> None:
+    """Same tools in a different order is still a different prompt — this mirrors
+    the CLI's own "tool prompt/schema changed, same tool set" miss reason."""
+    usage.reset_fingerprints()
+    specs = [
+        ("mcp__pupa_frontend__a", "does a", {"type": "object"}),
+        ("mcp__pupa_frontend__b", "does b", {"type": "object"}),
+    ]
+    usage.cache_line("t", _fp(tool_specs=specs), tool_count=2, system_chars=40)
+    line = usage.cache_line("t", _fp(tool_specs=list(reversed(specs))), tool_count=2, system_chars=40)
+    assert "tool_order" in line
+    assert "tool_set" not in line  # the set is identical; only the order moved
+
+
+def test_model_and_permission_mode_flips_are_named() -> None:
+    usage.reset_fingerprints()
+    usage.cache_line("t", _fp(), tool_count=1, system_chars=40)
+    line = usage.cache_line(
+        "t", _fp(model="claude-sonnet-4-5", permission_mode="plan"),
+        tool_count=1, system_chars=40,
+    )
+    assert "model" in line and "permission_mode" in line
+
+
+def test_threads_are_tracked_independently() -> None:
+    usage.reset_fingerprints()
+    usage.cache_line("a", _fp(), tool_count=1, system_chars=40)
+    assert "first turn on this thread" in usage.cache_line("b", _fp(), tool_count=1, system_chars=40)
+    assert "prefix unchanged" in usage.cache_line("a", _fp(), tool_count=1, system_chars=40)
+
+
+def test_fingerprint_tracking_is_bounded() -> None:
+    usage.reset_fingerprints()
+    for i in range(usage._MAX_TRACKED_THREADS + 50):
+        usage.cache_line(f"t{i}", _fp(), tool_count=1, system_chars=40)
+    assert len(usage._PREV_FINGERPRINT) == usage._MAX_TRACKED_THREADS

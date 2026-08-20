@@ -44,7 +44,7 @@ from pupa_backend.sse_replay import register_reattach_observer
 
 from . import events, registry, usage
 from .config_mcp import SERVER_NAME as CONFIG_MCP_SERVER
-from .config_mcp import build_config_mcp
+from .config_mcp import build_config_mcp, config_tool_specs
 from .env import (
     assert_subscription_billing,
     build_sdk_env,
@@ -52,7 +52,12 @@ from .env import (
     loop_skills,
     loop_system_prompt,
 )
-from .frontend_tools import SERVER_NAME, build_frontend_mcp, frontend_qualified_names
+from .frontend_tools import (
+    SERVER_NAME,
+    build_frontend_mcp,
+    frontend_qualified_names,
+    frontend_tool_specs,
+)
 from .models import LOOP_MODEL_ALIASES, is_loop_model
 from .thinking import resolve_thinking
 from .gate import (
@@ -356,10 +361,37 @@ def _options_for(
     # `read` scope ≈ Claude's plan mode (investigate, don't change); otherwise the
     # gate is the authority so we stay in default permission mode.
     permission_mode = "plan" if scope == "read" else "default"
+    base_system = loop_system_prompt(state)
+    system = _compose_system_prompt(base_system, input.context)
+    thinking = resolve_thinking(input) or {}
+    model = _resolve_loop_model(input)
+    skills = loop_skills()
+    cwd = os.getenv("CLAUDE_CODE_WORKSPACE") or None
+    # Anthropic caches on an exact `tools` → `system` → `messages` prefix and the
+    # CLI owns the breakpoints, so anything drifting here re-writes the whole
+    # cache instead of reading it. Log what moved since this thread's last turn.
+    tool_specs = frontend_tool_specs(list(tools_descriptors or [])) + config_tool_specs(mcp)
+    logger.info(
+        usage.cache_line(
+            session.thread_id,
+            usage.fingerprint(
+                model=model,
+                base_system=base_system,
+                system=system,
+                tool_specs=tool_specs,
+                permission_mode=permission_mode,
+                thinking=thinking,
+                skills=skills,
+                cwd=cwd,
+            ),
+            tool_count=len(tool_specs),
+            system_chars=len(system),
+        )
+    )
     return ClaudeAgentOptions(
-        system_prompt=_compose_system_prompt(loop_system_prompt(state), input.context),
+        system_prompt=system,
         mcp_servers=mcp_servers,
-        skills=loop_skills(),
+        skills=skills,
         allowed_tools=allowed,
         disallowed_tools=_DISALLOWED_BUILTINS,
         can_use_tool=make_can_use_tool(state, session),
@@ -374,16 +406,16 @@ def _options_for(
         # (skills are discovered from them) — the PreToolUse hook still fires and is
         # the permission authority regardless of settings-level allow-rules.
         setting_sources=loop_setting_sources(),
-        cwd=os.getenv("CLAUDE_CODE_WORKSPACE") or None,
+        cwd=cwd,
         # Per-request model (iOS `forwardedProps.llm.model`) wins, else the
         # `CLAUDE_CODE_MODEL` config/env default, else Opus 4.8. See
         # `_resolve_loop_model`.
-        model=_resolve_loop_model(input),
+        model=model,
         # Per-request extended-thinking level (iOS `forwardedProps.llm.thinking`).
         # Spread as `thinking=` only when a known level was picked; otherwise the
         # option stays unset and the CLI/subscription default applies. See
         # `resolve_thinking`.
-        **(resolve_thinking(input) or {}),
+        **thinking,
         resume=resume_id,
         # Stream assistant text token-by-token: the SDK then yields partial
         # `StreamEvent`s that `_pump` maps to incremental `TextMessageContent`
@@ -502,12 +534,14 @@ async def _pump(session: registry.LiveSession) -> None:
                 if model and session.sdk_model is None:
                     session.sdk_model = model
                     logger.info("claude_code loop: model=%s (thread=%s)", model, thread_id)
-                # Per-API-call token + cache stats (yellow). This is the only
-                # place the cache read/write split is visible per call — the
-                # ResultMessage below only has turn totals.
-                token_line = usage.message_line(getattr(msg, "usage", None), thread_id)
-                if token_line:
-                    logger.info(token_line)
+                # Per-API-call token + cache stats (yellow). The SDK yields one
+                # `AssistantMessage` per content block, all carrying the same
+                # message-level usage, so log once per message id — otherwise a
+                # text+tool_use reply prints the identical line several times.
+                if events.record_usage_logged(msg, stream_state):
+                    token_line = usage.message_line(getattr(msg, "usage", None), thread_id)
+                    if token_line:
+                        logger.info(token_line)
                 # Skip only the text that actually streamed above (avoids a duplicate
                 # whole-block emit). Messages the CLI fabricates locally — rate-limit
                 # notices, API errors, the "No response requested." reply to a query

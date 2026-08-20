@@ -94,6 +94,20 @@ def build_frontend_mcp(tools: list[Any], session: LiveSession) -> tuple[Any, set
     return server, qualified
 
 
+def frontend_tool_specs(tools: list[Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    """Ordered `(name, description, schema)` for `tools` — what the model sees.
+
+    Used to fingerprint the cacheable prompt prefix (`usage.fingerprint`) without
+    building a server.
+    """
+    specs: list[tuple[str, str, dict[str, Any]]] = []
+    for descriptor in tools or []:
+        name, description, schema = _descriptor_fields(descriptor)
+        if name:
+            specs.append((qualified_name(name), description, schema))
+    return specs
+
+
 def frontend_qualified_names(tools: list[Any]) -> set[str]:
     """Qualified (`mcp__pupa_frontend__*`) names for `tools`, without building a
     server. Lets a resume POST detect a gate-widened surface (new names vs the
