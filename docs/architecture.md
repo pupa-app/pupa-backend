@@ -484,6 +484,16 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   says `prefix unchanged` but the tokens line still shows a large `cache_write`
   points at the messages block instead (transcript re-serialisation across the
   `resume`), not at the options build.
+- **Prompt dump.** `PUPA_CLAUDE_PROMPT_DUMP=<dir>` (unset = off) writes the whole
+  prefix per options build to `<dir>/<thread>/NNN.json` — tools, base system
+  prompt, each ambient-context entry, composed system prompt, fingerprint — plus
+  `NNN.diff`, a unified diff against the thread's previous turn (`(identical)`
+  when nothing moved). Long text is stored as arrays of lines so the diff lands
+  on the line that changed. **Off by default and not for a shared deploy**: the
+  payload is user data at rest (canvas state, memories, AGENTS.md, every tool
+  schema). Client-supplied thread ids are sanitised before use as directory
+  names, and a failing dump is swallowed rather than costing the turn. See
+  [`prompt_dump.py`](../backend/pupa_backend/harnesses/claude/prompt_dump.py).
 - **Thinking.** Extended-thinking level is also selected per turn via
   `forwardedProps.llm.thinking`
   ([`resolve_thinking`](../backend/pupa_backend/harnesses/claude/thinking.py)):

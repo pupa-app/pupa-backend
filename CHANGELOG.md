@@ -17,6 +17,11 @@ bumps (`0.0.X` → `0.0.X+1`).
   what changed since the thread's last one — the model, the tool set, or a named
   piece of the context the app sends every turn (live canvas state, memories,
   skills). A turn that changed nothing says so, and should be cheap.
+- **Opt-in prompt dump for chasing a cache miss.** Point
+  `PUPA_CLAUDE_PROMPT_DUMP` at a scratch folder and each turn writes down exactly
+  what was sent to the model, alongside a diff against the previous turn — so
+  "nothing changed but it re-charged me" is answerable from the file rather than
+  guessed at. Off unless you set it: the files hold your app's own content.
 
 ## [0.0.88] — 2026-08-16
 

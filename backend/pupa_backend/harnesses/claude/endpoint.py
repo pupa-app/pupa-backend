@@ -42,7 +42,7 @@ from fastapi.responses import StreamingResponse
 from pupa_backend.agui.tool_results import parse_tool_results
 from pupa_backend.sse_replay import register_reattach_observer
 
-from . import events, registry, usage
+from . import events, prompt_dump, registry, usage
 from .config_mcp import SERVER_NAME as CONFIG_MCP_SERVER
 from .config_mcp import build_config_mcp, config_tool_specs
 from .env import (
@@ -384,24 +384,46 @@ def _options_for(
     # CLI owns the breakpoints, so anything drifting here re-writes the whole
     # cache instead of reading it. Log what moved since this thread's last turn.
     tool_specs = frontend_tool_specs(list(tools_descriptors or [])) + config_tool_specs(mcp)
+    context_pairs = _context_pairs(input.context)
+    fingerprint = usage.fingerprint(
+        model=model,
+        base_system=base_system,
+        system=system,
+        context_pairs=context_pairs,
+        tool_specs=tool_specs,
+        permission_mode=permission_mode,
+        thinking=thinking,
+        skills=skills,
+        cwd=cwd,
+    )
     logger.info(
         usage.cache_line(
             session.thread_id,
-            usage.fingerprint(
+            fingerprint,
+            tool_count=len(tool_specs),
+            system_chars=len(system),
+        )
+    )
+    # `PUPA_CLAUDE_PROMPT_DUMP=<dir>` (off by default — the payload is user data)
+    # writes this exact prefix plus a unified diff against the thread's previous
+    # turn, for when the fingerprint key isn't enough to see what moved.
+    if prompt_dump.dump_dir() is not None:
+        prompt_dump.write(
+            session.thread_id,
+            prompt_dump.build_payload(
+                thread_id=session.thread_id,
                 model=model,
                 base_system=base_system,
                 system=system,
-                context_pairs=_context_pairs(input.context),
+                context_pairs=context_pairs,
                 tool_specs=tool_specs,
                 permission_mode=permission_mode,
                 thinking=thinking,
                 skills=skills,
                 cwd=cwd,
+                fingerprint=fingerprint,
             ),
-            tool_count=len(tool_specs),
-            system_chars=len(system),
         )
-    )
     return ClaudeAgentOptions(
         system_prompt=system,
         mcp_servers=mcp_servers,
