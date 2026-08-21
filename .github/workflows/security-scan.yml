@@ -1,0 +1,66 @@
+name: Security scan
+
+# Dependency vulnerabilities + leaked secrets, on every PR and on the release
+# branches. Deliberately NOT path-filtered like backend-tests.yml: a lockfile
+# is only one of the ways a vulnerability arrives, and a leaked secret can land
+# in any file in the repo.
+#
+# Neither job is a required check — advisories appear and disappear without any
+# change on our side, so a red scan is a signal to triage, not a merge block.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  schedule:
+    # Weekly, so a newly-published advisory against an unchanged lockfile still
+    # surfaces. Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      # Audit the resolved lockfile, not the `>=` floors in pyproject.toml —
+      # uv.lock is what actually gets installed.
+      - name: Export locked requirements
+        working-directory: backend
+        run: uv export --frozen --no-emit-project --format requirements-txt > /tmp/requirements.txt
+
+      # --no-deps: the export is already the fully-resolved set, so there is
+      # nothing left to resolve and pip-audit shouldn't build a venv to do it.
+      - name: Audit
+        run: |
+          uvx pip-audit --requirement /tmp/requirements.txt --no-deps --strict --progress-spinner off
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so a secret committed earlier in the branch is caught
+          # too, not just the tip.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

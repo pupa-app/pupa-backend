@@ -12,10 +12,10 @@ When auth is required, every non-public request must carry
 `Authorization: Bearer <token>` and the token must match one of:
 1. A live (non-revoked) paired device token in the `DeviceStore`.
 2. The exact `PUPA_API_KEY` value (constant-time compared) — the
-   server-side bootstrap credential used by `make pair` to authenticate
-   against `/auth/pair/begin` for the very first device. Never given to
-   end-user clients; the operator can unset it once at least one device
-   is paired.
+   server-side operator credential used by `make pair` to authenticate
+   against `/auth/pair/begin`. Never given to end-user clients. Keep it
+   set: `/auth/pair/begin` accepts nothing else, so unsetting it means no
+   further devices can be paired.
 
 When matched, the resolved auth identity is attached to `request.state.auth`
 as `("device", PairedDevice)` or `("api_key", None)`. Future per-scope
@@ -32,7 +32,7 @@ import hmac
 import os
 from collections.abc import Awaitable, Callable
 
-from fastapi import Request
+from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
@@ -44,7 +44,8 @@ def _is_public(path: str) -> bool:
         return True
     # `/auth/pair` is the bootstrap-code-exchange endpoint — the code IS the
     # credential, so we can't gate it behind a token (the device doesn't have
-    # one yet). `/auth/pair/begin` is gated; only `/auth/pair` itself is open.
+    # one yet). `/auth/pair/begin` is not public and is additionally
+    # operator-only via `require_api_key()`; only `/auth/pair` is open.
     if path == "/auth/pair":
         return True
     # The AGUI helper registers `GET {path}/health` — with `path="/"` that
@@ -93,3 +94,38 @@ async def api_key_middleware(
         return await call_next(request)
 
     return _unauthorized()
+
+
+async def run_scope_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Require the `agent` scope on harness run endpoints (`POST /`,
+    `POST /harnesses/{id}`).
+
+    Those routes can't carry a `Depends(require_scope(...))`: the LangGraph one
+    is mounted by a third-party helper that takes no `dependencies=`. So the
+    check lives here instead, keyed on the paths harnesses record in
+    `app.state.run_paths` when they mount. Runs *inside* `api_key_middleware`,
+    which is what puts `request.state.auth` there.
+    """
+    if request.method != "POST":
+        return await call_next(request)
+    run_paths = getattr(request.app.state, "run_paths", None)
+    if not run_paths or request.url.path not in run_paths:
+        return await call_next(request)
+    if truthy(os.getenv("PUPA_AUTH_DISABLED")):
+        return await call_next(request)
+
+    identity = getattr(request.state, "auth", None)
+    if identity is None:
+        return _unauthorized()
+    kind, principal = identity
+    if kind == "api_key":
+        return await call_next(request)
+    if kind == "device" and principal is not None and principal.has_scope("agent"):
+        return await call_next(request)
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"detail": "Missing required scope: 'agent'"},
+    )

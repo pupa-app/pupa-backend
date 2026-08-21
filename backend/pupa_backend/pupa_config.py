@@ -22,6 +22,8 @@ YAML_FILE = CONFIG_DIR / "config.yml"
 _YAML_TO_ENV: dict[str, str] = {
     "persistence.database_url":      "DATABASE_URL",
     "persistence.require_db_scheme": "PUPA_REQUIRE_DB_SCHEME",
+    # bool: `transport.require_https: true` → "1". Refuse plaintext requests.
+    "transport.require_https": "PUPA_REQUIRE_HTTPS",
     "tls.cert":              "PUPA_TLS_CERT",
     "tls.key":               "PUPA_TLS_KEY",
     "tls.hostname":          "PUPA_HOSTNAME",

@@ -88,6 +88,14 @@ skills_disabled: true
 persistence:
   require_db_scheme: postgresql
 
+# Hard requirement: refuse plaintext. Railway terminates TLS in front of a
+# loopback-bound listener and forwards `X-Forwarded-Proto: https`, so this
+# costs nothing here and closes the one window where a device token crosses
+# the wire in the clear (the pairing exchange). Self-hosted LAN installs leave
+# it unset — that's why it's a flag and not the default.
+transport:
+  require_https: true
+
 # Tracing is opt-out: on automatically once LANGFUSE_PUBLIC_KEY +
 # LANGFUSE_SECRET_KEY are supplied as Railway env vars; without them the
 # tracer no-ops. Set `langfuse.disabled: true` (→ PUPA_LANGFUSE_DISABLED=1)

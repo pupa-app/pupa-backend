@@ -40,6 +40,7 @@ import os
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from pupa_backend.auth.devices import get_store as get_device_store, truthy
+from pupa_backend.auth.transport import is_secure_request, require_https_enabled
 
 from .broker import ShareSession, broker
 from .sidecar_token import validate as validate_sidecar_token
@@ -88,6 +89,14 @@ async def screenshare_ws(
     role: str | None = None,
     share_id: str | None = None,
 ) -> None:
+    # WebSockets skip the HTTP middleware stack entirely, so the transport
+    # check is inline here — same reason auth is. The signalling socket carries
+    # the device token in its Authorization header, so a plaintext `ws://` hop
+    # leaks it exactly like a plaintext HTTP one would.
+    if require_https_enabled() and not is_secure_request(websocket):
+        await websocket.close(code=4403)
+        return
+
     if not await _authorised(websocket):
         await websocket.close(code=4401)
         return

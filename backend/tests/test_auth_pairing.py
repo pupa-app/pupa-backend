@@ -93,6 +93,45 @@ def test_pair_begin_requires_auth(monkeypatch: pytest.MonkeyPatch, app: FastAPI)
     assert resp.status_code == 401
 
 
+def test_pair_begin_rejects_a_device_token(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    """Only the operator mints pairing codes. A device token authenticates
+    fine at the middleware but must not be able to mint another device —
+    otherwise a leaked token outlives the revocation of its own device.
+    """
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    begin = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": "Bearer k"}
+    ).json()
+    token = client.post(
+        "/auth/pair", json={"code": begin["code"], "label": "phone"}
+    ).json()["token"]
+
+    resp = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 403
+    assert "PUPA_API_KEY" in resp.json()["detail"]
+
+
+def test_pair_begin_rejects_unknown_scopes(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    """Scope names are a closed set; a typo shouldn't mint a token whose
+    scope silently matches nothing."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    resp = client.post(
+        "/auth/pair/begin",
+        json={"scopes": ["agent", "root"]},
+        headers={"Authorization": "Bearer k"},
+    )
+    assert resp.status_code == 422
+    assert "root" in str(resp.json())
+
+
 def test_pair_begin_returns_code_and_metadata(
     monkeypatch: pytest.MonkeyPatch, app: FastAPI
 ) -> None:

@@ -58,11 +58,11 @@ def _post(url: str, body: dict, api_key: str | None) -> dict:
         with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        if exc.code == 401:
+        if exc.code in (401, 403):
             sys.exit(
-                "401 from backend. The /auth/pair/begin route requires an existing\n"
-                "credential. Either export PUPA_API_KEY=... before running\n"
-                "`make pair`, or pair from a device that's already authenticated.\n"
+                f"{exc.code} from backend. /auth/pair/begin is operator-only:\n"
+                "export PUPA_API_KEY=... before running `make pair`. A paired\n"
+                "device token is not accepted here — devices can't mint devices.\n"
             )
         sys.exit(f"HTTP {exc.code} from {url}: {exc.read().decode('utf-8', errors='replace')}")
     except urllib.error.URLError as exc:

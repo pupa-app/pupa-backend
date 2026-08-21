@@ -4,6 +4,55 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.90] — 2026-08-21
+
+### Security
+
+- **Devices can no longer pair other devices.** Minting a pairing code
+  (`/auth/pair/begin`) now requires the operator key. Before, any paired-device
+  token was accepted, which meant a leaked token could quietly issue itself a
+  replacement — and revoking the device it came from wouldn't end the access.
+  **Keep `PUPA_API_KEY` set:** it is now the only credential that can pair a
+  device, so unsetting it after the first pair means you can't add a second.
+- **Pairing requests asked for their own permissions, and got them.** The
+  scope list in a `/auth/pair/begin` body was used as sent. It's now checked
+  against the known set, and the route it arrives on is operator-only.
+- **Running the agent now requires the `agent` scope.** `POST /` and
+  `POST /harnesses/{id}` previously accepted any valid token regardless of the
+  scopes it was issued with — which is the most powerful thing a token can do,
+  since it reaches every backend tool.
+- **The pairing endpoints are rate limited.** `/auth/pair` is the one route a
+  stranger can call, and nothing stopped them calling it at full speed. Now 5
+  attempts per client per minute, 60 across all clients, with
+  `PUPA_RATE_LIMIT_DISABLED=1` for local loops. Bucketing reads
+  `X-Forwarded-For`: every tunnel mode terminates in front of a loopback
+  listener, so the peer address is `127.0.0.1` for everyone.
+- **New `PUPA_REQUIRE_HTTPS` refuses plaintext.** Off by default so LAN and
+  offline installs keep working; **set it on anything reachable from the
+  internet**, where it's the difference between handing the device token to the
+  client and handing it to the network. Pinned on in the cloud image. Covers
+  the screen-share socket too.
+- **The shell tool no longer inherits your API keys.** `SHELL_PASS_ENV=1`
+  handed the backend's whole environment to a subprocess the *model* drives,
+  filtered only by a list the operator had to write themselves. Secret-shaped
+  names (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …) are now dropped by default;
+  `SHELL_ENV_ALLOW` names exceptions.
+- **Responses carry security headers** — `nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, and HSTS on TLS connections. Still no CORS:
+  there's no browser origin to allow.
+- **33 known vulnerabilities in dependencies, fixed.** The lockfile carried
+  advisories against `starlette`, `aiohttp`, `cryptography`, `mcp`,
+  `python-multipart` and others. Upgraded to zero. CI now runs `pip-audit` and
+  a secret scan weekly and on every PR, so the next one surfaces in review.
+
+### Fixed
+
+- **A frontend tool call no longer stops the chat when it lands second.**
+  `ag-ui-langgraph` 0.0.43 fixes the emit path that only looked for parked
+  interrupts on the first task — when one parked elsewhere, the turn ended
+  looking exactly like a clean finish and the chat sat silent until the user
+  typed again.
+
 ## [0.0.89] — 2026-08-20
 
 ### Added

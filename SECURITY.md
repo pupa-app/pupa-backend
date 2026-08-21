@@ -31,11 +31,23 @@ pupa-backend is designed to be **operator-run**. A few properties are important
 when assessing risk:
 
 - **Auth is required by default.** The only client credential is a paired-device
-  bearer token; the bootstrap `PUPA_API_KEY` never reaches a client. Per-route
+  bearer token; the operator `PUPA_API_KEY` never reaches a client. Per-route
   authorization is enforced via scopes (see
-  [`backend/pupa_backend/auth/scopes.py`](backend/pupa_backend/auth/scopes.py)).
+  [`backend/pupa_backend/auth/scopes.py`](backend/pupa_backend/auth/scopes.py)),
+  including the agent run endpoints.
   `PUPA_AUTH_DISABLED=1` removes all auth and is **only** for a same-machine dev
   loop — never expose such a backend to a network.
+- **Devices cannot mint devices.** `/auth/pair/begin` requires `PUPA_API_KEY`;
+  a paired-device token gets 403. So a leaked token cannot issue itself a
+  replacement, and revoking the device it belongs to actually ends its access.
+  Keep `PUPA_API_KEY` set — it is the only credential that can pair.
+- **Pairing is rate limited.** `/auth/pair` is the one unauthenticated write
+  route (the bootstrap code *is* the credential), so it is throttled per client
+  with a global backstop. Bucketing uses `X-Forwarded-For`, because every
+  supported transport terminates TLS in front of a loopback-bound listener.
+- **TLS is the operator's to enforce.** `PUPA_REQUIRE_HTTPS=1` refuses
+  plaintext; it is pinned on in the cloud image and **must** be set on any
+  internet-reachable self-host. See [docs/deploy.md](docs/deploy.md).
 - **Secrets are environment-driven.** LLM/provider credentials live in the
   operator's shell environment, never in the repo or the config file. The paired
   device token store holds only hashed tokens and is kept outside the repo

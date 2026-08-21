@@ -37,7 +37,13 @@ from pupa_backend.harnesses import (
     deepagents_harness_enabled,
 )
 from pupa_backend.mcp_servers import mcp_servers_lifecycle
-from pupa_backend.auth import api_key_middleware
+from pupa_backend.auth import (
+    api_key_middleware,
+    rate_limit_middleware,
+    require_https_middleware,
+    run_scope_middleware,
+    security_headers_middleware,
+)
 from pupa_backend.auth import router as auth_router
 from pupa_backend.sse_keepalive import SSEKeepAliveMiddleware
 from pupa_backend.sse_replay import SSEReplayMiddleware
@@ -215,11 +221,19 @@ async def lifespan(app: FastAPI):
             # builders still get their creds via `get_credential`.
             registry = build_registry()
             deps = HarnessDeps(checkpointer=checkpointer, store=store, mcp=mcp)
+            # Every mounted run path, for `run_scope_middleware`. The routes
+            # themselves can't take a scope dependency (the LangGraph one is
+            # mounted by a third-party helper), so the guard keys off this set.
+            run_paths: set[str] = set()
             for harness in registry.enabled():
-                harness.register(app, f"/harnesses/{harness.id}", deps)
+                path = f"/harnesses/{harness.id}"
+                harness.register(app, path, deps)
+                run_paths.add(path)
             default = registry.default()
             if default is not None:
                 default.register(app, "/", deps)
+                run_paths.add("/")
+            app.state.run_paths = run_paths
             app.state.harness_registry = registry
             app.state.checkpointer = checkpointer
             await _log_auth_state()
@@ -253,7 +267,19 @@ app.add_middleware(SSEReplayMiddleware)
 # per-request idle timeout. Decoupled from the agent loop — covers both `POST /`
 # handlers (Claude Code loop + LangGraph) and any future SSE route.
 app.add_middleware(SSEKeepAliveMiddleware)
+# Inner to `api_key_middleware` (added after it here = added earlier = inner):
+# it reads the `request.state.auth` that auth puts there.
+app.middleware("http")(run_scope_middleware)
 app.middleware("http")(api_key_middleware)
+# Outside auth: a plaintext request should be refused before its bearer token
+# is read at all. No-op unless PUPA_REQUIRE_HTTPS is set.
+app.middleware("http")(require_https_middleware)
+# Outermost (added last): throttles the pre-auth pairing exchange before any
+# auth work happens, and regardless of how that auth turns out.
+app.middleware("http")(rate_limit_middleware)
+# Outermost of all: every response gets the headers, including the ones the
+# guards above return on their own (403/429 never reach the inner stack).
+app.middleware("http")(security_headers_middleware)
 app.include_router(auth_router, prefix="/auth")
 if deepagents_harness_enabled():
     # Mounted only with its harness — the routes serve that loop's checkpoints.

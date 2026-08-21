@@ -92,10 +92,24 @@ Knobs: `PUPA_SSE_REPLAY_TTL` (default 6h; `<= 0` disables),
 `PUPA_SSE_REPLAY_MAX_EVENTS` (ring cap per thread, default 4096).
 
 **Middleware order is load-bearing**, and reads bottom-up in
-[`app.py`](../backend/pupa_backend/app.py) because `add_middleware` prepends:
-api-key → keep-alive → replay → handler. Replay sits innermost so heartbeat
-comments stay out of the replay log, while an idle re-attached stream still
-receives them.
+[`app.py`](../backend/pupa_backend/app.py) because `add_middleware` prepends.
+Outermost to innermost: security-headers → rate-limit → require-https →
+api-key → run-scope → keep-alive → replay → handler.
+
+Why that order, at each step:
+- **security-headers** outermost so the guards' own 403/429 responses carry
+  the headers too — those never reach the inner stack.
+- **rate-limit** before auth: it protects `/auth/pair`, which is *pre*-auth, so
+  it has to apply regardless of the auth outcome.
+- **require-https** outside auth: a plaintext request is refused before its
+  bearer token is read at all.
+- **run-scope** inside api-key: it reads the `request.state.auth` identity that
+  api-key resolves.
+- **replay** innermost so heartbeat comments stay out of the replay log, while
+  an idle re-attached stream still receives them.
+
+`tests/test_middleware_wiring.py` pins this against the real app — the other
+auth tests build their own and would keep passing if a guard were unmounted.
 
 Two accepted limits: the log is in-memory, so a backend restart drops it; and
 recovery depends on the client persisting its last seq — a client that loses
@@ -639,8 +653,8 @@ depend on a harness.
 
 - **Middleware** —
   [`middleware.py`](../backend/pupa_backend/auth/middleware.py) gates every request
-  except a small allowlist (`/auth/config`, `/auth/pair/begin`,
-  `/auth/pair/complete`). It accepts either the bootstrap
+  except a small allowlist (`/auth/config`, `/auth/pair`, and any
+  `*/health`). It accepts either the bootstrap
   `PUPA_API_KEY` or a paired-device bearer token resolved via
   `DeviceStore.resolve`. `PUPA_AUTH_DISABLED=1` short-circuits the
   middleware — dev loops only.
@@ -651,14 +665,44 @@ depend on a harness.
   `request.state.auth` to `("api_key", None)` or
   `("device", PairedDevice)`; the dependencies read it. `api_key`
   identity bypasses scope checks (operator god mode); a device must
-  carry the named scope, else 403. Route map: `/db/threads/*` and
-  `/harnesses` → `agent` scope, `/auth/devices/*` →
-  `require_api_key()` (operator-only).
+  carry the named scope, else 403. Route map: `/db/threads/*`,
+  `/harnesses`, and the run endpoints (`POST /`, `POST /harnesses/{id}`)
+  → `agent` scope; `/auth/devices/*` and `/auth/pair/begin` →
+  `require_api_key()` (operator-only). Minting is operator-only on
+  purpose: a device that could mint a device would let a leaked token
+  outlive the revocation of the device it was issued to.
 - **Pairing** —
   [`pairing.py`](../backend/pupa_backend/auth/pairing.py) holds a short-lived
   `PairingCodeStore` of one-time 8-char codes minted by
   `/auth/pair/begin`. Code TTL defaults to 5 min (capped at 1 day);
   device-token TTL is also operator-configurable per-request.
+- **Abuse limits** —
+  [`ratelimit.py`](../backend/pupa_backend/auth/ratelimit.py) throttles the
+  pairing routes per client (`/auth/pair` 5/min, `/auth/pair/begin` 10/min,
+  plus a 60/min global backstop). Keyed on the **rightmost**
+  `X-Forwarded-For` entry, not `request.client.host`: every transport mode
+  terminates TLS in front of a loopback-bound listener, so the peer address is
+  `127.0.0.1` for all remote callers and would bucket the internet as one.
+  `PUPA_RATE_LIMIT_DISABLED=1` opts out for local loops. `POST /` is
+  deliberately *not* throttled — a dropped SSE socket re-attaches there, so a
+  per-IP cap would break the flaky-network case `SSEReplayMiddleware` exists
+  for.
+- **Transport** —
+  [`transport.py`](../backend/pupa_backend/auth/transport.py) implements
+  `PUPA_REQUIRE_HTTPS` (config `transport.require_https`), unset by default so
+  LAN and offline installs keep working. When set, any non-TLS request that
+  isn't a health probe gets 403, and the screen-share WebSocket closes with
+  4403 (WebSockets skip the HTTP middleware stack, so that check is inline).
+  Secure means `url.scheme == https` **or** the rightmost `X-Forwarded-Proto`
+  is `https`. There is deliberately no loopback carve-out, for the same reason
+  the rate limiter can't key on the peer address. Pinned on in
+  [`deploy/cloud-config.yml`](../deploy/cloud-config.yml).
+- **Response headers** —
+  [`headers.py`](../backend/pupa_backend/auth/headers.py) sets `nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and HSTS only on a
+  connection that is actually TLS. No `CORSMiddleware`: there is no browser
+  origin to allow, and a permissive one would let any web page call this
+  backend with a user's credentials.
 - **Device store** —
   [`devices.py`](../backend/pupa_backend/auth/devices.py) hashes and persists
   paired-device bearer tokens. `DeviceStore` writes a JSON file at

@@ -18,6 +18,7 @@ Settings sheet can grey it out. The user toggle then lives on top of that.
 
 import os
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Any, Callable, List
 
 from deepagents.backends.state import StateBackend
@@ -86,6 +87,59 @@ def _shell_env_exclude() -> frozenset[str]:
     return frozenset(names)
 
 
+# Env var names that are secrets by shape. `SHELL_PASS_ENV=1` hands the
+# backend's environment to a subprocess the *model* drives, so the default has
+# to be "don't", not "whatever the operator remembered to list". Matched
+# case-sensitively against the whole name; `SHELL_ENV_ALLOW` puts one back.
+_SECRET_NAME_GLOBS: tuple[str, ...] = (
+    "*_API_KEY",
+    "*_APIKEY",
+    "*_TOKEN",
+    "*_SECRET",
+    "*_SECRET_*",
+    "*SECRET_KEY",
+    "*_PASSWORD",
+    "*_PRIVATE_KEY",
+    "*_CREDENTIALS",
+    "AWS_*",
+    "DATABASE_URL",
+)
+
+
+def is_secret_env_name(name: str) -> bool:
+    """Whether an env var name looks like a credential."""
+    return any(fnmatch(name, glob) for glob in _SECRET_NAME_GLOBS)
+
+
+def _shell_env_allow() -> frozenset[str]:
+    """`SHELL_ENV_ALLOW`: names to forward even though they look secret.
+
+    For the startup script that genuinely needs one credential (a `gh auth`
+    wrapper, say) — name it, rather than dropping the whole default.
+    """
+    raw = os.getenv("SHELL_ENV_ALLOW", "")
+    return frozenset(v.strip() for v in raw.split(",") if v.strip())
+
+
+def shell_env_excluded(name: str) -> bool:
+    """Whether `name` is withheld from the shell subprocess."""
+    if name in _shell_env_allow():
+        return False
+    return name in _shell_env_exclude() or is_secret_env_name(name)
+
+
+def _shell_subprocess_env() -> dict[str, str] | None:
+    """Environment for the shell subprocess, or None to inherit nothing.
+
+    `None` is the default and is *not* the same as "inherit": ShellToolMiddleware
+    passes `env={}` to Popen in that case, so the subprocess gets no PATH/HOME
+    either. `SHELL_PASS_ENV=1` opts into a filtered copy.
+    """
+    if not os.getenv("SHELL_PASS_ENV"):
+        return None
+    return {k: v for k, v in os.environ.items() if not shell_env_excluded(k)}
+
+
 def _build_startup_commands() -> list[str]:
     """Load shell startup commands from a local script file.
 
@@ -115,7 +169,10 @@ def _build_shell_middlewares() -> list:
     Settings sheet); the middleware honours that flag and skips the interrupt.
 
     Set ``SHELL_PASS_ENV=1`` to forward the backend's environment to the shell
-    subprocess (minus ``_SHELL_ENV_EXCLUDE``). Without it the subprocess gets
+    subprocess — minus anything ``shell_env_excluded`` withholds: the
+    operator's ``SHELL_ENV_EXCLUDE`` list plus every secret-shaped name
+    (``*_API_KEY``, ``AWS_*``, …). ``SHELL_ENV_ALLOW`` names exceptions.
+    Without it the subprocess gets
     no inherited env — note that ``ShellToolMiddleware`` passes ``env={}`` to
     ``Popen`` when env is ``None``, which strips HOME and PATH, so startup
     commands that rely on those (e.g. the gh auth wrapper) require
@@ -124,11 +181,7 @@ def _build_shell_middlewares() -> list:
     from pupa_backend.harnesses.langgraph.shell_approval import ShellApprovalMiddleware
 
     workspace = os.getenv("SHELL_TOOL_WORKSPACE")
-    env = (
-        {k: v for k, v in os.environ.items() if k not in _shell_env_exclude()}
-        if os.getenv("SHELL_PASS_ENV")
-        else None
-    )
+    env = _shell_subprocess_env()
     startup = _build_startup_commands()
     kwargs: dict[str, Any] = {"startup_commands": startup}
     if workspace:
