@@ -92,10 +92,26 @@ Knobs: `PUPA_SSE_REPLAY_TTL` (default 6h; `<= 0` disables),
 `PUPA_SSE_REPLAY_MAX_EVENTS` (ring cap per thread, default 4096).
 
 **Middleware order is load-bearing**, and reads bottom-up in
-[`app.py`](../backend/pupa_backend/app.py) because `add_middleware` prepends:
-api-key → keep-alive → replay → handler. Replay sits innermost so heartbeat
-comments stay out of the replay log, while an idle re-attached stream still
-receives them.
+[`app.py`](../backend/pupa_backend/app.py) because `add_middleware` prepends.
+Outermost to innermost: security-headers → require-https → rate-limit →
+api-key → run-scope → keep-alive → replay → handler.
+
+Why that order, at each step:
+- **security-headers** outermost so the guards' own 403/429 responses carry
+  the headers too — those never reach the inner stack.
+- **require-https** outside the limiter: a plaintext hop is a
+  misconfiguration, not a guess at a credential, so refusing it there is what
+  stops it spending a real device's pairing budget. The limiter then needs to
+  know nothing about transport.
+- **rate-limit** before auth: it protects `/auth/pair`, which is *pre*-auth, so
+  it has to apply regardless of the auth outcome.
+- **run-scope** inside api-key: it reads the `request.state.auth` identity that
+  api-key resolves.
+- **replay** innermost so heartbeat comments stay out of the replay log, while
+  an idle re-attached stream still receives them.
+
+`tests/test_middleware_wiring.py` pins this against the real app — the other
+auth tests build their own and would keep passing if a guard were unmounted.
 
 Two accepted limits: the log is in-memory, so a backend restart drops it; and
 recovery depends on the client persisting its last seq — a client that loses
@@ -639,11 +655,18 @@ depend on a harness.
 
 - **Middleware** —
   [`middleware.py`](../backend/pupa_backend/auth/middleware.py) gates every request
-  except a small allowlist (`/auth/config`, `/auth/pair/begin`,
-  `/auth/pair/complete`). It accepts either the bootstrap
+  except a small allowlist (`/auth/config`, `/auth/pair`, and any
+  `*/health`). It accepts either the bootstrap
   `PUPA_API_KEY` or a paired-device bearer token resolved via
   `DeviceStore.resolve`. `PUPA_AUTH_DISABLED=1` short-circuits the
-  middleware — dev loops only.
+  middleware — dev loops only, and `main()` enforces that: it **refuses to
+  start** when the switch is set and the listener is reachable from off the
+  machine, since a warning about a wide-open agent loop scrolls past in a
+  platform log. Reachable means bound off-loopback *or* fronted by a tunnel —
+  under `connectivity: cloudflared` the socket is on loopback and the URL is
+  public, so the bind address alone would exempt the most exposed case.
+  `PUPA_ALLOW_INSECURE_BIND=1` overrides it — a second, differently-named
+  variable, so pasting the first into a launch script can't reach it.
 - **Per-route authorization** —
   [`scopes.py`](../backend/pupa_backend/auth/scopes.py) provides
   `require_scope("<scope>")` and `require_api_key()` FastAPI
@@ -651,14 +674,113 @@ depend on a harness.
   `request.state.auth` to `("api_key", None)` or
   `("device", PairedDevice)`; the dependencies read it. `api_key`
   identity bypasses scope checks (operator god mode); a device must
-  carry the named scope, else 403. Route map: `/db/threads/*` and
-  `/harnesses` → `agent` scope, `/auth/devices/*` →
-  `require_api_key()` (operator-only).
+  carry the named scope, else 403. Route map: `/db/threads/*`,
+  `/harnesses`, and the run endpoints (`POST /`, `POST /harnesses/{id}`)
+  → `agent` scope; `/auth/devices/*` and `/auth/pair/begin` →
+  `require_api_key()` (operator-only). Minting is operator-only on
+  purpose: a device that could mint a device would let a leaked token
+  outlive the revocation of the device it was issued to.
 - **Pairing** —
   [`pairing.py`](../backend/pupa_backend/auth/pairing.py) holds a short-lived
   `PairingCodeStore` of one-time 8-char codes minted by
   `/auth/pair/begin`. Code TTL defaults to 5 min (capped at 1 day);
   device-token TTL is also operator-configurable per-request.
+- **Abuse limits** —
+  [`ratelimit.py`](../backend/pupa_backend/auth/ratelimit.py) throttles the
+  pairing routes per client (`/auth/pair` 5/min, `/auth/pair/begin` 10/min).
+  **Only failed attempts are charged** — the charge goes on at entry and is
+  refunded (by the exact timestamp it wrote, so it can't take back a concurrent
+  request's) once the status code says the caller was legitimate; checking
+  first and charging after would let requests arriving together all clear the
+  check against a bucket none of them had written to. The cost of holding the
+  budget for the request's duration: more than the limit genuinely in flight on
+  one bucket 429s even when all would have succeeded — retrying works
+  immediately, so `Retry-After` is an upper bound. A successful pairing is
+  free, because
+  on `/auth/pair` the code *is* the credential (one request, then it's
+  consumed) and `/auth/pair/begin` is operator-only, so throttling a caller
+  who already holds `PUPA_API_KEY` protects nothing. What it does throttle is
+  wrong codes and wrong keys. Buckets are **per client with no global cap**: a
+  shared bucket that blocks is a denial of service with extra steps, since a
+  stranger could drain it and lock out everyone holding a real credential.
+  Keyed on the **rightmost**
+  `X-Forwarded-For` entry across *every* field line of that header — a proxy
+  may append a second line rather than extend the caller's, and reading only
+  the first would give the caller the last word — *when a proxy is trusted*,
+  else on
+  `request.client.host`. Both halves matter: the proxied modes terminate in
+  front of a loopback listener, so the peer address is `127.0.0.1` for every
+  remote caller and would bucket the internet as one — but on a direct bind
+  the header is written by the caller, so believing it would let one host
+  rotate it per request for unlimited buckets.
+  Mounted *inside* `require_https_middleware`, so a plaintext hop is refused
+  before it can spend a real device's budget — the limiter needs to know
+  nothing about transport. Not `slowapi`: it charges before `call_next` and
+  offers no post-response hook, so "charge only failures" cannot be expressed
+  in it; the shared-bucket ceiling is an `OrderedDict` keyed by last charge, so
+  eviction is O(1) and drops the bucket charged longest ago rather than a
+  guesser still spending.
+  `PUPA_RATE_LIMIT_DISABLED=1` opts out for local loops. `POST /` is
+  deliberately *not* throttled — a dropped SSE socket re-attaches there, so a
+  per-IP cap would break the flaky-network case `SSEReplayMiddleware` exists
+  for.
+- **Proxy trust** —
+  [`proxy.py`](../backend/pupa_backend/auth/proxy.py) answers "should
+  `X-Forwarded-*` be believed here", which every forwarded-header read depends
+  on. `PUPA_TRUSTED_PROXY` (config `transport.trusted_proxy`) is explicit and
+  wins **either way** — `transport.trusted_proxy: false` is written to the env
+  as `0`, not omitted, so it overrides the inference below. Otherwise it's
+  inferred true for `connectivity: tailscale` / `cloudflared`, since the
+  backend starts those proxies itself; otherwise **false**. Pinned true in the
+  cloud image for Railway. Wrong in the safe direction (real proxy, flag unset)
+  collapses callers into one bucket; wrong the other way voids the rate limits
+  and the HTTPS check, which is why the default is off.
+  For this to be the only answer, uvicorn is started with
+  `proxy_headers=False` ([`app.py`](../backend/pupa_backend/app.py)): its
+  default middleware folds `X-Forwarded-Proto`/`-For` into the ASGI scope for
+  any peer within `forwarded_allow_ips` (`127.0.0.1` — every tunnel mode, and
+  anything else on the host), which would rewrite `url.scheme` and
+  `client.host` *above* the app and make the check below read a forged value.
+  Consequence for **operator-run** reverse proxies (nginx, Caddy, a manual
+  `cloudflared`): set `transport.trusted_proxy: true`, or every caller buckets
+  as `127.0.0.1` and `PUPA_REQUIRE_HTTPS` sees a plaintext hop.
+  `main()` resolves the rest at startup, because `PUPA_CONNECTIVITY` says what
+  was *intended* and the answer needed is what actually came up. Two separate
+  facts:
+  - **Fronted** — something local forwards into this listener, so it binds
+    `127.0.0.1`. False when `tailscale serve` didn't start (CLI absent,
+    `PUPA_TAILSCALE_SERVE=0`, or `serve` failed), which keeps the documented
+    `0.0.0.0` fallback and logs why.
+  - **Rewrites `X-Forwarded-*`** — that something is an HTTP proxy, so it
+    overwrites what the caller sent. True for `cloudflared` and for Tailscale's
+    **https** mode; false for Tailscale's **tcp** mode, which is a raw L4
+    passthrough where the client's request arrives byte-for-byte and those
+    headers stay caller-written. Only this sets `PUPA_TRUSTED_PROXY` when the
+    operator hasn't.
+  A non-loopback bind while forwarded headers are trusted (Railway, or an
+  explicit flag) logs a warning: anyone who can reach the port directly can
+  write their own hop.
+- **Transport** —
+  [`transport.py`](../backend/pupa_backend/auth/transport.py) implements
+  `PUPA_REQUIRE_HTTPS` (config `transport.require_https`), unset by default so
+  LAN and offline installs keep working. When set, any non-TLS request that
+  isn't a health probe gets 403, and the screen-share WebSocket closes with
+  4403 (WebSockets skip the HTTP middleware stack, so that check is inline).
+  Refused sockets are accepted and *then* closed — a close on a socket that was
+  never accepted has no frame to carry the code, so the client would see a bare
+  HTTP 403 and couldn't tell 4403 from 4401.
+  Secure means `url.scheme == https` **or** the rightmost `X-Forwarded-Proto`
+  is `https`. There is deliberately no loopback carve-out, for the same reason
+  the rate limiter can't key on the peer address. Pinned on in
+  [`deploy/cloud-config.yml`](../deploy/cloud-config.yml).
+- **Response headers** —
+  [`headers.py`](../backend/pupa_backend/auth/headers.py) sets `nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and HSTS only on a
+  connection that is actually TLS — which is `is_secure_request` and nothing
+  else, so the tunnel modes get it too even though the cert lives in the
+  terminator rather than here. No `CORSMiddleware`: there is no browser
+  origin to allow, and a permissive one would let any web page call this
+  backend with a user's credentials.
 - **Device store** —
   [`devices.py`](../backend/pupa_backend/auth/devices.py) hashes and persists
   paired-device bearer tokens. `DeviceStore` writes a JSON file at

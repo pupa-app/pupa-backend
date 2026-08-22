@@ -20,7 +20,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from pupa_backend.auth import api_key_middleware, router as auth_router
+from pupa_backend.auth import (
+    api_key_middleware,
+    router as auth_router,
+    run_scope_middleware,
+)
 from pupa_backend.auth.devices import DeviceStore, reset_for_testing
 from pupa_backend.harnesses.routes import router as harnesses_router
 from pupa_backend.harnesses.langgraph.db.connection import open_persistence
@@ -40,10 +44,24 @@ async def app(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("PUPA_API_KEY", raising=False)
     monkeypatch.delenv("PUPA_AUTH_DISABLED", raising=False)
     app = FastAPI()
+    # Same order as `app.py`: run-scope added first so it sits *inside* auth
+    # and can read the identity auth resolved.
+    app.middleware("http")(run_scope_middleware)
     app.middleware("http")(api_key_middleware)
     app.include_router(auth_router, prefix="/auth")
     app.include_router(db_router, prefix="/db")
     app.include_router(harnesses_router, prefix="/harnesses")
+
+    # Stand-in for a harness run endpoint. Real harnesses mount these
+    # themselves (one via a third-party helper that takes no `dependencies=`),
+    # so the scope check can't live on the route — it keys off the run-path
+    # record the harness leaves behind, which is what this mirrors.
+    @app.post("/")
+    async def run() -> dict:
+        return {"ok": True}
+
+    app.state.run_paths = {"/"}
+
     async with open_persistence(None, None) as (checkpointer, _store):
         app.state.checkpointer = checkpointer
         yield app
@@ -212,3 +230,51 @@ async def test_auth_disabled_bypasses_all_scopes(
     assert client.get("/harnesses").status_code == 200
     assert client.get("/db/threads/x/messages").status_code == 200
     assert client.get("/auth/devices").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# POST / and POST /harnesses/{id} — `agent` scope
+# ---------------------------------------------------------------------------
+
+
+async def test_run_endpoint_accepts_api_key(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    assert client.post("/", json={}, headers=_bearer("k")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_run_endpoint_accepts_device_with_agent_scope(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI, store: DeviceStore
+) -> None:
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    token = await _device_token(store, ["agent"])
+    client = TestClient(app)
+    assert client.post("/", json={}, headers=_bearer(token)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_run_endpoint_rejects_device_without_agent_scope(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI, store: DeviceStore
+) -> None:
+    """Running the agent is the most powerful thing a token can do — it reaches
+    every backend tool. A token issued without `agent` must not reach it just
+    because the middleware says the bearer is live."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    token = await _device_token(store, ["screenshare"])  # no "agent"
+    client = TestClient(app)
+    resp = client.post("/", json={}, headers=_bearer(token))
+    assert resp.status_code == 403
+    assert "agent" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_run_scope_check_is_skipped_when_auth_disabled(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    monkeypatch.setenv("PUPA_AUTH_DISABLED", "1")
+    client = TestClient(app)
+    assert client.post("/", json={}).status_code == 200
+

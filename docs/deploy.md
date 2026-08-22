@@ -124,9 +124,49 @@ curl -X POST \
 
 No QR — the response is just JSON with the `code`.
 
-### 5. (Recommended) Remove the bootstrap key
+### 5. Keep the bootstrap key
 
-Once you trust your paired devices, delete `PUPA_API_KEY` from Railway. Paired-device tokens can still mint new codes via `/auth/pair/begin`; fresh laptops with no token get 401 until the next pair.
+`PUPA_API_KEY` is the **only** credential `/auth/pair/begin` accepts — a paired-device token gets 403, so devices can't mint devices. Delete the key and you can't pair anything else without setting it again. Keep it in Railway's variables (never in a client), and rotate it rather than removing it.
+
+## Transport security — required for anything reachable
+
+**Any internet-reachable deploy must terminate TLS and set
+`PUPA_REQUIRE_HTTPS=1`** (config: `transport.require_https: true`). It's
+already pinned on in [`deploy/cloud-config.yml`](../deploy/cloud-config.yml),
+so Railway inherits it.
+
+The reason is the pairing handshake: `/auth/pair` returns the device token in
+plaintext exactly once. Over a plaintext hop, anyone on the path has a
+credential that works until it's revoked. Every request after that carries a
+bearer token, so the exposure isn't limited to pairing.
+
+TLS itself stays optional because `pupa-backend` is self-hosted first — an
+offline or LAN install has no name to put a cert on. The flag is how a
+reachable deploy opts into strictness:
+
+| Deploy | TLS terminated by | `PUPA_REQUIRE_HTTPS` |
+|---|---|---|
+| Railway | Railway's edge (`X-Forwarded-Proto: https`) | **1** (pinned in the image config) |
+| Cloudflare tunnel | `cloudflared` | **1** |
+| Tailscale serve | `tailscale serve` with tailnet HTTPS | **1** |
+| Own cert | the backend (`PUPA_TLS_CERT` / `PUPA_TLS_KEY`) | **1** |
+| LAN / offline self-host | nothing | unset — plaintext on the local segment |
+
+Behind any reverse proxy other than the Tailscale/Cloudflare modes the backend
+starts itself — **including Railway** — also set `PUPA_TRUSTED_PROXY=1` (config
+`transport.trusted_proxy`, already pinned in the cloud image). TLS terminates at
+the proxy, so `X-Forwarded-Proto` is the only evidence the caller's hop was
+encrypted, and the backend ignores that header unless it's told something in
+front actually writes it. Leave it **off** on a direct bind: there the header is
+written by the caller, and believing it would let anyone assert their own
+plaintext hop was TLS.
+
+When set, a non-TLS request gets `403 HTTPS required` and the screen-share
+socket closes with 4403. Health probes are exempt so platform checks still
+pass. There is **no** loopback exemption: every tunnel mode terminates in
+front of a loopback-bound listener, so "it came from 127.0.0.1" is true of
+every remote caller. For local development, leave the flag unset rather than
+looking for a carve-out — `http://localhost:8004` then works exactly as before.
 
 ## Auto-deploy on `main`
 

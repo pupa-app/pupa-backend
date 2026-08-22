@@ -31,11 +31,50 @@ pupa-backend is designed to be **operator-run**. A few properties are important
 when assessing risk:
 
 - **Auth is required by default.** The only client credential is a paired-device
-  bearer token; the bootstrap `PUPA_API_KEY` never reaches a client. Per-route
+  bearer token; the operator `PUPA_API_KEY` never reaches a client. Per-route
   authorization is enforced via scopes (see
-  [`backend/pupa_backend/auth/scopes.py`](backend/pupa_backend/auth/scopes.py)).
+  [`backend/pupa_backend/auth/scopes.py`](backend/pupa_backend/auth/scopes.py)),
+  including the agent run endpoints.
   `PUPA_AUTH_DISABLED=1` removes all auth and is **only** for a same-machine dev
-  loop — never expose such a backend to a network.
+  loop. The backend enforces that rather than trusting it: with the switch set
+  and the listener reachable from off the machine — bound wide, *or* published
+  by a tunnel, which binds loopback precisely because something else is
+  serving it — it refuses to start, because
+  that combination hands every route — the agent loop and the shell tool
+  included — to anyone who can reach the port. `PUPA_ALLOW_INSECURE_BIND=1` is
+  the deliberate override.
+- **Devices cannot mint devices.** `/auth/pair/begin` requires `PUPA_API_KEY`;
+  a paired-device token gets 403. So a leaked token cannot issue itself a
+  replacement, and revoking the device it belongs to actually ends its access.
+  Keep `PUPA_API_KEY` set — it is the only credential that can pair.
+- **Failed pairing attempts are rate limited.** `/auth/pair` is the one
+  unauthenticated write route (the bootstrap code *is* the credential), so
+  wrong codes are throttled per client — as are wrong `PUPA_API_KEY` values on
+  `/auth/pair/begin`. Successful requests do not spend budget — the charge goes
+  on when the request arrives and comes back off when the response says the
+  caller was legitimate, so concurrent guesses can't all clear the check
+  against a bucket none of them has been written to yet. (The one cost: more
+  than the limit genuinely *in flight at once* on one bucket will 429 even if
+  they'd all have succeeded. Retrying works immediately — unless the requests
+  in flight are being held open deliberately, which on a shared bucket is a
+  handful of sockets against the pairing route.) There is no shared
+  cap — one bucket everybody drew from could be drained by a stranger to lock
+  out people holding real credentials. That protection is only as good as the
+  bucket key: where the backend can't tell callers apart (a proxy in front of
+  it that isn't trusted, so every request looks like `127.0.0.1`) they share a
+  bucket and the guarantee weakens to the shared-cap one. Hence the next
+  paragraph. Bucketing uses `X-Forwarded-For` **only
+  where a proxy is trusted** (`PUPA_TRUSTED_PROXY`, inferred for the tunnel
+  modes): the proxied transports terminate in front of a loopback listener so
+  the peer address is useless there, while on a direct bind the header is
+  caller-written and trusting it would void the limits entirely. **If you front
+  the backend with your own reverse proxy** (nginx, Caddy, a manually-run
+  `cloudflared`), set `transport.trusted_proxy: true` — uvicorn's own
+  forwarded-header handling is switched off, so without it every caller buckets
+  as `127.0.0.1` and `PUPA_REQUIRE_HTTPS` sees a plaintext hop.
+- **TLS is the operator's to enforce.** `PUPA_REQUIRE_HTTPS=1` refuses
+  plaintext; it is pinned on in the cloud image and **must** be set on any
+  internet-reachable self-host. See [docs/deploy.md](docs/deploy.md).
 - **Secrets are environment-driven.** LLM/provider credentials live in the
   operator's shell environment, never in the repo or the config file. The paired
   device token store holds only hashed tokens and is kept outside the repo

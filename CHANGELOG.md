@@ -4,6 +4,115 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.90] — 2026-08-21
+
+### Security
+
+- **Devices can no longer pair other devices.** Minting a pairing code
+  (`/auth/pair/begin`) now requires the operator key. Before, any paired-device
+  token was accepted, which meant a leaked token could quietly issue itself a
+  replacement — and revoking the device it came from wouldn't end the access.
+  **Keep `PUPA_API_KEY` set:** it is now the only credential that can pair a
+  device, so unsetting it after the first pair means you can't add a second.
+- **Pairing requests asked for their own permissions, and got them.** The
+  scope list in a `/auth/pair/begin` body was used as sent. It's now checked
+  against the known set, and the route it arrives on is operator-only.
+- **Running the agent now requires the `agent` scope.** `POST /` and
+  `POST /harnesses/{id}` previously accepted any valid token regardless of the
+  scopes it was issued with — which is the most powerful thing a token can do,
+  since it reaches every backend tool.
+- **Failed pairing attempts are rate limited.** `/auth/pair` is the one route
+  a stranger can call, and nothing stopped them calling it at full speed. Now
+  5 wrong codes per client per minute (and 10 wrong operator keys on
+  `/auth/pair/begin`), with `PUPA_RATE_LIMIT_DISABLED=1` for local loops.
+  **Only failures count** — pairing a device successfully, or minting codes
+  with the operator key, is never throttled, so the limit falls on guessing
+  rather than on using the thing. There's no shared cap either: one that
+  everybody drew from could be drained by a stranger to lock out people
+  holding real credentials. Bucketing reads `X-Forwarded-For` only where a
+  proxy is trusted — every tunnel mode terminates in front of a loopback
+  listener, so the peer address is `127.0.0.1` for everyone there, while on a
+  direct bind that header is written by the caller and believing it would hand
+  out an unlimited supply of buckets.
+- **New `PUPA_TRUSTED_PROXY`.** Says whether `X-Forwarded-*` can be believed
+  on this deployment. Inferred for the Tailscale and Cloudflare modes and
+  pinned on in the cloud image, so working setups stay working; off everywhere
+  else, because that's the answer that can't be turned against you. uvicorn's
+  own forwarded-header handling is switched off so this stays the only answer
+  — it believed those headers from any loopback peer, which on a tunnel
+  deployment is every caller. **If you run your own reverse proxy in front of
+  the backend, set `transport.trusted_proxy: true`**; the modes Pupa starts
+  itself are inferred and need nothing. `connectivity: cloudflared` bound
+  `0.0.0.0` while trusting `X-Forwarded-*`, so anyone on the LAN could forge a
+  hop; it now binds loopback, and Tailscale's raw-TCP fallback mode — which
+  passes the client's request through byte-for-byte and writes no forwarded
+  headers — is no longer trusted to have written them.
+- **Forwarded headers are read across every field line.** A proxy that
+  *appends* `X-Forwarded-For: <client>` as a second header line rather than
+  extending the caller's left the whole value caller-controlled, because only
+  the first line was parsed — so "the rightmost hop is the proxy's" was not
+  what the code did.
+- **Concurrent pairing guesses are capped.** The limiter checked a caller's
+  budget before running the request and charged it after, so requests arriving
+  together all passed the check against a bucket none of them had been written
+  to yet. The charge now goes on first and comes back off when the response
+  says the caller was legitimate.
+- **A pairing request asking for no scopes gets none.** `"scopes": []` in a
+  `/auth/pair/begin` body was read as "unspecified" and minted a device with
+  the full default set, `agent` included.
+- **New `PUPA_REQUIRE_HTTPS` refuses plaintext.** Off by default so LAN and
+  offline installs keep working; **set it on anything reachable from the
+  internet**, where it's the difference between handing the device token to the
+  client and handing it to the network. Pinned on in the cloud image. Covers
+  the screen-share socket too.
+- **The shell tool no longer inherits your API keys.** `SHELL_PASS_ENV=1`
+  handed the backend's whole environment to a subprocess the *model* drives,
+  filtered only by a list the operator had to write themselves. Secret-shaped
+  names (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …) are now dropped by default;
+  `SHELL_ENV_ALLOW` names exceptions.
+- **`transport.trusted_proxy: false` now takes effect.** A `false` in
+  `config.yml` was dropped rather than written out, and an unset
+  `PUPA_TRUSTED_PROXY` means "infer from `connectivity`" — so on a Tailscale or
+  Cloudflare deployment, the one place you'd turn proxy trust off didn't.
+- **Responses carry security headers** — `nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, and HSTS on TLS connections — including the
+  tunnel modes, where the terminator holds the cert and the backend speaks
+  plain HTTP over loopback. Still no CORS: there's no browser origin to allow.
+- **33 known vulnerabilities in dependencies, fixed.** The lockfile carried
+  advisories against `starlette`, `aiohttp`, `cryptography`, `mcp`,
+  `python-multipart` and others. Upgraded to zero. CI now runs `pip-audit` and
+  a secret scan weekly and on every PR, so the next one surfaces in review.
+  Neither job is a required check, but neither is `continue-on-error` either —
+  GitHub reports those as passing, which would have made a new advisory look
+  identical to a clean run.
+
+### Changed
+
+- **`PUPA_AUTH_DISABLED=1` on a reachable listener is now refused, not warned
+  about.** The switch opens every route — the agent loop and the shell tool
+  included — and pairing it with a `0.0.0.0` bind, or with a tunnel, serves
+  that to anything that can reach it. A Cloudflare quick tunnel binds
+  *loopback* and publishes a public URL, so the bind address alone is the wrong
+  question. Startup now fails with an explanation instead of logging a warning
+  that scrolls past. Same-machine loopback with no tunnel is unaffected, which
+  is the dev loop the switch exists for; `PUPA_ALLOW_INSECURE_BIND=1` is the
+  deliberate override for a trusted network.
+- **The HTTPS guard now sits outside the rate limiter.** A plaintext request is
+  refused before the limiter sees it, so it can't spend a real device's pairing
+  budget — the limiter no longer needs to know anything about transport.
+
+### Fixed
+
+- **A refused screen-share socket reports why.** The 4403 / 4401 / 4400 close
+  codes were sent on a socket that had never been accepted, so a real server
+  answered the upgrade with a bare HTTP 403 and the client couldn't tell an
+  HTTPS problem from an auth one.
+- **A frontend tool call no longer stops the chat when it lands second.**
+  `ag-ui-langgraph` 0.0.43 fixes the emit path that only looked for parked
+  interrupts on the first task — when one parked elsewhere, the turn ended
+  looking exactly like a clean finish and the chat sat silent until the user
+  typed again.
+
 ## [0.0.89] — 2026-08-20
 
 ### Added

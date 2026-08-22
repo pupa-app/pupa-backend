@@ -6,6 +6,7 @@ routes with them.
 """
 
 import logging
+import ipaddress
 import os
 import re
 import shutil
@@ -37,7 +38,13 @@ from pupa_backend.harnesses import (
     deepagents_harness_enabled,
 )
 from pupa_backend.mcp_servers import mcp_servers_lifecycle
-from pupa_backend.auth import api_key_middleware
+from pupa_backend.auth import (
+    api_key_middleware,
+    rate_limit_middleware,
+    require_https_middleware,
+    run_scope_middleware,
+    security_headers_middleware,
+)
 from pupa_backend.auth import router as auth_router
 from pupa_backend.sse_keepalive import SSEKeepAliveMiddleware
 from pupa_backend.sse_replay import SSEReplayMiddleware
@@ -61,6 +68,23 @@ if claude_harness_enabled():
 
 
 _TUNNEL_URL_FILE = Path.home() / ".pupa-backend" / "tunnel_url"
+
+def _is_loopback(host: str) -> bool:
+    """Whether only this machine can reach a listener bound here.
+
+    `ipaddress` rather than a literal set, so the whole of 127/8 and every
+    spelling of `::1` count. A bind is *not* the whole story — see the tunnel
+    check in `main()`, where the socket is on loopback precisely because
+    something else is publishing it.
+    """
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname. It may resolve to loopback, but we can't know that
+        # cheaply and guessing wrong here fails open — treat it as reachable.
+        return False
 
 
 def _start_cloudflared_tunnel() -> "subprocess.Popen[str] | None":
@@ -215,11 +239,19 @@ async def lifespan(app: FastAPI):
             # builders still get their creds via `get_credential`.
             registry = build_registry()
             deps = HarnessDeps(checkpointer=checkpointer, store=store, mcp=mcp)
+            # Every mounted run path, for `run_scope_middleware`. The routes
+            # themselves can't take a scope dependency (the LangGraph one is
+            # mounted by a third-party helper), so the guard keys off this set.
+            run_paths: set[str] = set()
             for harness in registry.enabled():
-                harness.register(app, f"/harnesses/{harness.id}", deps)
+                path = f"/harnesses/{harness.id}"
+                harness.register(app, path, deps)
+                run_paths.add(path)
             default = registry.default()
             if default is not None:
                 default.register(app, "/", deps)
+                run_paths.add("/")
+            app.state.run_paths = run_paths
             app.state.harness_registry = registry
             app.state.checkpointer = checkpointer
             await _log_auth_state()
@@ -253,7 +285,20 @@ app.add_middleware(SSEReplayMiddleware)
 # per-request idle timeout. Decoupled from the agent loop — covers both `POST /`
 # handlers (Claude Code loop + LangGraph) and any future SSE route.
 app.add_middleware(SSEKeepAliveMiddleware)
+# Inner to `api_key_middleware` (added after it here = added earlier = inner):
+# it reads the `request.state.auth` that auth puts there.
+app.middleware("http")(run_scope_middleware)
 app.middleware("http")(api_key_middleware)
+# Outside auth: throttles the pre-auth pairing exchange before any auth work
+# happens, and regardless of how that auth turns out.
+app.middleware("http")(rate_limit_middleware)
+# Outside the limiter: a plaintext hop is a misconfiguration, not a guess at a
+# credential, so it must be refused before it can spend a real device's pairing
+# budget. No-op unless PUPA_REQUIRE_HTTPS is set.
+app.middleware("http")(require_https_middleware)
+# Outermost of all: every response gets the headers, including the ones the
+# guards above return on their own (403/429 never reach the inner stack).
+app.middleware("http")(security_headers_middleware)
 app.include_router(auth_router, prefix="/auth")
 if deepagents_harness_enabled():
     # Mounted only with its harness — the routes serve that loop's checkpoints.
@@ -281,9 +326,39 @@ def main() -> None:
     # With `connectivity: tailscale`, let tailscaled forward the tailnet into a
     # loopback-bound listener — a wildcard bind is unreachable on macOS without
     # the Local Network privacy grant. See tailscale_proxy.py.
+    from pupa_backend.auth.proxy import trust_forwarded_headers
     from pupa_backend.tailscale_proxy import bind_host, start_serve_proxy
 
     proxy = start_serve_proxy(port)
+    connectivity = os.getenv("PUPA_CONNECTIVITY", "").strip().lower()
+    cloudflared = connectivity == "cloudflared"
+
+    # Two facts, and they come apart — `PUPA_CONNECTIVITY` says what was
+    # *intended*, not what actually came up:
+    #
+    # - `fronted`: something local forwards into this listener, so it doesn't
+    #   need to be reachable directly. `start_serve_proxy` returns None when the
+    #   Tailscale CLI is absent, when `PUPA_TAILSCALE_SERVE=0`, or when `serve`
+    #   fails — all documented as falling back to `0.0.0.0`.
+    # - `rewrites_forwarded`: that something is an HTTP proxy, so it *writes*
+    #   `X-Forwarded-*` over whatever the caller sent. Tailscale's `tcp` mode is
+    #   a raw L4 passthrough: the client's request arrives byte-for-byte, so
+    #   those headers stay caller-written and must not be believed.
+    fronted = proxy is not None or cloudflared
+    rewrites_forwarded = cloudflared or (proxy is not None and proxy.terminates_tls)
+
+    if connectivity == "tailscale" and proxy is None:
+        logger.warning(
+            "connectivity=tailscale but `tailscale serve` is not active — "
+            "binding %s and trusting no forwarded headers.",
+            bind_host(proxied=False),
+        )
+
+    # `auth/proxy.py` infers trust from `PUPA_CONNECTIVITY` for processes that
+    # never run this function (a bare `uvicorn pupa_backend.app:app`). Here the
+    # answer is known, so record it — an explicit operator setting still wins.
+    if not os.getenv("PUPA_TRUSTED_PROXY", "").strip():
+        os.environ["PUPA_TRUSTED_PROXY"] = "1" if rewrites_forwarded else "0"
 
     tls_cert = os.getenv("PUPA_TLS_CERT")
     tls_key = os.getenv("PUPA_TLS_KEY")
@@ -300,12 +375,65 @@ def main() -> None:
 
         warn_unusable_cert(tls_cert)
 
+    host = bind_host(proxied=fronted)
+
+    # `fronted` matters as much as the bind: under a tunnel the socket is on
+    # loopback *because* tailscaled or cloudflared is publishing it, and a
+    # Cloudflare quick tunnel is a public URL — strictly more exposed than the
+    # `0.0.0.0` case, not less.
+    reachable = fronted or not _is_loopback(host)
+    where = f"published by connectivity={connectivity}" if fronted else f"bound to {host}"
+    if truthy(os.getenv("PUPA_AUTH_DISABLED")) and reachable:
+        # Refuse, don't warn. `PUPA_AUTH_DISABLED=1` opens every route
+        # including the agent loop and the shell tool, and a warning scrolls
+        # past in a platform log — the two together are how a dev shortcut ends
+        # up serving a stranger. The escape hatch is deliberately a second,
+        # differently-named variable so it can't be reached by pasting the
+        # first one into a launch script.
+        if not truthy(os.getenv("PUPA_ALLOW_INSECURE_BIND")):
+            if proxy is not None:
+                # Don't leave a `serve --bg` registration pointing at a port
+                # nothing is going to listen on.
+                proxy.stop()
+            raise SystemExit(
+                f"Refusing to start: PUPA_AUTH_DISABLED=1 with the listener "
+                f"{where}, which is reachable from off this machine. Every "
+                f"route would be open to anyone who can reach it. Pair a "
+                f"device instead (see `pupa-backend pair`), bind 127.0.0.1 "
+                f"with no tunnel, or set PUPA_ALLOW_INSECURE_BIND=1 if this "
+                f"network really is trusted."
+            )
+        logger.warning(
+            "auth is DISABLED and the listener is %s — every route is open to "
+            "anything that can reach it. Allowed only because "
+            "PUPA_ALLOW_INSECURE_BIND is set.",
+            where,
+        )
+
+    if trust_forwarded_headers() and not _is_loopback(host):
+        # Not fatal: Railway and friends need the wildcard bind and do sanitise
+        # the headers. But anyone who can reach the port directly can now write
+        # their own hop, so it has to be a deliberate choice, not a default.
+        logger.warning(
+            "trusting X-Forwarded-* while bound to %s — anyone who can reach "
+            "this port directly can forge their own hop. Front it with the "
+            "proxy, or unset transport.trusted_proxy.",
+            host,
+        )
+
     try:
         uvicorn.run(
             "pupa_backend.app:app",
-            host=bind_host(proxied=proxy is not None),
+            host=host,
             port=port,
             reload=False,
+            # uvicorn's own proxy-header handling folds client-supplied
+            # `X-Forwarded-Proto`/`-For` into the ASGI scope for any peer in
+            # `forwarded_allow_ips` (default `127.0.0.1` — every tunnel mode).
+            # That would rewrite `url.scheme` and `client.host` *underneath*
+            # `auth/proxy.py`, which is the one place allowed to decide whether
+            # those headers are believable. Off: we read the raw headers.
+            proxy_headers=False,
             **ssl_kwargs,
         )
     finally:

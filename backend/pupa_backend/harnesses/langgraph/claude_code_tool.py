@@ -29,7 +29,7 @@ Safety posture:
     the sub-agent. To restore the old per-token API/Bedrock billing (e.g. no
     subscription on the host), set `CLAUDE_CODE_ALLOW_API_BILLING=1`, which
     forwards `_CLAUDE_CRED_VARS` again. `CLAUDE_CODE_PASS_ENV=1` forwards the whole
-    environment (minus `_shell_env_exclude()`) but still strips the credential vars
+    environment (minus `shell_env_excluded()`) but still strips the credential vars
     unless `CLAUDE_CODE_ALLOW_API_BILLING=1` is also set.
 
 Default ON; opt out with `PUPA_CLAUDE_CODE_DISABLED=1`. Wired through
@@ -90,20 +90,30 @@ def _build_env() -> dict[str, str]:
     inherit `os.environ` in the default path), so the orchestrator keeping its own
     `ANTHROPIC_API_KEY` doesn't reach the sub-agent. `CLAUDE_CODE_ALLOW_API_BILLING=1`
     forwards `_CLAUDE_CRED_VARS` again. `CLAUDE_CODE_PASS_ENV=1` forwards the full
-    environment minus `_shell_env_exclude()` — but still strips the credential vars
-    unless API billing is opted in.
+    environment minus everything `shell_env_excluded()` withholds (secret-shaped
+    names plus the operator's `SHELL_ENV_EXCLUDE`) — and still strips the
+    credential vars unless API billing is opted in.
     """
     from pupa_backend.auth.devices import truthy
 
     allow_api = truthy(os.getenv("CLAUDE_CODE_ALLOW_API_BILLING"))
 
     if os.getenv("CLAUDE_CODE_PASS_ENV"):
-        from pupa_backend.harnesses.langgraph.backend_tools import _shell_env_exclude
+        from pupa_backend.harnesses.langgraph.backend_tools import shell_env_filter
 
-        exclude = set(_shell_env_exclude())
-        if not allow_api:
-            exclude |= set(_CLAUDE_CRED_VARS)
-        return {k: v for k, v in os.environ.items() if k not in exclude}
+        creds = set(_CLAUDE_CRED_VARS)
+        excluded = shell_env_filter()
+
+        def _forward(name: str) -> bool:
+            # The credential vars are the point of `allow_api` — decide them
+            # first, or the generic secret denylist would drop the very keys
+            # the opt-in exists to pass through and the sub-agent would get
+            # ANTHROPIC_BASE_URL with nothing to authenticate with.
+            if name in creds:
+                return allow_api
+            return not excluded(name)
+
+        return {k: v for k, v in os.environ.items() if _forward(k)}
 
     # USER/LOGNAME are required for macOS Keychain to resolve the login keychain
     # where the CLI's OAuth login (subscription auth) is stored — without them a

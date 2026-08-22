@@ -12,10 +12,10 @@ When auth is required, every non-public request must carry
 `Authorization: Bearer <token>` and the token must match one of:
 1. A live (non-revoked) paired device token in the `DeviceStore`.
 2. The exact `PUPA_API_KEY` value (constant-time compared) — the
-   server-side bootstrap credential used by `make pair` to authenticate
-   against `/auth/pair/begin` for the very first device. Never given to
-   end-user clients; the operator can unset it once at least one device
-   is paired.
+   server-side operator credential used by `make pair` to authenticate
+   against `/auth/pair/begin`. Never given to end-user clients. Keep it
+   set: `/auth/pair/begin` accepts nothing else, so unsetting it means no
+   further devices can be paired.
 
 When matched, the resolved auth identity is attached to `request.state.auth`
 as `("device", PairedDevice)` or `("api_key", None)`. Future per-scope
@@ -32,11 +32,13 @@ import hmac
 import os
 from collections.abc import Awaitable, Callable
 
-from fastapi import Request
+from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from .devices import get_store, truthy
+from .paths import is_health_probe
+from .scopes import auth_disabled, scope_denial
 
 
 def _is_public(path: str) -> bool:
@@ -44,12 +46,11 @@ def _is_public(path: str) -> bool:
         return True
     # `/auth/pair` is the bootstrap-code-exchange endpoint — the code IS the
     # credential, so we can't gate it behind a token (the device doesn't have
-    # one yet). `/auth/pair/begin` is gated; only `/auth/pair` itself is open.
+    # one yet). `/auth/pair/begin` is not public and is additionally
+    # operator-only via `require_api_key()`; only `/auth/pair` is open.
     if path == "/auth/pair":
         return True
-    # The AGUI helper registers `GET {path}/health` — with `path="/"` that
-    # serialises to `//health` until Starlette normalises it, so match both.
-    if path.endswith("/health"):
+    if is_health_probe(path):
         return True
     return False
 
@@ -93,3 +94,54 @@ async def api_key_middleware(
         return await call_next(request)
 
     return _unauthorized()
+
+
+def _is_probably_run_path(path: str) -> bool:
+    """Shape of a harness run endpoint, for the fail-closed branch only. The
+    authoritative answer is `app.state.run_paths`; this is what to assume when
+    that's absent."""
+    return path == "/" or path.startswith("/harnesses/")
+
+
+async def run_scope_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Require the `agent` scope on harness run endpoints (`POST /`,
+    `POST /harnesses/{id}`).
+
+    Those routes can't carry a `Depends(require_scope(...))`: the LangGraph one
+    is mounted by a third-party helper that takes no `dependencies=`. So the
+    check lives here instead, keyed on the paths harnesses record in
+    `app.state.run_paths` when they mount. Runs *inside* `api_key_middleware`,
+    which is what puts `request.state.auth` there.
+    """
+    if request.method != "POST":
+        return await call_next(request)
+    if auth_disabled():
+        return await call_next(request)
+
+    run_paths = getattr(request.app.state, "run_paths", None)
+    if run_paths is None:
+        # Fail closed. The set is populated during lifespan startup; missing it
+        # means the app was built in a way this guard doesn't understand, and
+        # the alternative is silently un-gating the most powerful route on the
+        # backend. `POST /` on a running app always has it.
+        if _is_probably_run_path(request.url.path):
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "Harness routes are not ready."},
+            )
+        return await call_next(request)
+    if request.url.path not in run_paths:
+        return await call_next(request)
+
+    # Same decision `Depends(require_scope("agent"))` makes, in response form.
+    denial = scope_denial(request, "agent")
+    if denial is None:
+        return await call_next(request)
+    if denial.status_code == status.HTTP_401_UNAUTHORIZED:
+        # This stack's 401 — it carries the `WWW-Authenticate` challenge that
+        # `api_key_middleware` sends for the same condition.
+        return _unauthorized()
+    return JSONResponse(status_code=denial.status_code, content={"detail": denial.detail})

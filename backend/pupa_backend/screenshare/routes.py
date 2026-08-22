@@ -40,6 +40,7 @@ import os
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from pupa_backend.auth.devices import get_store as get_device_store, truthy
+from pupa_backend.auth.transport import is_secure_request, require_https_enabled
 
 from .broker import ShareSession, broker
 from .sidecar_token import validate as validate_sidecar_token
@@ -82,23 +83,43 @@ async def _authorised(websocket: WebSocket) -> bool:
     return False
 
 
+async def _refuse(websocket: WebSocket, code: int) -> None:
+    """Reject a socket with a close code the client can actually read.
+
+    Closing a socket that was never accepted has no frame channel to carry the
+    code — the ASGI server just completes the upgrade with a plain HTTP 403, so
+    every refusal would look the same to the client. Accept first, then close:
+    nothing is read from the socket in between.
+    """
+    await websocket.accept()
+    await websocket.close(code=code)
+
+
 @router.websocket("/ws")
 async def screenshare_ws(
     websocket: WebSocket,
     role: str | None = None,
     share_id: str | None = None,
 ) -> None:
+    # WebSockets skip the HTTP middleware stack entirely, so the transport
+    # check is inline here — same reason auth is. The signalling socket carries
+    # the device token in its Authorization header, so a plaintext `ws://` hop
+    # leaks it exactly like a plaintext HTTP one would.
+    if require_https_enabled() and not is_secure_request(websocket):
+        await _refuse(websocket, 4403)
+        return
+
     if not await _authorised(websocket):
-        await websocket.close(code=4401)
+        await _refuse(websocket, 4401)
         return
 
     if role not in ("publisher", "viewer"):
-        await websocket.close(code=4400)
+        await _refuse(websocket, 4400)
         return
 
     if role == "publisher":
         if not share_id:
-            await websocket.close(code=4400)
+            await _refuse(websocket, 4400)
             return
         await websocket.accept()
         await _serve_publisher(websocket, share_id)

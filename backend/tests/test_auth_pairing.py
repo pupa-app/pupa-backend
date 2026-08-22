@@ -22,7 +22,10 @@ from pupa_backend.auth.pairing import DEFAULT_TTL, PairingCodeStore, reset_for_t
 
 
 @pytest.fixture
-def app(tmp_path: Path) -> FastAPI:
+def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    # These cases are *about* auth, so the dev opt-out must not be inherited
+    # from the shell — `PUPA_AUTH_DISABLED=1` is a documented local setting.
+    monkeypatch.delenv("PUPA_AUTH_DISABLED", raising=False)
     # Fresh device + pairing stores per test so flows don't leak between cases.
     reset_devices(tmp_path / "devices.json")
     reset_pairing()
@@ -93,6 +96,45 @@ def test_pair_begin_requires_auth(monkeypatch: pytest.MonkeyPatch, app: FastAPI)
     assert resp.status_code == 401
 
 
+def test_pair_begin_rejects_a_device_token(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    """Only the operator mints pairing codes. A device token authenticates
+    fine at the middleware but must not be able to mint another device —
+    otherwise a leaked token outlives the revocation of its own device.
+    """
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    begin = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": "Bearer k"}
+    ).json()
+    token = client.post(
+        "/auth/pair", json={"code": begin["code"], "label": "phone"}
+    ).json()["token"]
+
+    resp = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 403
+    assert "PUPA_API_KEY" in resp.json()["detail"]
+
+
+def test_pair_begin_rejects_unknown_scopes(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    """Scope names are a closed set; a typo shouldn't mint a token whose
+    scope silently matches nothing."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    resp = client.post(
+        "/auth/pair/begin",
+        json={"scopes": ["agent", "root"]},
+        headers={"Authorization": "Bearer k"},
+    )
+    assert resp.status_code == 422
+    assert "root" in str(resp.json())
+
+
 def test_pair_begin_returns_code_and_metadata(
     monkeypatch: pytest.MonkeyPatch, app: FastAPI
 ) -> None:
@@ -123,6 +165,24 @@ def test_pair_begin_with_custom_scopes(
     )
     assert resp.status_code == 200
     assert resp.json()["scopes"] == ["agent"]
+
+
+def test_pair_begin_with_an_empty_scope_list_grants_nothing(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    """An explicit `[]` asks for a device with no privileges — the opposite of
+    omitting the field. Treating it as falsy would hand the request that most
+    clearly asks for least privilege the entire default set, `agent` included.
+    """
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    resp = client.post(
+        "/auth/pair/begin",
+        json={"label": "kiosk", "scopes": []},
+        headers={"Authorization": "Bearer k"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["scopes"] == []
 
 
 # ---------------------------------------------------------------------------

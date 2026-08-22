@@ -18,6 +18,7 @@ Settings sheet can grey it out. The user toggle then lives on top of that.
 
 import os
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Any, Callable, List
 
 from deepagents.backends.state import StateBackend
@@ -86,6 +87,121 @@ def _shell_env_exclude() -> frozenset[str]:
     return frozenset(names)
 
 
+# Env var names that are secrets by shape. `SHELL_PASS_ENV=1` hands the
+# backend's environment to a subprocess the *model* drives, so the default has
+# to be "don't", not "whatever the operator remembered to list". Matched
+# case-insensitively against the whole name; `SHELL_ENV_ALLOW` puts one back.
+# Substring globs, not suffix ones: `PGPASSWORD` has no underscore, so
+# `*_PASSWORD` misses it.
+_SECRET_NAME_GLOBS: tuple[str, ...] = (
+    "*KEY",           # *_API_KEY, SECRET_KEY, bare OPENAI_KEY / SUPABASE_KEY
+    "*APIKEY*",
+    "*TOKEN*",
+    "*SECRET*",
+    "*PASSWORD*",
+    "*PASSWD*",
+    "*_PWD",          # MYSQL_PWD
+    "*CREDENTIAL*",
+    "*_AUTH",
+    "*_DSN",          # SENTRY_DSN embeds the project key
+    "AWS_*",
+    "AZURE_*",
+    "GOOGLE_*",
+    "GCP_*",
+    # Connection strings carry inline credentials. Narrow to the schemes that
+    # actually do, rather than every *_URL — LANGFUSE_BASE_URL and friends are
+    # addresses, not secrets, and over-blocking sends people to SHELL_ENV_ALLOW
+    # for no benefit.
+    "DATABASE_URL",
+    "*POSTGRES*_URL",
+    "*POSTGRESQL*_URL",
+    "*MYSQL*_URL",
+    "*REDIS*_URL",
+    "*MONGO*_URI",
+    "*AMQP*_URL",
+    "*_CONNECTION_STRING",
+)
+
+# Names that are neither secret-shaped nor secrets, but hand the subprocess
+# the *use* of one.
+_SECRET_NAME_EXACT: frozenset[str] = frozenset({
+    # A live agent socket: not a secret string, but signing with the
+    # operator's SSH keys is one `ssh` away.
+    "SSH_AUTH_SOCK",
+    # Cluster credentials, or a path to them.
+    "KUBECONFIG",
+    # Registry auth blob.
+    "DOCKER_AUTH_CONFIG",
+    # Path to a service-account JSON key.
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "PGPASSFILE",
+    "NETRC",
+})
+
+
+def is_secret_env_name(name: str) -> bool:
+    """Whether an env var name looks like a credential, or grants use of one.
+
+    Note the limit of this whole approach: `HOME` is deliberately forwarded so
+    startup scripts work, which leaves `~/.aws/credentials`, `~/.ssh/id_rsa`
+    and `~/.netrc` one `cat` away. This closes the environment channel, not
+    the filesystem one — `SHELL_TOOL_WORKSPACE` and not enabling the shell
+    tool on a host that holds credentials are what cover that.
+    """
+    upper = name.upper()
+    if upper in _SECRET_NAME_EXACT:
+        return True
+    return any(fnmatch(upper, glob) for glob in _SECRET_NAME_GLOBS)
+
+
+def _shell_env_allow() -> frozenset[str]:
+    """`SHELL_ENV_ALLOW`: names to forward even though they look secret.
+
+    For the startup script that genuinely needs one credential (a `gh auth`
+    wrapper, say) — name it, rather than dropping the whole default.
+    """
+    raw = os.getenv("SHELL_ENV_ALLOW", "")
+    return frozenset(v.strip() for v in raw.split(",") if v.strip())
+
+
+def shell_env_filter() -> Callable[[str], bool]:
+    """`shell_env_excluded`, bound to one snapshot of the rules.
+
+    Both rule sets are read from the environment on every call, and
+    `SHELL_ENV_EXCLUDE_FROM` re-opens and re-scans a file to build one of them.
+    Filtering a whole environment calls the predicate once per variable, so
+    take the snapshot first.
+    """
+    allow = _shell_env_allow()
+    exclude = _shell_env_exclude()
+
+    def excluded(name: str) -> bool:
+        if name in allow:
+            return False
+        return name in exclude or is_secret_env_name(name)
+
+    return excluded
+
+
+def shell_env_excluded(name: str) -> bool:
+    """Whether `name` is withheld from the shell subprocess. For one-off
+    questions — to filter a whole environment, use `shell_env_filter`."""
+    return shell_env_filter()(name)
+
+
+def _shell_subprocess_env() -> dict[str, str] | None:
+    """Environment for the shell subprocess, or None to inherit nothing.
+
+    `None` is the default and is *not* the same as "inherit": ShellToolMiddleware
+    passes `env={}` to Popen in that case, so the subprocess gets no PATH/HOME
+    either. `SHELL_PASS_ENV=1` opts into a filtered copy.
+    """
+    if not os.getenv("SHELL_PASS_ENV"):
+        return None
+    excluded = shell_env_filter()
+    return {k: v for k, v in os.environ.items() if not excluded(k)}
+
+
 def _build_startup_commands() -> list[str]:
     """Load shell startup commands from a local script file.
 
@@ -115,7 +231,10 @@ def _build_shell_middlewares() -> list:
     Settings sheet); the middleware honours that flag and skips the interrupt.
 
     Set ``SHELL_PASS_ENV=1`` to forward the backend's environment to the shell
-    subprocess (minus ``_SHELL_ENV_EXCLUDE``). Without it the subprocess gets
+    subprocess — minus anything ``shell_env_excluded`` withholds: the
+    operator's ``SHELL_ENV_EXCLUDE`` list plus every secret-shaped name
+    (``*_API_KEY``, ``AWS_*``, …). ``SHELL_ENV_ALLOW`` names exceptions.
+    Without it the subprocess gets
     no inherited env — note that ``ShellToolMiddleware`` passes ``env={}`` to
     ``Popen`` when env is ``None``, which strips HOME and PATH, so startup
     commands that rely on those (e.g. the gh auth wrapper) require
@@ -124,11 +243,7 @@ def _build_shell_middlewares() -> list:
     from pupa_backend.harnesses.langgraph.shell_approval import ShellApprovalMiddleware
 
     workspace = os.getenv("SHELL_TOOL_WORKSPACE")
-    env = (
-        {k: v for k, v in os.environ.items() if k not in _shell_env_exclude()}
-        if os.getenv("SHELL_PASS_ENV")
-        else None
-    )
+    env = _shell_subprocess_env()
     startup = _build_startup_commands()
     kwargs: dict[str, Any] = {"startup_commands": startup}
     if workspace:

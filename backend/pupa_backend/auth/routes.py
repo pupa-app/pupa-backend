@@ -19,7 +19,7 @@ import os
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from pupa_backend.version import backend_version
 
@@ -117,24 +117,41 @@ class _PairBeginRequest(BaseModel):
         description="Lifetime of the issued device token in seconds. Default: never expires.",
     )
 
+    @field_validator("scopes")
+    @classmethod
+    def _known_scopes(cls, v: list[str] | None) -> list[str] | None:
+        """Reject scope names outside `DEFAULT_SCOPES`. A typo would otherwise
+        mint a device whose scope matches no route — silently useless, and
+        indistinguishable from a downgrade attempt."""
+        if v is None:
+            return v
+        unknown = sorted(set(v) - set(DEFAULT_SCOPES))
+        if unknown:
+            raise ValueError(f"unknown scopes: {', '.join(unknown)}")
+        return v
+
 
 class _PairExchangeRequest(BaseModel):
     code: str
     label: str = Field(min_length=1, max_length=200)
 
 
-@router.post("/pair/begin")
+@router.post("/pair/begin", dependencies=[Depends(require_api_key())])
 async def pair_begin(body: _PairBeginRequest | None = None) -> dict:
-    """Operator-side: mint a short-lived bootstrap code. Gated by the global
-    auth middleware — needs `PUPA_API_KEY` or an existing paired device
-    to reach. The first device on a fresh backend therefore needs `PUPA_API_KEY`
-    to be set initially; afterwards the operator can unset it and rely on
-    paired-device tokens for further pairings.
+    """Operator-side: mint a short-lived bootstrap code. **Operator-only** —
+    `PUPA_API_KEY` is required, so `PUPA_API_KEY` must stay set for as long as
+    you want to pair devices.
+
+    A paired-device token is deliberately *not* enough: minting is how device
+    tokens come into existence, so letting one device mint another would make a
+    leaked token outlive the revocation of the device it was issued to.
     """
     from .pairing import DEFAULT_TTL
 
     payload = body or _PairBeginRequest()
-    scopes = payload.scopes if payload.scopes else list(DEFAULT_SCOPES)
+    # `is not None`, not truthiness: an explicit `[]` asks for a device with
+    # no scopes at all, which is the opposite of the default set.
+    scopes = payload.scopes if payload.scopes is not None else list(DEFAULT_SCOPES)
     code_ttl = (
         timedelta(seconds=payload.codeTtlSeconds)
         if payload.codeTtlSeconds is not None

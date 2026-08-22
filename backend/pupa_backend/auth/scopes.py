@@ -36,7 +36,7 @@ from fastapi import HTTPException, Request, status
 from .devices import truthy
 
 
-def _auth_disabled() -> bool:
+def auth_disabled() -> bool:
     return truthy(os.getenv("PUPA_AUTH_DISABLED"))
 
 
@@ -55,6 +55,27 @@ def _unauthorized() -> HTTPException:
     )
 
 
+def scope_denial(request: Request, scope: str) -> HTTPException | None:
+    """The `scope` decision itself. `None` means allowed.
+
+    Split out because two callers need the same answer in different shapes:
+    `require_scope` raises it as a dependency, and `run_scope_middleware`
+    (which can't be a dependency — see its docstring) turns it into a
+    response. One definition of what a scope means, either way.
+    """
+    if auth_disabled():
+        return None
+    identity = _identity(request)
+    if identity is None:
+        return _unauthorized()
+    kind, principal = identity
+    if kind == "api_key":
+        return None
+    if kind == "device" and principal is not None and principal.has_scope(scope):
+        return None
+    return _forbid(f"Missing required scope: {scope!r}")
+
+
 def require_scope(scope: str) -> Callable[[Request], None]:
     """FastAPI dependency: caller must be ``api_key`` or a device with ``scope``.
 
@@ -64,17 +85,9 @@ def require_scope(scope: str) -> Callable[[Request], None]:
     """
 
     def _dep(request: Request) -> None:
-        if _auth_disabled():
-            return
-        identity = _identity(request)
-        if identity is None:
-            raise _unauthorized()
-        kind, principal = identity
-        if kind == "api_key":
-            return
-        if kind == "device" and principal is not None and principal.has_scope(scope):
-            return
-        raise _forbid(f"Missing required scope: {scope!r}")
+        denial = scope_denial(request, scope)
+        if denial is not None:
+            raise denial
 
     return _dep
 
@@ -88,7 +101,7 @@ def require_api_key() -> Callable[[Request], None]:
     """
 
     def _dep(request: Request) -> None:
-        if _auth_disabled():
+        if auth_disabled():
             return
         identity = _identity(request)
         if identity is None:
