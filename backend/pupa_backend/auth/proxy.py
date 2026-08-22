@@ -48,8 +48,19 @@ def trust_forwarded_headers() -> bool:
 
 
 def forwarded_values(headers, name: str) -> list[str]:
-    """Split a comma-separated forwarded header into its hops, or []."""
-    raw = headers.get(name)
-    if not raw:
-        return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    """Every hop in a forwarded header, in order, or [].
+
+    `getlist`, not `get`: a proxy may *append a second field line* rather than
+    extend the first (Go's `Header.Add`, HAProxy's `option forwardfor`), and
+    `get` returns only the first one. Reading just that line would hand a
+    caller the last word — they send `X-Forwarded-Proto: https`, the proxy adds
+    its own `http` line underneath, and the "rightmost wins" rule would still
+    read the caller's. Per RFC 9110 the lines are one comma-joined value.
+    """
+    lines = headers.getlist(name) if hasattr(headers, "getlist") else [headers.get(name)]
+    hops: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        hops.extend(p.strip() for p in line.split(",") if p.strip())
+    return hops

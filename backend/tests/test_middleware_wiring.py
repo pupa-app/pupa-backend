@@ -153,6 +153,82 @@ def test_uvicorn_does_not_rewrite_the_scope_from_forwarded_headers(
     assert captured.get("proxy_headers") is False
 
 
+def _run_main(monkeypatch, **env) -> dict:
+    """Run `app.main()` with uvicorn stubbed; return the kwargs it was given."""
+    import uvicorn
+
+    from pupa_backend import app as app_module
+
+    captured: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
+    monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
+    for var in ("PUPA_HOST", "PUPA_TLS_CERT", "PUPA_TLS_KEY", "PUPA_CONNECTIVITY",
+                "PUPA_TRUSTED_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    app_module.main()
+    return captured
+
+
+def test_tailscale_without_an_active_serve_keeps_the_documented_wildcard_bind(
+    monkeypatch,
+) -> None:
+    """`start_serve_proxy` returns None when the CLI is missing, when
+    `PUPA_TAILSCALE_SERVE=0`, or when `serve` fails — all documented as falling
+    back to `0.0.0.0`. Binding loopback on the *intent* alone would take a
+    working LAN deployment off the network with nothing in the log to explain
+    it. And with nothing in front, the forwarded headers are caller-written.
+    """
+    import os
+
+    from pupa_backend import tailscale_proxy
+
+    monkeypatch.setattr(tailscale_proxy, "start_serve_proxy", lambda port: None)
+    captured = _run_main(monkeypatch, PUPA_CONNECTIVITY="tailscale")
+
+    assert captured.get("host") == "0.0.0.0"
+    assert os.environ["PUPA_TRUSTED_PROXY"] == "0"
+
+
+def test_tailscales_raw_tcp_mode_is_not_trusted_to_write_forwarded_headers(
+    monkeypatch,
+) -> None:
+    """`tcp` mode is an L4 passthrough: the client's request arrives
+    byte-for-byte, so `X-Forwarded-*` is whatever the caller sent. The listener
+    still binds loopback — tailscaled is what reaches it — but nothing it
+    forwards may be believed."""
+    import os
+
+    from pupa_backend import tailscale_proxy
+
+    class _TcpProxy:
+        mode = "tcp"
+        terminates_tls = False
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(tailscale_proxy, "start_serve_proxy", lambda port: _TcpProxy())
+    captured = _run_main(monkeypatch, PUPA_CONNECTIVITY="tailscale")
+
+    assert captured.get("host") == "127.0.0.1"
+    assert os.environ["PUPA_TRUSTED_PROXY"] == "0"
+
+
+def test_an_explicit_operator_setting_still_wins_at_startup(monkeypatch) -> None:
+    """`main()` records what it observed, but the operator's answer is the one
+    `auth/proxy.py` documents as final."""
+    import os
+
+    from pupa_backend import tailscale_proxy
+
+    monkeypatch.setattr(tailscale_proxy, "start_serve_proxy", lambda port: None)
+    _run_main(monkeypatch, PUPA_CONNECTIVITY="tailscale", PUPA_TRUSTED_PROXY="1")
+
+    assert os.environ["PUPA_TRUSTED_PROXY"] == "1"
+
+
 def test_an_inferred_proxy_deployment_binds_loopback(monkeypatch) -> None:
     """`auth/proxy.py` infers forwarded-header trust from `PUPA_CONNECTIVITY`.
     Wherever it does, the listener must not also be reachable directly — a
@@ -179,13 +255,21 @@ def test_an_inferred_proxy_deployment_binds_loopback(monkeypatch) -> None:
     assert captured.get("host") == "127.0.0.1"
 
 
-def test_the_guard_fails_closed_without_run_paths() -> None:
+def test_the_guard_fails_closed_without_run_paths(monkeypatch) -> None:
     """If the attribute is missing the guard must refuse, not wave the request
-    through — that branch is the difference between a bug and an open door."""
+    through — that branch is the difference between a bug and an open door.
+
+    The caller here holds a *valid* operator key on purpose: with a bad one
+    `api_key_middleware` answers 401 first and the fail-closed branch is never
+    reached, so the test would pass no matter what this guard does.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from pupa_backend.auth import api_key_middleware
+
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    monkeypatch.delenv("PUPA_AUTH_DISABLED", raising=False)
 
     app = FastAPI()
     app.middleware("http")(run_scope_middleware)
@@ -196,5 +280,8 @@ def test_the_guard_fails_closed_without_run_paths() -> None:
         return {"ok": True}
 
     # No app.state.run_paths assigned.
-    resp = TestClient(app).post("/", json={}, headers={"Authorization": "Bearer x"})
-    assert resp.status_code != 200, "run endpoint served with no scope data"
+    resp = TestClient(app).post("/", json={}, headers={"Authorization": "Bearer k"})
+    assert resp.status_code == 503, (
+        f"run endpoint answered {resp.status_code} with no scope data — the "
+        "fail-closed branch did not fire"
+    )

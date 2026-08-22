@@ -21,6 +21,7 @@ from pupa_backend.auth.ratelimit import (
     PAIR_EXCHANGE_LIMIT,
     SlidingWindowLimiter,
     client_key,
+    get_limiter,
     reset_for_testing as reset_limiter,
 )
 
@@ -424,11 +425,14 @@ def test_a_refund_cannot_take_back_a_concurrent_requests_charge() -> None:
     charge that still has a request behind it. Refund by value."""
     now = [0.0]
     limiter = SlidingWindowLimiter(now=lambda: now[0])
-    mine = limiter.record("ip")             # request A arrives
+    mine = limiter.record("ip")             # request A arrives at t=0
     now[0] = 1.0
-    limiter.record("ip")                    # request B arrives, still in flight
+    limiter.record("ip")                    # request B arrives at t=1, in flight
     limiter.refund("ip", mine)              # A finishes first, legitimately
     assert not limiter.under_limit("ip", limit=1), "B's charge was refunded too"
+    # The hit left behind must be *B's*. Popping the tail would leave A's, and
+    # the count alone can't tell them apart — the expiry can.
+    assert limiter.retry_after("ip") == 61, "the wrong charge was given back"
 
 
 def test_a_refund_of_an_aged_out_charge_is_harmless() -> None:
@@ -481,3 +485,55 @@ def test_the_ceiling_keeps_the_buckets_that_are_still_being_spent() -> None:
     assert not limiter.under_limit("guesser", limit=5), (
         "hitting the ceiling forgave a live budget"
     )
+
+
+# ---------------------------------------------------------------------------
+# What the middleware refunds, and what it never charges
+# ---------------------------------------------------------------------------
+
+
+def test_a_transport_refusal_does_not_spend_a_pairing_budget(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`require_https_middleware` sits inside the limiter and also answers 403.
+    A plaintext hop is a misconfiguration, not a guess at a credential — an
+    operator who forgot the scheme must not burn a real device's budget
+    discovering it."""
+    from pupa_backend.auth import require_https_middleware
+
+    monkeypatch.setenv("PUPA_REQUIRE_HTTPS", "1")
+    reset_limiter()
+    inner = FastAPI()
+    inner.middleware("http")(require_https_middleware)
+    inner.middleware("http")(rate_limit_middleware)
+    inner.include_router(auth_router, prefix="/auth")
+
+    client = TestClient(inner)
+    headers = {"X-Forwarded-For": "203.0.113.11"}
+    for _ in range(PAIR_EXCHANGE_LIMIT * 3):
+        resp = client.post("/auth/pair", json={"code": "NOSUCHCO", "label": "x"}, headers=headers)
+        assert resp.status_code == 403, resp.status_code
+    assert get_limiter().tracked_keys() == 0, "a transport refusal was charged"
+
+
+def test_a_crash_downstream_does_not_spend_the_callers_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 500 is a server bug, not a guess. Leaving the entry charge on would
+    let a broken deploy lock out the device it is broken for."""
+    monkeypatch.delenv("PUPA_RATE_LIMIT_DISABLED", raising=False)
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
+    reset_limiter()
+
+    boom = FastAPI()
+
+    @boom.post("/auth/pair")
+    async def pair() -> dict:  # pragma: no cover - raises before returning
+        raise RuntimeError("kaboom")
+
+    boom.middleware("http")(rate_limit_middleware)
+
+    client = TestClient(boom, raise_server_exceptions=False)
+    for _ in range(PAIR_EXCHANGE_LIMIT * 2):
+        client.post("/auth/pair", json={}, headers={"X-Forwarded-For": "203.0.113.12"})
+    assert get_limiter().tracked_keys() == 0, "a server crash was charged to the caller"

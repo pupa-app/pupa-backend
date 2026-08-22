@@ -346,22 +346,61 @@ async def test_sidecar_token_allows_publisher_only(monkeypatch: pytest.MonkeyPat
     assert not await _authorised(no_token)
 
 
-async def test_a_refused_socket_is_accepted_before_it_is_closed() -> None:
+async def _ws_messages(app: FastAPI, query: str, headers: list | None = None) -> list:
+    """Drive the websocket route at the raw ASGI layer and return what it sent.
+
+    TestClient is an in-process shim that surfaces a close code whether or not
+    the socket was accepted, so it cannot see the difference this asserts. The
+    ASGI message list can.
+    """
+    sent: list = []
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": "/screenshare/ws",
+        "raw_path": b"/screenshare/ws",
+        "query_string": query.encode(),
+        "root_path": "",
+        "headers": headers or [],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+
+    async def receive() -> dict:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
+async def test_a_refused_socket_is_accepted_before_it_is_closed(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Closing a socket that was never accepted has no frame channel to carry
-    the close code — the ASGI server just answers the upgrade with a plain HTTP
+    the close code — a real ASGI server answers the upgrade with a plain HTTP
     403, so 4403 (HTTPS required), 4401 (unauthorised) and 4400 (bad role) all
-    reach the client as the same thing. TestClient is an in-process shim that
-    surfaces the code either way, so only the call order can be asserted."""
-    from pupa_backend.screenshare.routes import _refuse
+    reach the client as the same thing.
 
-    calls: list = []
+    This drives the route, not the helper: asserting the helper alone would
+    restate its two lines and say nothing about whether the refusals use it.
+    """
+    monkeypatch.setenv("PUPA_REQUIRE_HTTPS", "1")
+    sent = await _ws_messages(app, "role=publisher&share_id=any")
+    assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"]
+    assert sent[-1]["code"] == 4403
 
-    class _FakeWebSocket:
-        async def accept(self) -> None:
-            calls.append("accept")
 
-        async def close(self, code: int) -> None:
-            calls.append(("close", code))
-
-    await _refuse(_FakeWebSocket(), 4403)
-    assert calls == ["accept", ("close", 4403)]
+async def test_a_bad_role_is_also_accepted_before_it_is_closed(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PUPA_AUTH_DISABLED=1` comes from the fixture, so this reaches the role
+    check — the other pre-accept refusal path."""
+    monkeypatch.delenv("PUPA_REQUIRE_HTTPS", raising=False)
+    sent = await _ws_messages(app, "role=nonsense")
+    assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"]
+    assert sent[-1]["code"] == 4400

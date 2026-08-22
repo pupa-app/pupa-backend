@@ -231,3 +231,51 @@ def test_an_explicit_flag_overrides_the_inference(
     monkeypatch.setenv("PUPA_CONNECTIVITY", "tailscale")
     monkeypatch.setenv("PUPA_TRUSTED_PROXY", "0")
     assert not is_secure_request(_Req("http", "https"))
+
+# ---------------------------------------------------------------------------
+# Forwarded headers: every line, not just the first
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_forwarded_line_cannot_be_hidden_behind_the_callers_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy may *append a field line* rather than extend the caller's (Go's
+    `Header.Add`, HAProxy's `option forwardfor`). Reading only the first line
+    would let the caller send `X-Forwarded-Proto: https`, have the proxy add
+    its real `http` underneath, and still be believed."""
+    from starlette.datastructures import Headers
+
+    from pupa_backend.auth.proxy import forwarded_values
+
+    headers = Headers(
+        raw=[
+            (b"x-forwarded-proto", b"https"),   # written by the caller
+            (b"x-forwarded-proto", b"http"),    # appended by the proxy
+        ]
+    )
+    assert forwarded_values(headers, "x-forwarded-proto") == ["https", "http"]
+
+
+async def test_a_forged_proto_line_cannot_outrank_the_proxys_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same case, end to end: the rightmost hop is the proxy's, so a plaintext
+    hop stays refused however the caller arranges its own headers."""
+    from starlette.requests import Request
+
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
+    scope = {
+        "type": "http",
+        "scheme": "http",
+        "method": "POST",
+        "path": "/auth/pair",
+        "query_string": b"",
+        "headers": [
+            (b"x-forwarded-proto", b"https"),
+            (b"x-forwarded-proto", b"http"),
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("testserver", 80),
+    }
+    assert not is_secure_request(Request(scope))

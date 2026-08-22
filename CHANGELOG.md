@@ -42,9 +42,16 @@ bumps (`0.0.X` → `0.0.X+1`).
   — it believed those headers from any loopback peer, which on a tunnel
   deployment is every caller. **If you run your own reverse proxy in front of
   the backend, set `transport.trusted_proxy: true`**; the modes Pupa starts
-  itself are inferred and need nothing. Those modes now also bind the listener
-  to loopback — `connectivity: cloudflared` bound `0.0.0.0` while trusting
-  `X-Forwarded-*`, so anyone on the LAN could forge a hop.
+  itself are inferred and need nothing. `connectivity: cloudflared` bound
+  `0.0.0.0` while trusting `X-Forwarded-*`, so anyone on the LAN could forge a
+  hop; it now binds loopback, and Tailscale's raw-TCP fallback mode — which
+  passes the client's request through byte-for-byte and writes no forwarded
+  headers — is no longer trusted to have written them.
+- **Forwarded headers are read across every field line.** A proxy that
+  *appends* `X-Forwarded-For: <client>` as a second header line rather than
+  extending the caller's left the whole value caller-controlled, because only
+  the first line was parsed — so "the rightmost hop is the proxy's" was not
+  what the code did.
 - **Concurrent pairing guesses are capped.** The limiter checked a caller's
   budget before running the request and charged it after, so requests arriving
   together all passed the check against a bucket none of them had been written

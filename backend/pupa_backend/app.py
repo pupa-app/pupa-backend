@@ -307,18 +307,39 @@ def main() -> None:
     # With `connectivity: tailscale`, let tailscaled forward the tailnet into a
     # loopback-bound listener — a wildcard bind is unreachable on macOS without
     # the Local Network privacy grant. See tailscale_proxy.py.
-    from pupa_backend.auth.proxy import starts_its_own_proxy
+    from pupa_backend.auth.proxy import trust_forwarded_headers
     from pupa_backend.tailscale_proxy import bind_host, start_serve_proxy
 
     proxy = start_serve_proxy(port)
-    # `cloudflared` reaches us over loopback too, and `auth/proxy.py` infers
-    # forwarded-header trust from the same env var — so a wildcard bind there
-    # would let anyone who can route to the port write their own
-    # `X-Forwarded-Proto`/`-For` and walk through both the HTTPS check and the
-    # rate limiter. `start_serve_proxy` only covers the Tailscale case (and
-    # returns None when the CLI is missing), so ask the connectivity mode
-    # directly. `PUPA_HOST` still overrides.
-    loopback_only = proxy is not None or starts_its_own_proxy()
+    connectivity = os.getenv("PUPA_CONNECTIVITY", "").strip().lower()
+    cloudflared = connectivity == "cloudflared"
+
+    # Two facts, and they come apart — `PUPA_CONNECTIVITY` says what was
+    # *intended*, not what actually came up:
+    #
+    # - `fronted`: something local forwards into this listener, so it doesn't
+    #   need to be reachable directly. `start_serve_proxy` returns None when the
+    #   Tailscale CLI is absent, when `PUPA_TAILSCALE_SERVE=0`, or when `serve`
+    #   fails — all documented as falling back to `0.0.0.0`.
+    # - `rewrites_forwarded`: that something is an HTTP proxy, so it *writes*
+    #   `X-Forwarded-*` over whatever the caller sent. Tailscale's `tcp` mode is
+    #   a raw L4 passthrough: the client's request arrives byte-for-byte, so
+    #   those headers stay caller-written and must not be believed.
+    fronted = proxy is not None or cloudflared
+    rewrites_forwarded = cloudflared or (proxy is not None and proxy.terminates_tls)
+
+    if connectivity == "tailscale" and proxy is None:
+        logger.warning(
+            "connectivity=tailscale but `tailscale serve` is not active — "
+            "binding %s and trusting no forwarded headers.",
+            bind_host(proxied=False),
+        )
+
+    # `auth/proxy.py` infers trust from `PUPA_CONNECTIVITY` for processes that
+    # never run this function (a bare `uvicorn pupa_backend.app:app`). Here the
+    # answer is known, so record it — an explicit operator setting still wins.
+    if not os.getenv("PUPA_TRUSTED_PROXY", "").strip():
+        os.environ["PUPA_TRUSTED_PROXY"] = "1" if rewrites_forwarded else "0"
 
     tls_cert = os.getenv("PUPA_TLS_CERT")
     tls_key = os.getenv("PUPA_TLS_KEY")
@@ -335,10 +356,22 @@ def main() -> None:
 
         warn_unusable_cert(tls_cert)
 
+    host = bind_host(proxied=fronted)
+    if trust_forwarded_headers() and host not in ("127.0.0.1", "::1", "localhost"):
+        # Not fatal: Railway and friends need the wildcard bind and do sanitise
+        # the headers. But anyone who can reach the port directly can now write
+        # their own hop, so it has to be a deliberate choice, not a default.
+        logger.warning(
+            "trusting X-Forwarded-* while bound to %s — anyone who can reach "
+            "this port directly can forge their own hop. Front it with the "
+            "proxy, or unset transport.trusted_proxy.",
+            host,
+        )
+
     try:
         uvicorn.run(
             "pupa_backend.app:app",
-            host=bind_host(proxied=loopback_only),
+            host=host,
             port=port,
             reload=False,
             # uvicorn's own proxy-header handling folds client-supplied

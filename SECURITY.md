@@ -49,9 +49,13 @@ when assessing risk:
   caller was legitimate, so concurrent guesses can't all clear the check
   against a bucket none of them has been written to yet. (The one cost: more
   than the limit genuinely *in flight at once* on one bucket will 429 even if
-  they'd all have succeeded. Retrying works immediately.) Buckets are
-  per-client with no shared cap, so no amount of third-party abuse can block a
-  caller holding a valid credential. Bucketing uses `X-Forwarded-For` **only
+  they'd all have succeeded. Retrying works immediately.) There is no shared
+  cap — one bucket everybody drew from could be drained by a stranger to lock
+  out people holding real credentials. That protection is only as good as the
+  bucket key: where the backend can't tell callers apart (a proxy in front of
+  it that isn't trusted, so every request looks like `127.0.0.1`) they share a
+  bucket and the guarantee weakens to the shared-cap one. Hence the next
+  paragraph. Bucketing uses `X-Forwarded-For` **only
   where a proxy is trusted** (`PUPA_TRUSTED_PROXY`, inferred for the tunnel
   modes): the proxied transports terminate in front of a loopback listener so
   the peer address is useless there, while on a direct bind the header is

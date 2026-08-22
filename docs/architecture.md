@@ -692,7 +692,10 @@ depend on a harness.
   shared bucket that blocks is a denial of service with extra steps, since a
   stranger could drain it and lock out everyone holding a real credential.
   Keyed on the **rightmost**
-  `X-Forwarded-For` entry *when a proxy is trusted*, else on
+  `X-Forwarded-For` entry across *every* field line of that header — a proxy
+  may append a second line rather than extend the caller's, and reading only
+  the first would give the caller the last word — *when a proxy is trusted*,
+  else on
   `request.client.host`. Both halves matter: the proxied modes terminate in
   front of a loopback listener, so the peer address is `127.0.0.1` for every
   remote caller and would bucket the internet as one — but on a direct bind
@@ -721,11 +724,23 @@ depend on a harness.
   `client.host` *above* the app and make the check below read a forged value.
   Consequence for **operator-run** reverse proxies (nginx, Caddy, a manual
   `cloudflared`): set `transport.trusted_proxy: true`, or every caller buckets
-  as `127.0.0.1` and `PUPA_REQUIRE_HTTPS` sees a plaintext hop. The modes this
-  process starts itself are inferred and need nothing. Those modes also bind
-  the listener to loopback (`starts_its_own_proxy()` in `main()`) — believing
-  `X-Forwarded-*` while the port is also directly reachable would let anyone
-  who can route to it write their own hop.
+  as `127.0.0.1` and `PUPA_REQUIRE_HTTPS` sees a plaintext hop.
+  `main()` resolves the rest at startup, because `PUPA_CONNECTIVITY` says what
+  was *intended* and the answer needed is what actually came up. Two separate
+  facts:
+  - **Fronted** — something local forwards into this listener, so it binds
+    `127.0.0.1`. False when `tailscale serve` didn't start (CLI absent,
+    `PUPA_TAILSCALE_SERVE=0`, or `serve` failed), which keeps the documented
+    `0.0.0.0` fallback and logs why.
+  - **Rewrites `X-Forwarded-*`** — that something is an HTTP proxy, so it
+    overwrites what the caller sent. True for `cloudflared` and for Tailscale's
+    **https** mode; false for Tailscale's **tcp** mode, which is a raw L4
+    passthrough where the client's request arrives byte-for-byte and those
+    headers stay caller-written. Only this sets `PUPA_TRUSTED_PROXY` when the
+    operator hasn't.
+  A non-loopback bind while forwarded headers are trusted (Railway, or an
+  explicit flag) logs a warning: anyone who can reach the port directly can
+  write their own hop.
 - **Transport** —
   [`transport.py`](../backend/pupa_backend/auth/transport.py) implements
   `PUPA_REQUIRE_HTTPS` (config `transport.require_https`), unset by default so
