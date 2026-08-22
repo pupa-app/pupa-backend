@@ -29,6 +29,10 @@ from pupa_backend.auth.ratelimit import (
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
     monkeypatch.delenv("PUPA_RATE_LIMIT_DISABLED", raising=False)
+    # Several cases here turn on a 401/403 actually happening, so the dev auth
+    # opt-out must not be inherited from the shell — `PUPA_AUTH_DISABLED=1` is
+    # a documented local setting.
+    monkeypatch.delenv("PUPA_AUTH_DISABLED", raising=False)
     # These cases exercise the proxied deployments, where something in front
     # writes X-Forwarded-For. The direct-bind case is covered separately below.
     monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
@@ -459,9 +463,13 @@ def test_the_ceiling_keeps_the_buckets_that_are_still_being_spent() -> None:
     """Clearing the map at the ceiling would hand every caller their
     outstanding budget back at once — a flood spread over enough addresses
     could keep the limiter switched off for everybody simply by running. Nor
-    can eviction go by insertion order: a guesser that started *before* the
-    flood is at the front of the map and is exactly the bucket that has to
-    survive it.
+    can eviction go by insertion order: a caller that started *before* the
+    flood is at the front of the map while still being charged.
+
+    Note the limit of what this pins: it is about buckets still being charged.
+    A bucket already *at* its limit gets 429s that `record` never sees, so its
+    recency stops moving and a large enough flood does evict it — see the note
+    in `record`.
     """
     from pupa_backend.auth.ratelimit import MAX_TRACKED_KEYS
 
@@ -538,3 +546,29 @@ def test_a_crash_downstream_does_not_spend_the_callers_budget(
     for _ in range(PAIR_EXCHANGE_LIMIT * 2):
         client.post("/auth/pair", json={}, headers={"X-Forwarded-For": "203.0.113.12"})
     assert get_limiter().tracked_keys() == 0, "a server crash was charged to the caller"
+
+
+def test_client_key_reads_every_forwarded_field_line(monkeypatch) -> None:
+    """The `_Req` stubs above carry a plain dict, so they exercise the
+    single-line path only. A real Starlette request can hold the same header
+    twice — a proxy that appends rather than extends — and the rightmost hop
+    has to be the proxy's, not the caller's."""
+    from starlette.requests import Request
+
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/auth/pair",
+            "query_string": b"",
+            "headers": [
+                (b"x-forwarded-for", b"9.9.9.9"),      # written by the caller
+                (b"x-forwarded-for", b"203.0.113.7"),  # appended by the proxy
+            ],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+    assert client_key(request) == "203.0.113.7"

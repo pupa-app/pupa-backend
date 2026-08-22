@@ -6,6 +6,7 @@ routes with them.
 """
 
 import logging
+import ipaddress
 import os
 import re
 import shutil
@@ -68,10 +69,22 @@ if claude_harness_enabled():
 
 _TUNNEL_URL_FILE = Path.home() / ".pupa-backend" / "tunnel_url"
 
-# Bind addresses only this machine can reach. Anything else — `0.0.0.0`, or an
-# explicit `PUPA_HOST` on a LAN address — is reachable by something that isn't
-# the operator, which is what `PUPA_AUTH_DISABLED` must never be paired with.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+def _is_loopback(host: str) -> bool:
+    """Whether only this machine can reach a listener bound here.
+
+    `ipaddress` rather than a literal set, so the whole of 127/8 and every
+    spelling of `::1` count. A bind is *not* the whole story — see the tunnel
+    check in `main()`, where the socket is on loopback precisely because
+    something else is publishing it.
+    """
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname. It may resolve to loopback, but we can't know that
+        # cheaply and guessing wrong here fails open — treat it as reachable.
+        return False
 
 
 def _start_cloudflared_tunnel() -> "subprocess.Popen[str] | None":
@@ -364,7 +377,13 @@ def main() -> None:
 
     host = bind_host(proxied=fronted)
 
-    if truthy(os.getenv("PUPA_AUTH_DISABLED")) and host not in _LOOPBACK_HOSTS:
+    # `fronted` matters as much as the bind: under a tunnel the socket is on
+    # loopback *because* tailscaled or cloudflared is publishing it, and a
+    # Cloudflare quick tunnel is a public URL — strictly more exposed than the
+    # `0.0.0.0` case, not less.
+    reachable = fronted or not _is_loopback(host)
+    where = f"published by connectivity={connectivity}" if fronted else f"bound to {host}"
+    if truthy(os.getenv("PUPA_AUTH_DISABLED")) and reachable:
         # Refuse, don't warn. `PUPA_AUTH_DISABLED=1` opens every route
         # including the agent loop and the shell tool, and a warning scrolls
         # past in a platform log — the two together are how a dev shortcut ends
@@ -372,22 +391,26 @@ def main() -> None:
         # differently-named variable so it can't be reached by pasting the
         # first one into a launch script.
         if not truthy(os.getenv("PUPA_ALLOW_INSECURE_BIND")):
+            if proxy is not None:
+                # Don't leave a `serve --bg` registration pointing at a port
+                # nothing is going to listen on.
+                proxy.stop()
             raise SystemExit(
                 f"Refusing to start: PUPA_AUTH_DISABLED=1 with the listener "
-                f"bound to {host}, which is reachable from off this machine. "
-                f"Every route would be open to anyone who can route to it. "
-                f"Pair a device instead (see `pupa-backend pair`), bind "
-                f"127.0.0.1, or set PUPA_ALLOW_INSECURE_BIND=1 if this network "
-                f"really is trusted."
+                f"{where}, which is reachable from off this machine. Every "
+                f"route would be open to anyone who can reach it. Pair a "
+                f"device instead (see `pupa-backend pair`), bind 127.0.0.1 "
+                f"with no tunnel, or set PUPA_ALLOW_INSECURE_BIND=1 if this "
+                f"network really is trusted."
             )
         logger.warning(
-            "auth is DISABLED and the listener is bound to %s — every route is "
-            "open to anything that can reach this port. Allowed only because "
+            "auth is DISABLED and the listener is %s — every route is open to "
+            "anything that can reach it. Allowed only because "
             "PUPA_ALLOW_INSECURE_BIND is set.",
-            host,
+            where,
         )
 
-    if trust_forwarded_headers() and host not in _LOOPBACK_HOSTS:
+    if trust_forwarded_headers() and not _is_loopback(host):
         # Not fatal: Railway and friends need the wildcard bind and do sanitise
         # the headers. But anyone who can reach the port directly can now write
         # their own hop, so it has to be a deliberate choice, not a default.

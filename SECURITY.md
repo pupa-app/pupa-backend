@@ -37,7 +37,9 @@ when assessing risk:
   including the agent run endpoints.
   `PUPA_AUTH_DISABLED=1` removes all auth and is **only** for a same-machine dev
   loop. The backend enforces that rather than trusting it: with the switch set
-  and the listener bound to anything but loopback it refuses to start, because
+  and the listener reachable from off the machine — bound wide, *or* published
+  by a tunnel, which binds loopback precisely because something else is
+  serving it — it refuses to start, because
   that combination hands every route — the agent loop and the shell tool
   included — to anyone who can reach the port. `PUPA_ALLOW_INSECURE_BIND=1` is
   the deliberate override.
@@ -53,7 +55,9 @@ when assessing risk:
   caller was legitimate, so concurrent guesses can't all clear the check
   against a bucket none of them has been written to yet. (The one cost: more
   than the limit genuinely *in flight at once* on one bucket will 429 even if
-  they'd all have succeeded. Retrying works immediately.) There is no shared
+  they'd all have succeeded. Retrying works immediately — unless the requests
+  in flight are being held open deliberately, which on a shared bucket is a
+  handful of sockets against the pairing route.) There is no shared
   cap — one bucket everybody drew from could be drained by a stranger to lock
   out people holding real credentials. That protection is only as good as the
   bucket key: where the backend can't tell callers apart (a proxy in front of

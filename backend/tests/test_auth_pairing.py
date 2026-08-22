@@ -22,7 +22,10 @@ from pupa_backend.auth.pairing import DEFAULT_TTL, PairingCodeStore, reset_for_t
 
 
 @pytest.fixture
-def app(tmp_path: Path) -> FastAPI:
+def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    # These cases are *about* auth, so the dev opt-out must not be inherited
+    # from the shell — `PUPA_AUTH_DISABLED=1` is a documented local setting.
+    monkeypatch.delenv("PUPA_AUTH_DISABLED", raising=False)
     # Fresh device + pairing stores per test so flows don't leak between cases.
     reset_devices(tmp_path / "devices.json")
     reset_pairing()

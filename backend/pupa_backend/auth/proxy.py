@@ -10,8 +10,12 @@ So it has to be a deployment fact, not a guess from the request:
 
 - `PUPA_TRUSTED_PROXY` (config `transport.trusted_proxy`) is the explicit
   answer and always wins, either way.
-- Otherwise it's inferred from `PUPA_CONNECTIVITY`: with `tailscale` or
-  `cloudflared` this process starts the proxy itself, so it knows one is there.
+- Otherwise `app.main()` records what it observed at startup — whether an HTTP
+  proxy actually came up, which `PUPA_CONNECTIVITY` alone can't say (Tailscale
+  serve has a raw-TCP mode that writes no forwarded headers, and the CLI may be
+  absent entirely).
+- Failing that — a process that never ran `main()` — it's inferred from
+  `PUPA_CONNECTIVITY=cloudflared`, the one mode that is always an HTTP proxy.
 - Otherwise **false** — a direct bind (`0.0.0.0`, the LAN/offline default)
   has nothing in front, so the peer address is the honest one.
 
@@ -25,17 +29,20 @@ import os
 
 from .devices import truthy
 
-# Connectivity modes where this process launches the proxy in front of itself.
-_PROXIED_CONNECTIVITY = frozenset({"tailscale", "cloudflared"})
+# Connectivity modes where an HTTP proxy is in front, so `X-Forwarded-*` is
+# written by it rather than by the caller. `tailscale` is deliberately absent:
+# its `tcp` mode is a raw L4 passthrough that writes nothing, and which mode is
+# live isn't knowable from the environment. `app.main()` knows, and records the
+# answer in `PUPA_TRUSTED_PROXY` before serving.
+_PROXIED_CONNECTIVITY = frozenset({"cloudflared"})
 
 
 def starts_its_own_proxy() -> bool:
-    """Whether this process launches the proxy that fronts it.
+    """Whether an HTTP proxy this process starts is in front of it.
 
-    The same fact the inference below rests on, read by `app.main()` to bind
-    the listener to loopback. The two have to agree: believing `X-Forwarded-*`
-    while the listener is also reachable directly lets anyone who can route to
-    it write their own hop — which is the whole hole the trust gate closes.
+    Only a fallback: it answers for a process that never ran `app.main()` — a
+    bare `uvicorn pupa_backend.app:app`. Every documented entrypoint goes
+    through `main()`, which resolves this from what actually came up.
     """
     return os.getenv("PUPA_CONNECTIVITY", "").strip().lower() in _PROXIED_CONNECTIVITY
 

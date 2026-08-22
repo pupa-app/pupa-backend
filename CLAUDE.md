@@ -109,8 +109,9 @@ environment, so renaming any of those three breaks releases.
   Backend → Edit. The operator can `unset PUPA_API_KEY` after the first pair —
   paired devices keep working, fresh devices get 401 until the next pair. The
   key never reaches a client. `PUPA_AUTH_DISABLED=1` disables everything — dev
-  loops only, and the backend refuses to start if it's set on a non-loopback
-  bind (`PUPA_ALLOW_INSECURE_BIND=1` overrides). Per-route authorization lives in
+  loops only, and the backend refuses to start if it's set while the listener
+  is reachable — bound off-loopback or fronted by a tunnel
+  (`PUPA_ALLOW_INSECURE_BIND=1` overrides). Per-route authorization lives in
   [`auth/scopes.py`](backend/pupa_backend/auth/scopes.py): scope-gated surfaces
   (`/db/threads/*` and `GET /harnesses` → `agent`) and operator-only surfaces
   (`/auth/devices/*`). API-key identity bypasses scope checks; devices must

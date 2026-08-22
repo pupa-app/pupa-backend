@@ -141,17 +141,7 @@ def test_uvicorn_does_not_rewrite_the_scope_from_forwarded_headers(
     `trust_forwarded_headers`, and the rate limiter would bucket on a forged
     peer. Must stay off.
     """
-    import uvicorn
-
-    from pupa_backend import app as app_module
-
-    captured: dict = {}
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
-    monkeypatch.delenv("PUPA_CONNECTIVITY", raising=False)
-    monkeypatch.delenv("PUPA_TLS_CERT", raising=False)
-    monkeypatch.delenv("PUPA_TLS_KEY", raising=False)
-
-    app_module.main()
+    captured = _run_main(monkeypatch)
 
     assert captured.get("proxy_headers") is False
 
@@ -166,9 +156,12 @@ def _run_main(monkeypatch, **env) -> dict:
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
     monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
     for var in ("PUPA_HOST", "PUPA_TLS_CERT", "PUPA_TLS_KEY", "PUPA_CONNECTIVITY",
-                "PUPA_TRUSTED_PROXY", "PUPA_AUTH_DISABLED",
-                "PUPA_ALLOW_INSECURE_BIND"):
+                "PUPA_AUTH_DISABLED", "PUPA_ALLOW_INSECURE_BIND"):
         monkeypatch.delenv(var, raising=False)
+    # `main()` *creates* this one, and `delenv` on an absent var records nothing
+    # for monkeypatch to undo — so it would leak into every later test in the
+    # session. An empty value is falsy to the check in `main()` and restorable.
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "")
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     app_module.main()
@@ -241,20 +234,7 @@ def test_an_inferred_proxy_deployment_binds_loopback(monkeypatch) -> None:
     limiter. `cloudflared` is the case that used to bind `0.0.0.0`: unlike
     Tailscale, nothing in this process forwards for it.
     """
-    import uvicorn
-
-    from pupa_backend import app as app_module
-
-    captured: dict = {}
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
-    monkeypatch.setenv("PUPA_CONNECTIVITY", "cloudflared")
-    monkeypatch.delenv("PUPA_HOST", raising=False)
-    monkeypatch.delenv("PUPA_TLS_CERT", raising=False)
-    monkeypatch.delenv("PUPA_TLS_KEY", raising=False)
-    # Don't actually start a tunnel.
-    monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
-
-    app_module.main()
+    captured = _run_main(monkeypatch, PUPA_CONNECTIVITY="cloudflared")
 
     assert captured.get("host") == "127.0.0.1"
 
@@ -309,8 +289,9 @@ def test_auth_disabled_on_a_reachable_bind_refuses_to_start(monkeypatch) -> None
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: called.append(kw))
     monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
     for var in ("PUPA_HOST", "PUPA_CONNECTIVITY", "PUPA_TLS_CERT", "PUPA_TLS_KEY",
-                "PUPA_TRUSTED_PROXY", "PUPA_ALLOW_INSECURE_BIND"):
+                "PUPA_ALLOW_INSECURE_BIND"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "")
     monkeypatch.setenv("PUPA_AUTH_DISABLED", "1")
 
     with pytest.raises(SystemExit) as excinfo:
@@ -340,3 +321,77 @@ def test_a_reachable_bind_with_auth_on_is_untouched(monkeypatch) -> None:
     LAN and cloud deployment runs."""
     captured = _run_main(monkeypatch)
     assert captured.get("host") == "0.0.0.0"
+
+
+def test_auth_disabled_behind_a_tunnel_refuses_to_start(monkeypatch) -> None:
+    """The bind alone is the wrong question. Under a tunnel the socket is on
+    loopback *because* cloudflared is publishing it — as a public
+    `trycloudflare.com` URL, which is strictly more exposed than `0.0.0.0`, not
+    less. Keying only on the bind address would have exempted the one case
+    that hands a wide-open agent loop to the internet."""
+    import uvicorn
+
+    from pupa_backend import app as app_module
+
+    called: list = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: called.append(kw))
+    monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
+    for var in ("PUPA_HOST", "PUPA_TLS_CERT", "PUPA_TLS_KEY",
+                "PUPA_ALLOW_INSECURE_BIND"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "")
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "cloudflared")
+    monkeypatch.setenv("PUPA_AUTH_DISABLED", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_module.main()
+
+    assert "cloudflared" in str(excinfo.value)
+    assert not called, "the server started anyway"
+
+
+def test_a_tailscale_serve_registration_is_torn_down_on_refusal(monkeypatch) -> None:
+    """Refusing after `tailscale serve --bg` is registered would otherwise
+    leave the tailnet forwarding to a port nothing listens on."""
+    import uvicorn
+
+    from pupa_backend import app as app_module
+    from pupa_backend import tailscale_proxy
+
+    stopped: list = []
+
+    class _Serve:
+        mode = "https"
+        terminates_tls = True
+
+        def stop(self) -> None:
+            stopped.append(True)
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(tailscale_proxy, "start_serve_proxy", lambda port: _Serve())
+    for var in ("PUPA_HOST", "PUPA_TLS_CERT", "PUPA_TLS_KEY",
+                "PUPA_ALLOW_INSECURE_BIND"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "")
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "tailscale")
+    monkeypatch.setenv("PUPA_AUTH_DISABLED", "1")
+
+    with pytest.raises(SystemExit):
+        app_module.main()
+
+    assert stopped, "tailscale serve was left registered against a dead port"
+
+
+def test_the_loopback_check_covers_the_whole_127_range(monkeypatch) -> None:
+    """`127.0.0.2` and `::1` are as local as `127.0.0.1`; refusing them would
+    be a confusing failure for a dev loop that is in fact same-machine."""
+    from pupa_backend.app import _is_loopback
+
+    assert _is_loopback("127.0.0.1")
+    assert _is_loopback("127.0.0.2")
+    assert _is_loopback("::1")
+    assert _is_loopback("localhost")
+    assert not _is_loopback("0.0.0.0")
+    assert not _is_loopback("192.168.1.5")
+    # A hostname we can't cheaply resolve fails closed — treated as reachable.
+    assert not _is_loopback("my-laptop.local")

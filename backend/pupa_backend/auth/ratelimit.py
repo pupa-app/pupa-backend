@@ -105,10 +105,16 @@ class SlidingWindowLimiter:
         self._hits[key] = live
         self._hits.move_to_end(key)
         # Position is recency, so the ceiling drops the bucket charged longest
-        # ago — never a guesser that is still spending. Clearing the map (or
-        # evicting by first sight) would forgive one of those, and a flood
-        # spread over enough addresses could then keep the limiter switched off
-        # for everyone simply by continuing to run.
+        # ago. Clearing the map (or evicting by first sight) would instead
+        # forgive a caller *still being charged*, and a flood spread over
+        # enough addresses could then keep the limiter switched off for
+        # everyone simply by continuing to run.
+        #
+        # Not a guarantee that a throttled bucket survives: once it is at limit
+        # the middleware answers 429 without charging, so its recency freezes
+        # and enough distinct keys will eventually evict it. That costs an
+        # attacker MAX_TRACKED_KEYS distinct bucket keys inside one window —
+        # ~10k source addresses, which is already 50k free guesses a minute.
         while len(self._hits) > MAX_TRACKED_KEYS:
             self._hits.popitem(last=False)
         return stamp

@@ -213,16 +213,29 @@ def test_a_forged_proto_cannot_pass_the_middleware(
     assert resp.status_code == 403
 
 
-def test_tailscale_and_cloudflared_are_trusted_without_asking(
+def test_cloudflared_is_trusted_without_asking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """This process starts those proxies itself, so it knows one is in front —
-    operators shouldn't have to set a second flag to keep working deployments
+    """A Cloudflare tunnel is always an HTTP proxy, so the mode alone settles
+    it — operators shouldn't need a second flag to keep a working deployment
     working."""
     monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
-    for mode in ("tailscale", "cloudflared"):
-        monkeypatch.setenv("PUPA_CONNECTIVITY", mode)
-        assert is_secure_request(_Req("http", "https")), mode
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "cloudflared")
+    assert is_secure_request(_Req("http", "https"))
+
+
+def test_tailscale_alone_is_not_enough_to_trust_forwarded_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`connectivity: tailscale` says nothing about whether a proxy that
+    *writes* those headers came up: serve has a raw-TCP mode that passes the
+    client's request through byte-for-byte, and the CLI may be missing
+    entirely. `app.main()` resolves it from what actually started and records
+    the answer; this fallback — a process that never ran `main()` — must not
+    guess in the direction that voids the HTTPS check."""
+    monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "tailscale")
+    assert not is_secure_request(_Req("http", "https"))
 
 
 def test_an_explicit_flag_overrides_the_inference(

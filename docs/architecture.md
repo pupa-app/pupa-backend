@@ -93,16 +93,18 @@ Knobs: `PUPA_SSE_REPLAY_TTL` (default 6h; `<= 0` disables),
 
 **Middleware order is load-bearing**, and reads bottom-up in
 [`app.py`](../backend/pupa_backend/app.py) because `add_middleware` prepends.
-Outermost to innermost: security-headers → rate-limit → require-https →
+Outermost to innermost: security-headers → require-https → rate-limit →
 api-key → run-scope → keep-alive → replay → handler.
 
 Why that order, at each step:
 - **security-headers** outermost so the guards' own 403/429 responses carry
   the headers too — those never reach the inner stack.
+- **require-https** outside the limiter: a plaintext hop is a
+  misconfiguration, not a guess at a credential, so refusing it there is what
+  stops it spending a real device's pairing budget. The limiter then needs to
+  know nothing about transport.
 - **rate-limit** before auth: it protects `/auth/pair`, which is *pre*-auth, so
   it has to apply regardless of the auth outcome.
-- **require-https** outside auth: a plaintext request is refused before its
-  bearer token is read at all.
 - **run-scope** inside api-key: it reads the `request.state.auth` identity that
   api-key resolves.
 - **replay** innermost so heartbeat comments stay out of the replay log, while
@@ -658,8 +660,11 @@ depend on a harness.
   `PUPA_API_KEY` or a paired-device bearer token resolved via
   `DeviceStore.resolve`. `PUPA_AUTH_DISABLED=1` short-circuits the
   middleware — dev loops only, and `main()` enforces that: it **refuses to
-  start** when the switch is set and the listener isn't on loopback, since a
-  warning about a wide-open agent loop scrolls past in a platform log.
+  start** when the switch is set and the listener is reachable from off the
+  machine, since a warning about a wide-open agent loop scrolls past in a
+  platform log. Reachable means bound off-loopback *or* fronted by a tunnel —
+  under `connectivity: cloudflared` the socket is on loopback and the URL is
+  public, so the bind address alone would exempt the most exposed case.
   `PUPA_ALLOW_INSECURE_BIND=1` overrides it — a second, differently-named
   variable, so pasting the first into a launch script can't reach it.
 - **Per-route authorization** —
