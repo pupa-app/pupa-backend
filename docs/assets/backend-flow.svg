@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     viewBox="0 0 720 322" width="720" height="322" role="img"
+     aria-label="Three ways the Pupa app reaches a pupa-backend you run: localhost on the same machine, a Cloudflare tunnel, or Tailscale.">
+  <title>How the Pupa app reaches your backend</title>
+  <style>
+    :root, svg {
+      --text: #24292f; --dim: #57606a; --faint: #8c959f;
+      --border: #d0d7de; --elev: #f6f8fa; --accent: #d4231b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root, svg {
+        --text: #e6edf3; --dim: #9198a1; --faint: #6e7681;
+        --border: #3d444d; --elev: #161b22; --accent: #f5453e;
+      }
+    }
+    .frame  { fill: none; stroke: var(--border); stroke-width: 2; }
+    .screen { fill: none; stroke: var(--border); stroke-width: 1.5; opacity: .6; }
+    .notch  { fill: var(--faint); }
+    .base   { fill: var(--elev); stroke: var(--border); stroke-width: 2; stroke-linejoin: round; }
+    .node   { fill: var(--elev); stroke: var(--border); stroke-width: 1.75; }
+    .pupa   { fill: var(--accent); }
+    .burst  { stroke: var(--accent); stroke-width: 2.2; stroke-linecap: round; }
+    .node-label { fill: var(--text); font: 600 13px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .label  { fill: var(--dim); font: 500 12px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .caption { fill: var(--dim); font: 400 13px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; opacity: 0; }
+    .caption tspan.k { fill: var(--text); font-weight: 600; }
+    .wire   { fill: none; stroke: var(--faint); stroke-width: 2; opacity: .4; }
+    .packet { fill: var(--accent); opacity: 0; }
+
+    /* One 12s cycle, 4s per channel: localhost, then Cloudflare, then Tailscale. */
+    .wire.localhost   { animation: wire-a 12s linear infinite; }
+    .wire.cloudflare  { animation: wire-b 12s linear infinite; }
+    .wire.tailscale   { animation: wire-c 12s linear infinite; }
+    .label.localhost  { animation: lit-a 12s linear infinite; }
+    .label.cloudflare { animation: lit-b 12s linear infinite; }
+    .label.tailscale  { animation: lit-c 12s linear infinite; }
+    .caption.localhost  { animation: cap-a 12s linear infinite; }
+    .caption.cloudflare { animation: cap-b 12s linear infinite; }
+    .caption.tailscale  { animation: cap-c 12s linear infinite; }
+    .packet.localhost  { animation: dot-a 12s linear infinite; }
+    .packet.cloudflare { animation: dot-b 12s linear infinite; }
+    .packet.tailscale  { animation: dot-c 12s linear infinite; }
+    .node.app     { animation: node-a 12s linear infinite; }
+    .node.backend { animation: node-bc 12s linear infinite; }
+
+    @keyframes wire-a {
+      0%, 30% { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
+      34%, 100% { stroke: var(--faint); stroke-width: 2; opacity: .4; }
+    }
+    @keyframes wire-b {
+      0%, 30% { stroke: var(--faint); stroke-width: 2; opacity: .4; }
+      34%, 63% { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
+      67%, 100% { stroke: var(--faint); stroke-width: 2; opacity: .4; }
+    }
+    @keyframes wire-c {
+      0%, 63% { stroke: var(--faint); stroke-width: 2; opacity: .4; }
+      67%, 96% { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
+      100% { stroke: var(--faint); stroke-width: 2; opacity: .4; }
+    }
+    @keyframes lit-a { 0%, 30% { fill: var(--accent); opacity: 1; } 34%, 100% { fill: var(--dim); opacity: .55; } }
+    @keyframes lit-b { 0%, 30% { fill: var(--dim); opacity: .55; } 34%, 63% { fill: var(--accent); opacity: 1; } 67%, 100% { fill: var(--dim); opacity: .55; } }
+    @keyframes lit-c { 0%, 63% { fill: var(--dim); opacity: .55; } 67%, 96% { fill: var(--accent); opacity: 1; } 100% { fill: var(--dim); opacity: .55; } }
+    @keyframes dot-a { 0%, 30% { opacity: 1; } 32%, 100% { opacity: 0; } }
+    @keyframes dot-b { 0%, 32% { opacity: 0; } 34%, 63% { opacity: 1; } 65%, 100% { opacity: 0; } }
+    @keyframes dot-c { 0%, 65% { opacity: 0; } 67%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+    @keyframes cap-a { 0%, 30% { opacity: 1; } 33%, 100% { opacity: 0; } }
+    @keyframes cap-b { 0%, 32% { opacity: 0; } 34%, 63% { opacity: 1; } 66%, 100% { opacity: 0; } }
+    @keyframes cap-c { 0%, 65% { opacity: 0; } 67%, 96% { opacity: 1; } 99%, 100% { opacity: 0; } }
+    @keyframes node-a  { 0%, 30% { stroke: var(--accent); } 34%, 100% { stroke: var(--border); } }
+    @keyframes node-bc { 0%, 30% { stroke: var(--border); } 34%, 96% { stroke: var(--accent); } 100% { stroke: var(--border); } }
+
+    @media (prefers-reduced-motion: reduce) {
+      .wire, .label, .caption, .packet, .node { animation: none; }
+      .caption.cloudflare { opacity: 1; }
+      .wire.cloudflare { stroke: var(--accent); stroke-width: 2.5; opacity: 1; }
+    }
+  </style>
+
+  <!-- Caption text is opacity-animated per channel; each shares the same slot. -->
+  <defs>
+    <g id="pupa-glyph">
+      <rect x="-8" y="-15" width="16" height="6.5" rx="3.2"/>
+      <rect x="-9" y="-6.5" width="18" height="5.5" rx="2.7"/>
+      <rect x="-7" y="1" width="14" height="5.5" rx="2.7"/>
+      <rect x="-5" y="8.5" width="10" height="5.5" rx="2.7"/>
+    </g>
+  </defs>
+
+  <!-- Phone -->
+  <rect class="frame" x="44" y="58" width="104" height="184" rx="20"/>
+  <rect class="screen" x="54" y="74" width="84" height="152" rx="10"/>
+  <rect class="notch" x="86" y="65" width="20" height="5" rx="2.5"/>
+  <g class="pupa" transform="translate(96,150) scale(1.15)"><use xlink:href="#pupa-glyph" href="#pupa-glyph"/></g>
+  <text class="label" x="96" y="262" text-anchor="middle" style="animation:none;opacity:1">Pupa app</text>
+
+  <!-- Laptop shell -->
+  <path class="base" d="M300 228 H720 L732 246 Q733 250 728 250 H292 Q287 250 288 246 Z"/>
+  <rect class="frame" x="330" y="44" width="362" height="184" rx="14"/>
+
+  <!-- Wires (under the node boxes so their ends tuck beneath the borders) -->
+  <path id="w-cloudflare" class="wire cloudflare" d="M150 116 C 240 116 300 90 356 92"/>
+  <path id="w-tailscale" class="wire tailscale" d="M150 170 C 250 170 300 112 356 110"/>
+  <path id="w-localhost" class="wire localhost" d="M470 126 C 470 142 520 138 552 150"/>
+
+  <!-- pupa-backend -->
+  <rect class="node backend" x="356" y="74" width="236" height="52" rx="13"/>
+  <text class="node-label" x="384" y="105">pupa-backend</text>
+  <g class="burst" transform="translate(566,100)">
+    <line x1="0" y1="-10" x2="0" y2="10"/>
+    <line x1="-10" y1="0" x2="10" y2="0"/>
+    <line x1="-7" y1="-7" x2="7" y2="7"/>
+    <line x1="-7" y1="7" x2="7" y2="-7"/>
+  </g>
+
+  <!-- A second Pupa app on the same machine (the localhost channel) -->
+  <rect class="node app" x="520" y="150" width="64" height="58" rx="12"/>
+  <g class="pupa" transform="translate(552,179) scale(0.92)"><use xlink:href="#pupa-glyph" href="#pupa-glyph"/></g>
+
+  <!-- Channel labels -->
+  <text class="label cloudflare" x="248" y="84" text-anchor="middle">Cloudflare</text>
+  <text class="label tailscale" x="262" y="172" text-anchor="middle">Tailscale</text>
+  <text class="label localhost" x="452" y="156" text-anchor="middle">Localhost</text>
+
+  <!-- Travelling packets -->
+  <circle class="packet cloudflare" r="4.5">
+    <animateMotion dur="1.6s" repeatCount="indefinite"><mpath xlink:href="#w-cloudflare" href="#w-cloudflare"/></animateMotion>
+  </circle>
+  <circle class="packet tailscale" r="4.5">
+    <animateMotion dur="1.6s" repeatCount="indefinite"><mpath xlink:href="#w-tailscale" href="#w-tailscale"/></animateMotion>
+  </circle>
+  <circle class="packet localhost" r="4.5">
+    <animateMotion dur="1.6s" repeatCount="indefinite"><mpath xlink:href="#w-localhost" href="#w-localhost"/></animateMotion>
+  </circle>
+
+  <!-- Captions (one slot, one visible at a time) -->
+  <text class="caption localhost" x="360" y="298" text-anchor="middle"><tspan class="k">Localhost</tspan> — app and backend on the same machine. Nothing leaves your computer.</text>
+  <text class="caption cloudflare" x="360" y="298" text-anchor="middle"><tspan class="k">Cloudflare tunnel</tspan> — an HTTPS address for your backend, reachable anywhere. No ports opened.</text>
+  <text class="caption tailscale" x="360" y="298" text-anchor="middle"><tspan class="k">Tailscale</tspan> — a private network across your own devices. Traffic stays off the public internet.</text>
+</svg>
