@@ -27,6 +27,9 @@ from pupa_backend.auth.ratelimit import (
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
     monkeypatch.delenv("PUPA_RATE_LIMIT_DISABLED", raising=False)
+    # These cases exercise the proxied deployments, where something in front
+    # writes X-Forwarded-For. The direct-bind case is covered separately below.
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
     reset_devices(tmp_path / "devices.json")
     reset_pairing()
     reset_limiter()
@@ -90,7 +93,18 @@ class _Req:
         self.headers = {"x-forwarded-for": xff} if xff else {}
 
 
-def test_client_key_prefers_the_forwarded_client() -> None:
+@pytest.fixture
+def trusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
+
+
+@pytest.fixture
+def untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
+    monkeypatch.delenv("PUPA_CONNECTIVITY", raising=False)
+
+
+def test_client_key_prefers_the_forwarded_client(trusted: None) -> None:
     """Every transport mode (Tailscale serve, Cloudflare tunnel, Railway)
     terminates in front of a loopback-bound listener, so `client.host` is
     127.0.0.1 for *every* remote caller. Bucketing on it would put the whole
@@ -98,17 +112,17 @@ def test_client_key_prefers_the_forwarded_client() -> None:
     assert client_key(_Req("127.0.0.1", "203.0.113.7")) == "203.0.113.7"
 
 
-def test_client_key_takes_the_rightmost_forwarded_entry() -> None:
+def test_client_key_takes_the_rightmost_forwarded_entry(trusted: None) -> None:
     """A caller can forge `X-Forwarded-For`; the trusted proxy *appends* what
     it actually saw. The rightmost entry is the only one it wrote."""
     assert client_key(_Req("127.0.0.1", "1.1.1.1, 2.2.2.2, 203.0.113.7")) == "203.0.113.7"
 
 
-def test_client_key_falls_back_to_the_peer_without_a_proxy() -> None:
+def test_client_key_falls_back_to_the_peer_without_a_proxy(trusted: None) -> None:
     assert client_key(_Req("198.51.100.4")) == "198.51.100.4"
 
 
-def test_client_key_survives_a_missing_peer() -> None:
+def test_client_key_survives_a_missing_peer(trusted: None) -> None:
     assert client_key(_Req(None)) == "unknown"
 
 
@@ -212,6 +226,36 @@ def test_a_rejected_device_token_is_throttled(
     assert codes[-1] == 429
 
 
+def test_a_forged_header_cannot_buy_new_buckets(untrusted: None) -> None:
+    """The bypass this trust check exists to close. On a direct bind — the
+    LAN/offline default, `0.0.0.0`, nothing in front — `X-Forwarded-For` is
+    just a string the caller chose. Believing it would let one host rotate it
+    per request for an unlimited supply of buckets, i.e. no limit at all."""
+    a = client_key(_Req("198.51.100.4", "203.0.113.1"))
+    b = client_key(_Req("198.51.100.4", "203.0.113.2"))
+    assert a == b == "198.51.100.4"
+
+
+def test_forged_headers_do_not_escape_the_limit(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: same socket, a fresh forged address every request, and the
+    limit still bites once the trust flag is off."""
+    monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
+    monkeypatch.delenv("PUPA_CONNECTIVITY", raising=False)
+    client = TestClient(app)
+    codes = [
+        _bad_code(client, xff=f"203.0.113.{i}").status_code
+        for i in range(PAIR_EXCHANGE_LIMIT + 3)
+    ]
+    assert 429 in codes, "rotating a forged X-Forwarded-For bypassed the limit"
+
+
+def test_key_length_is_capped(trusted: None) -> None:
+    """The key is attacker-supplied when forwarded headers are trusted."""
+    assert len(client_key(_Req("127.0.0.1", "x" * 5000))) <= 64
+
+
 def test_throttling_is_per_client(app: FastAPI) -> None:
     client = TestClient(app)
     for _ in range(PAIR_EXCHANGE_LIMIT):
@@ -265,3 +309,39 @@ def test_unrelated_routes_are_not_throttled(app: FastAPI) -> None:
     client = TestClient(app)
     for _ in range(PAIR_EXCHANGE_LIMIT + 5):
         assert client.get("/auth/config").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Bucket map stays bounded
+# ---------------------------------------------------------------------------
+
+
+def test_asking_about_an_unknown_key_does_not_create_a_bucket() -> None:
+    """`under_limit` runs on every request, including ones never charged. If
+    the question allocated, a flood of successes would grow the map at request
+    rate."""
+    limiter = SlidingWindowLimiter(now=lambda: 0.0)
+    for i in range(1000):
+        limiter.under_limit(f"client-{i}", limit=5)
+    assert limiter.tracked_keys() == 0
+
+
+def test_expired_buckets_are_dropped_not_retained_empty() -> None:
+    now = [0.0]
+    limiter = SlidingWindowLimiter(now=lambda: now[0])
+    for i in range(500):
+        limiter.record(f"client-{i}")
+    assert limiter.tracked_keys() == 500
+    now[0] = 61.0
+    for i in range(500):
+        limiter.under_limit(f"client-{i}", limit=5)
+    assert limiter.tracked_keys() == 0, "empty buckets retained after the window"
+
+
+def test_the_map_cannot_grow_without_bound() -> None:
+    from pupa_backend.auth.ratelimit import MAX_TRACKED_KEYS
+
+    limiter = SlidingWindowLimiter(now=lambda: 0.0)
+    for i in range(MAX_TRACKED_KEYS + 500):
+        limiter.record(f"client-{i}")
+    assert limiter.tracked_keys() <= MAX_TRACKED_KEYS

@@ -29,9 +29,15 @@ bumps (`0.0.X` → `0.0.X+1`).
   with the operator key, is never throttled, so the limit falls on guessing
   rather than on using the thing. There's no shared cap either: one that
   everybody drew from could be drained by a stranger to lock out people
-  holding real credentials. Bucketing reads `X-Forwarded-For`: every tunnel
-  mode terminates in front of a loopback listener, so the peer address is
-  `127.0.0.1` for everyone.
+  holding real credentials. Bucketing reads `X-Forwarded-For` only where a
+  proxy is trusted — every tunnel mode terminates in front of a loopback
+  listener, so the peer address is `127.0.0.1` for everyone there, while on a
+  direct bind that header is written by the caller and believing it would hand
+  out an unlimited supply of buckets.
+- **New `PUPA_TRUSTED_PROXY`.** Says whether `X-Forwarded-*` can be believed
+  on this deployment. Inferred for the Tailscale and Cloudflare modes and
+  pinned on in the cloud image, so working setups stay working; off everywhere
+  else, because that's the answer that can't be turned against you.
 - **New `PUPA_REQUIRE_HTTPS` refuses plaintext.** Off by default so LAN and
   offline installs keep working; **set it on anything reachable from the
   internet**, where it's the difference between handing the device token to the

@@ -37,7 +37,7 @@ needs a shared backing store.
 
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 from fastapi import Request
@@ -45,6 +45,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from .devices import truthy
+from .proxy import forwarded_values, trust_forwarded_headers
 
 # FAILED attempts per client per minute — successful requests are free.
 # `/auth/pair` is the public one and a human types one code once, so a
@@ -53,6 +54,13 @@ PAIR_EXCHANGE_LIMIT = 5
 # Wrong `PUPA_API_KEY` (401) or a device token trying to mint (403).
 PAIR_BEGIN_LIMIT = 10
 WINDOW_SECONDS = 60.0
+# A bucket key is attacker-influenced (it can be a forwarded address), and
+# `under_limit` is asked on every request including the ones never charged. So
+# the map is bounded on both axes: keys are truncated, empty buckets are
+# dropped as soon as they age out, and the whole map is cleared if it somehow
+# still grows past a ceiling no legitimate deployment approaches.
+MAX_KEY_CHARS = 64
+MAX_TRACKED_KEYS = 10_000
 # Response codes that mean "this caller did not present a valid credential".
 # 422 is deliberately absent: a malformed body is a client bug, not a guess at
 # a secret, and charging it would let a buggy client lock itself out.
@@ -69,24 +77,41 @@ class SlidingWindowLimiter:
     """
 
     def __init__(self, now: Callable[[], float] = time.monotonic) -> None:
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._hits: dict[str, deque[float]] = {}
         self._now = now
 
-    def _prune(self, key: str, window: float) -> deque[float]:
-        hits = self._hits[key]
+    def _live_hits(self, key: str, window: float) -> deque[float]:
+        """Hits still inside the window. Read-only: never creates a bucket, so
+        asking about an unknown key costs nothing and leaks nothing."""
+        hits = self._hits.get(key)
+        if hits is None:
+            return deque()
         cutoff = self._now() - window
         while hits and hits[0] <= cutoff:
             hits.popleft()
+        if not hits:
+            # Drop it now rather than retaining an empty deque per address
+            # ever seen — that map is keyed on attacker-supplied values.
+            del self._hits[key]
         return hits
 
     def under_limit(self, key: str, limit: int, window: float = WINDOW_SECONDS) -> bool:
         """Whether this key still has budget. A question, not a debit — the
         middleware asks it on every request but only charges the failures."""
-        return len(self._prune(key, window)) < limit
+        return len(self._live_hits(key, window)) < limit
 
     def record(self, key: str, window: float = WINDOW_SECONDS) -> None:
         """Charge one failure against this key."""
-        self._prune(key, window).append(self._now())
+        live = self._live_hits(key, window)
+        if len(self._hits) >= MAX_TRACKED_KEYS and key not in self._hits:
+            # Only reachable under a distributed flood of *failures*. Dropping
+            # the map forgives outstanding budget, which is the safe direction:
+            # over-forgiving throttles nobody, while growing without bound
+            # takes the process down.
+            self._hits.clear()
+            live = deque()
+        live.append(self._now())
+        self._hits[key] = live
 
     def retry_after(self, key: str, window: float = WINDOW_SECONDS) -> int:
         """Whole seconds until the oldest hit in this key's window ages out."""
@@ -94,6 +119,10 @@ class SlidingWindowLimiter:
         if not hits:
             return 1
         return max(1, int(hits[0] + window - self._now()) + 1)
+
+    def tracked_keys(self) -> int:
+        """For tests — how many buckets are being retained."""
+        return len(self._hits)
 
     def clear(self) -> None:
         self._hits.clear()
@@ -120,19 +149,26 @@ def client_key(request: Request) -> str:
     bucketing on it would throttle every user as one. `X-Forwarded-For` is
     what distinguishes them.
 
-    A caller can forge that header, but the trusted proxy **appends** the
-    address it actually saw, so the **rightmost** entry is the only one the
-    proxy wrote — read that, not the leftmost. With no proxy in front (bound
-    to a real interface), there's no header and the peer address is honest.
+    The header is only read when `trust_forwarded_headers()` says something in
+    front actually writes it (see `proxy.py`). Otherwise it is a client-supplied
+    string and believing it would let one host rotate the header per request to
+    get an unlimited number of buckets — no limit at all.
+
+    When trusted, the **rightmost** entry wins: a caller can forge the header,
+    but the proxy *appends* the address it actually saw, so that entry is the
+    only one it wrote. This assumes a single appending hop; behind a chain of
+    two or more, the rightmost is the previous proxy and callers collapse into
+    one bucket. Safe direction — failures are all that's ever charged — but it
+    means a multi-hop deployment wants `PUPA_TRUSTED_PROXY` weighed
+    deliberately.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
-        if parts:
-            return parts[-1]
+    if trust_forwarded_headers():
+        hops = forwarded_values(request.headers, "x-forwarded-for")
+        if hops:
+            return hops[-1][:MAX_KEY_CHARS]
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client else None
-    return host or "unknown"
+    return (host or "unknown")[:MAX_KEY_CHARS]
 
 
 def _limit_for(path: str) -> int | None:
@@ -182,6 +218,11 @@ async def rate_limit_middleware(
         return _too_many(limiter.retry_after(key))
 
     response = await call_next(request)
-    if response.status_code in FAILURE_STATUSES:
+    # `require_https_middleware` sits inside this one and also answers 403.
+    # That's a transport misconfiguration, not a guess at a credential — don't
+    # spend a legitimate device's budget on it.
+    if response.status_code in FAILURE_STATUSES and not getattr(
+        request.state, "transport_refused", False
+    ):
         limiter.record(key)
     return response

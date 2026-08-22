@@ -95,6 +95,11 @@ persistence:
 # it unset — that's why it's a flag and not the default.
 transport:
   require_https: true
+  # Railway terminates TLS at its edge and forwards over a loopback hop, so
+  # `X-Forwarded-For` / `-Proto` are written by the platform, not the caller.
+  # Without this the backend would fall back to the peer address — 127.0.0.1
+  # for every remote client — and bucket the whole internet together.
+  trusted_proxy: true
 
 # Tracing is opt-out: on automatically once LANGFUSE_PUBLIC_KEY +
 # LANGFUSE_SECRET_KEY are supplied as Railway env vars; without them the

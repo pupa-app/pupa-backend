@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from .devices import truthy
+from .proxy import forwarded_values, trust_forwarded_headers
 
 
 def require_https_enabled() -> bool:
@@ -36,7 +37,10 @@ def is_secure_request(request: Request) -> bool:
       evidence of the real hop.
 
     Rightmost entry wins: a caller can forge the header, but the trusted proxy
-    appends what it actually saw.
+    appends what it actually saw — and the header is only consulted at all
+    when `trust_forwarded_headers()` says a proxy is in front. Without that
+    check a client could assert its own plaintext hop was TLS and walk
+    straight through `PUPA_REQUIRE_HTTPS`.
 
     Note what is *not* here: any check on the peer address. Because those
     proxies all connect over loopback, "it came from 127.0.0.1" is true of
@@ -44,11 +48,10 @@ def is_secure_request(request: Request) -> bool:
     """
     if request.url.scheme in ("https", "wss"):
         return True
-    forwarded = request.headers.get("x-forwarded-proto")
-    if forwarded:
-        parts = [p.strip().lower() for p in forwarded.split(",") if p.strip()]
-        if parts:
-            return parts[-1] in ("https", "wss")
+    if trust_forwarded_headers():
+        hops = forwarded_values(request.headers, "x-forwarded-proto")
+        if hops:
+            return hops[-1].lower() in ("https", "wss")
     return False
 
 
@@ -67,6 +70,10 @@ async def require_https_middleware(
         return await call_next(request)
     if _is_health(request.url.path) or is_secure_request(request):
         return await call_next(request)
+    # Read by `rate_limit_middleware`, which wraps this one: a plaintext hop
+    # is a misconfiguration, not a guess at a credential, so it must not spend
+    # a legitimate device's pairing budget.
+    request.state.transport_refused = True
     return JSONResponse(
         status_code=403,
         content={

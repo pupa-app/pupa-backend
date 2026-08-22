@@ -24,6 +24,8 @@ _YAML_TO_ENV: dict[str, str] = {
     "persistence.require_db_scheme": "PUPA_REQUIRE_DB_SCHEME",
     # bool: `transport.require_https: true` → "1". Refuse plaintext requests.
     "transport.require_https": "PUPA_REQUIRE_HTTPS",
+    # bool: `transport.trusted_proxy: true` → "1". Believe `X-Forwarded-*`.
+    "transport.trusted_proxy": "PUPA_TRUSTED_PROXY",
     "tls.cert":              "PUPA_TLS_CERT",
     "tls.key":               "PUPA_TLS_KEY",
     "tls.hostname":          "PUPA_HOSTNAME",

@@ -91,24 +91,67 @@ def _shell_env_exclude() -> frozenset[str]:
 # backend's environment to a subprocess the *model* drives, so the default has
 # to be "don't", not "whatever the operator remembered to list". Matched
 # case-sensitively against the whole name; `SHELL_ENV_ALLOW` puts one back.
+# Matched case-insensitively against the whole name. Substring globs, not
+# suffix ones: `PGPASSWORD` has no underscore, so `*_PASSWORD` misses it.
 _SECRET_NAME_GLOBS: tuple[str, ...] = (
-    "*_API_KEY",
-    "*_APIKEY",
-    "*_TOKEN",
-    "*_SECRET",
-    "*_SECRET_*",
-    "*SECRET_KEY",
-    "*_PASSWORD",
-    "*_PRIVATE_KEY",
-    "*_CREDENTIALS",
+    "*KEY",           # *_API_KEY, SECRET_KEY, bare OPENAI_KEY / SUPABASE_KEY
+    "*APIKEY*",
+    "*TOKEN*",
+    "*SECRET*",
+    "*PASSWORD*",
+    "*PASSWD*",
+    "*_PWD",          # MYSQL_PWD
+    "*CREDENTIAL*",
+    "*_AUTH",
+    "*_DSN",          # SENTRY_DSN embeds the project key
     "AWS_*",
+    "AZURE_*",
+    "GOOGLE_*",
+    "GCP_*",
+    # Connection strings carry inline credentials. Narrow to the schemes that
+    # actually do, rather than every *_URL — LANGFUSE_BASE_URL and friends are
+    # addresses, not secrets, and over-blocking sends people to SHELL_ENV_ALLOW
+    # for no benefit.
     "DATABASE_URL",
+    "*POSTGRES*_URL",
+    "*POSTGRESQL*_URL",
+    "*MYSQL*_URL",
+    "*REDIS*_URL",
+    "*MONGO*_URI",
+    "*AMQP*_URL",
+    "*_CONNECTION_STRING",
 )
+
+# Names that are neither secret-shaped nor secrets, but hand the subprocess
+# the *use* of one.
+_SECRET_NAME_EXACT: frozenset[str] = frozenset({
+    # A live agent socket: not a secret string, but signing with the
+    # operator's SSH keys is one `ssh` away.
+    "SSH_AUTH_SOCK",
+    # Cluster credentials, or a path to them.
+    "KUBECONFIG",
+    # Registry auth blob.
+    "DOCKER_AUTH_CONFIG",
+    # Path to a service-account JSON key.
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "PGPASSFILE",
+    "NETRC",
+})
 
 
 def is_secret_env_name(name: str) -> bool:
-    """Whether an env var name looks like a credential."""
-    return any(fnmatch(name, glob) for glob in _SECRET_NAME_GLOBS)
+    """Whether an env var name looks like a credential, or grants use of one.
+
+    Note the limit of this whole approach: `HOME` is deliberately forwarded so
+    startup scripts work, which leaves `~/.aws/credentials`, `~/.ssh/id_rsa`
+    and `~/.netrc` one `cat` away. This closes the environment channel, not
+    the filesystem one — `SHELL_TOOL_WORKSPACE` and not enabling the shell
+    tool on a host that holds credentials are what cover that.
+    """
+    upper = name.upper()
+    if upper in _SECRET_NAME_EXACT:
+        return True
+    return any(fnmatch(upper, glob) for glob in _SECRET_NAME_GLOBS)
 
 
 def _shell_env_allow() -> frozenset[str]:

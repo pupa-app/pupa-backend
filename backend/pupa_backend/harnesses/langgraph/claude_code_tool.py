@@ -101,11 +101,18 @@ def _build_env() -> dict[str, str]:
     if os.getenv("CLAUDE_CODE_PASS_ENV"):
         from pupa_backend.harnesses.langgraph.backend_tools import shell_env_excluded
 
-        extra = set() if allow_api else set(_CLAUDE_CRED_VARS)
-        return {
-            k: v for k, v in os.environ.items()
-            if k not in extra and not shell_env_excluded(k)
-        }
+        creds = set(_CLAUDE_CRED_VARS)
+
+        def _forward(name: str) -> bool:
+            # The credential vars are the point of `allow_api` — decide them
+            # first, or the generic secret denylist would drop the very keys
+            # the opt-in exists to pass through and the sub-agent would get
+            # ANTHROPIC_BASE_URL with nothing to authenticate with.
+            if name in creds:
+                return allow_api
+            return not shell_env_excluded(name)
+
+        return {k: v for k, v in os.environ.items() if _forward(k)}
 
     # USER/LOGNAME are required for macOS Keychain to resolve the login keychain
     # where the CLI's OAuth login (subscription auth) is stored — without them a

@@ -687,13 +687,26 @@ depend on a harness.
   shared bucket that blocks is a denial of service with extra steps, since a
   stranger could drain it and lock out everyone holding a real credential.
   Keyed on the **rightmost**
-  `X-Forwarded-For` entry, not `request.client.host`: every transport mode
-  terminates TLS in front of a loopback-bound listener, so the peer address is
-  `127.0.0.1` for all remote callers and would bucket the internet as one.
+  `X-Forwarded-For` entry *when a proxy is trusted*, else on
+  `request.client.host`. Both halves matter: the proxied modes terminate in
+  front of a loopback listener, so the peer address is `127.0.0.1` for every
+  remote caller and would bucket the internet as one — but on a direct bind
+  the header is written by the caller, so believing it would let one host
+  rotate it per request for unlimited buckets.
   `PUPA_RATE_LIMIT_DISABLED=1` opts out for local loops. `POST /` is
   deliberately *not* throttled — a dropped SSE socket re-attaches there, so a
   per-IP cap would break the flaky-network case `SSEReplayMiddleware` exists
   for.
+- **Proxy trust** —
+  [`proxy.py`](../backend/pupa_backend/auth/proxy.py) answers "should
+  `X-Forwarded-*` be believed here", which every forwarded-header read depends
+  on. `PUPA_TRUSTED_PROXY` (config `transport.trusted_proxy`) is explicit and
+  wins; otherwise it's inferred true for `connectivity: tailscale` /
+  `cloudflared`, since the backend starts those proxies itself; otherwise
+  **false**. Pinned true in the cloud image for Railway. Wrong in the safe
+  direction (real proxy, flag unset) collapses callers into one bucket; wrong
+  the other way voids the rate limits and the HTTPS check, which is why the
+  default is off.
 - **Transport** —
   [`transport.py`](../backend/pupa_backend/auth/transport.py) implements
   `PUPA_REQUIRE_HTTPS` (config `transport.require_https`), unset by default so

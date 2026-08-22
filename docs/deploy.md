@@ -152,6 +152,15 @@ reachable deploy opts into strictness:
 | Own cert | the backend (`PUPA_TLS_CERT` / `PUPA_TLS_KEY`) | **1** |
 | LAN / offline self-host | nothing | unset — plaintext on the local segment |
 
+Behind any reverse proxy other than the Tailscale/Cloudflare modes the backend
+starts itself — **including Railway** — also set `PUPA_TRUSTED_PROXY=1` (config
+`transport.trusted_proxy`, already pinned in the cloud image). TLS terminates at
+the proxy, so `X-Forwarded-Proto` is the only evidence the caller's hop was
+encrypted, and the backend ignores that header unless it's told something in
+front actually writes it. Leave it **off** on a direct bind: there the header is
+written by the caller, and believing it would let anyone assert their own
+plaintext hop was TLS.
+
 When set, a non-TLS request gets `403 HTTPS required` and the screen-share
 socket closes with 4403. Health probes are exempt so platform checks still
 pass. There is **no** loopback exemption: every tunnel mode terminates in

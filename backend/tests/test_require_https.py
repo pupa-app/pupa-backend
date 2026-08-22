@@ -51,6 +51,13 @@ class _Req:
         self.headers = {"x-forwarded-proto": proto} if proto else {}
 
 
+@pytest.fixture(autouse=True)
+def _trusted_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most cases here model a proxied deployment. The untrusted case — where
+    the header is just a string the caller chose — is pinned separately."""
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
+
+
 def test_direct_tls_is_secure() -> None:
     assert is_secure_request(_Req("https"))
 
@@ -184,3 +191,43 @@ async def test_forwarded_https_screenshare_socket_is_allowed(
         headers={"Authorization": f"Bearer {token}", "X-Forwarded-Proto": "https"},
     ) as ws:
         assert ws is not None
+
+
+def test_forwarded_proto_is_ignored_without_a_proxy_in_front(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Otherwise a client on a plaintext hop asserts its own hop was TLS and
+    walks straight through PUPA_REQUIRE_HTTPS — the flag would be decoration."""
+    monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
+    monkeypatch.delenv("PUPA_CONNECTIVITY", raising=False)
+    assert not is_secure_request(_Req("http", "https"))
+
+
+def test_a_forged_proto_cannot_pass_the_middleware(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PUPA_REQUIRE_HTTPS", "1")
+    monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
+    monkeypatch.delenv("PUPA_CONNECTIVITY", raising=False)
+    resp = _pair(TestClient(app), **{"X-Forwarded-Proto": "https"})
+    assert resp.status_code == 403
+
+
+def test_tailscale_and_cloudflared_are_trusted_without_asking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This process starts those proxies itself, so it knows one is in front —
+    operators shouldn't have to set a second flag to keep working deployments
+    working."""
+    monkeypatch.delenv("PUPA_TRUSTED_PROXY", raising=False)
+    for mode in ("tailscale", "cloudflared"):
+        monkeypatch.setenv("PUPA_CONNECTIVITY", mode)
+        assert is_secure_request(_Req("http", "https")), mode
+
+
+def test_an_explicit_flag_overrides_the_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "tailscale")
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "0")
+    assert not is_secure_request(_Req("http", "https"))

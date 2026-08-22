@@ -46,9 +46,11 @@ when assessing risk:
   wrong codes are throttled per client — as are wrong `PUPA_API_KEY` values on
   `/auth/pair/begin`. Successful requests are never charged, and buckets are
   per-client with no shared cap, so no amount of third-party abuse can block a
-  caller holding a valid credential. Bucketing uses `X-Forwarded-For`, because
-  every supported transport terminates TLS in front of a loopback-bound
-  listener.
+  caller holding a valid credential. Bucketing uses `X-Forwarded-For` **only where a proxy is
+  trusted** (`PUPA_TRUSTED_PROXY`, inferred for the tunnel modes): the proxied
+  transports terminate in front of a loopback listener so the peer address is
+  useless there, while on a direct bind the header is caller-written and
+  trusting it would void the limits entirely.
 - **TLS is the operator's to enforce.** `PUPA_REQUIRE_HTTPS=1` refuses
   plaintext; it is pinned on in the cloud image and **must** be set on any
   internet-reachable self-host. See [docs/deploy.md](docs/deploy.md).

@@ -72,3 +72,60 @@ def test_https_guard_is_mounted_outside_auth(dispatch_stack: list[Any]) -> None:
     assert require_https_middleware in dispatch_stack, "https guard is not mounted"
     assert dispatch_stack.index(rate_limit_middleware) < dispatch_stack.index(require_https_middleware)
     assert dispatch_stack.index(require_https_middleware) < dispatch_stack.index(api_key_middleware)
+
+
+# ---------------------------------------------------------------------------
+# The guard's data source, not just its presence
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_records_the_run_paths_the_guard_reads() -> None:
+    """`run_scope_middleware` gates on `app.state.run_paths`, which only exists
+    because lifespan startup fills it in. Mounting the middleware without that
+    assignment un-gates `POST /` completely while every other test stays green
+    — so this one runs the real lifespan and checks the data is there.
+    """
+    import os
+
+    from fastapi.testclient import TestClient
+
+    snapshot = dict(os.environ)
+    try:
+        from pupa_backend.app import app
+
+        # TestClient's context manager runs startup/shutdown for real.
+        with TestClient(app):
+            run_paths = getattr(app.state, "run_paths", None)
+            assert run_paths, "lifespan did not record any run paths"
+            assert "/" in run_paths, (
+                "the default harness alias POST / is not gated — a token "
+                "without the `agent` scope could run the agent"
+            )
+            registry = getattr(app.state, "harness_registry", None)
+            if registry is not None:
+                for harness in registry.enabled():
+                    assert f"/harnesses/{harness.id}" in run_paths, harness.id
+    finally:
+        os.environ.clear()
+        os.environ.update(snapshot)
+
+
+def test_the_guard_fails_closed_without_run_paths() -> None:
+    """If the attribute is missing the guard must refuse, not wave the request
+    through — that branch is the difference between a bug and an open door."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from pupa_backend.auth import api_key_middleware
+
+    app = FastAPI()
+    app.middleware("http")(run_scope_middleware)
+    app.middleware("http")(api_key_middleware)
+
+    @app.post("/")
+    async def run() -> dict:  # pragma: no cover - must not be reached
+        return {"ok": True}
+
+    # No app.state.run_paths assigned.
+    resp = TestClient(app).post("/", json={}, headers={"Authorization": "Bearer x"})
+    assert resp.status_code != 200, "run endpoint served with no scope data"

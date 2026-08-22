@@ -255,7 +255,7 @@ def test_cloud_config_yaml_matches_expected_structure() -> None:
         "persistence": {"require_db_scheme": "postgresql"},
         # Reachable deploy: refuse plaintext. Railway terminates TLS and
         # forwards X-Forwarded-Proto, so nothing legitimate is blocked.
-        "transport": {"require_https": True},
+        "transport": {"require_https": True, "trusted_proxy": True},
         # Tracing is opt-out: on automatically once Langfuse secrets are
         # supplied via Railway env vars, so no `langfuse` block is needed.
     }

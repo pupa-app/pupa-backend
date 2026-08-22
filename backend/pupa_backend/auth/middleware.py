@@ -96,6 +96,13 @@ async def api_key_middleware(
     return _unauthorized()
 
 
+def _is_probably_run_path(path: str) -> bool:
+    """Shape of a harness run endpoint, for the fail-closed branch only. The
+    authoritative answer is `app.state.run_paths`; this is what to assume when
+    that's absent."""
+    return path == "/" or path.startswith("/harnesses/")
+
+
 async def run_scope_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -111,10 +118,22 @@ async def run_scope_middleware(
     """
     if request.method != "POST":
         return await call_next(request)
-    run_paths = getattr(request.app.state, "run_paths", None)
-    if not run_paths or request.url.path not in run_paths:
-        return await call_next(request)
     if truthy(os.getenv("PUPA_AUTH_DISABLED")):
+        return await call_next(request)
+
+    run_paths = getattr(request.app.state, "run_paths", None)
+    if run_paths is None:
+        # Fail closed. The set is populated during lifespan startup; missing it
+        # means the app was built in a way this guard doesn't understand, and
+        # the alternative is silently un-gating the most powerful route on the
+        # backend. `POST /` on a running app always has it.
+        if _is_probably_run_path(request.url.path):
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "Harness routes are not ready."},
+            )
+        return await call_next(request)
+    if request.url.path not in run_paths:
         return await call_next(request)
 
     identity = getattr(request.state, "auth", None)
