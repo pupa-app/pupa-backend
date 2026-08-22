@@ -99,9 +99,10 @@ def _build_env() -> dict[str, str]:
     allow_api = truthy(os.getenv("CLAUDE_CODE_ALLOW_API_BILLING"))
 
     if os.getenv("CLAUDE_CODE_PASS_ENV"):
-        from pupa_backend.harnesses.langgraph.backend_tools import shell_env_excluded
+        from pupa_backend.harnesses.langgraph.backend_tools import shell_env_filter
 
         creds = set(_CLAUDE_CRED_VARS)
+        excluded = shell_env_filter()
 
         def _forward(name: str) -> bool:
             # The credential vars are the point of `allow_api` — decide them
@@ -110,7 +111,7 @@ def _build_env() -> dict[str, str]:
             # ANTHROPIC_BASE_URL with nothing to authenticate with.
             if name in creds:
                 return allow_api
-            return not shell_env_excluded(name)
+            return not excluded(name)
 
         return {k: v for k, v in os.environ.items() if _forward(k)}
 

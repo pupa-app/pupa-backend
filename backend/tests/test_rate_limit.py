@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from pupa_backend.auth import api_key_middleware, rate_limit_middleware, router as auth_router
@@ -345,3 +346,138 @@ def test_the_map_cannot_grow_without_bound() -> None:
     for i in range(MAX_TRACKED_KEYS + 500):
         limiter.record(f"client-{i}")
     assert limiter.tracked_keys() <= MAX_TRACKED_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: the check and the charge must not straddle an await
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_guesses_cannot_exceed_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checking the budget before `call_next` and charging after it caps
+    guesses at the *connection count*, not at the limit: every request in
+    flight evaluates `under_limit` against a bucket nothing has been written
+    to yet. `/auth/pair` really does await in the middle (the pairing lock,
+    then the device store's file I/O), so this is reachable with nothing more
+    exotic than parallel requests.
+    """
+    import asyncio
+
+    from httpx import ASGITransport, AsyncClient
+
+    monkeypatch.delenv("PUPA_RATE_LIMIT_DISABLED", raising=False)
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
+    reset_limiter()
+
+    gate = asyncio.Event()
+    app = FastAPI()
+
+    @app.post("/auth/pair")
+    async def pair() -> JSONResponse:
+        # Every admitted request parks here, so they are all in flight at once
+        # — the window the old ordering left open.
+        await gate.wait()
+        return JSONResponse(status_code=404, content={"detail": "no such code"})
+
+    app.middleware("http")(rate_limit_middleware)
+
+    headers = {"X-Forwarded-For": "203.0.113.9"}
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://t"
+    ) as client:
+        attempts = [
+            asyncio.create_task(client.post("/auth/pair", json={}, headers=headers))
+            for _ in range(PAIR_EXCHANGE_LIMIT * 4)
+        ]
+        # Let every request reach the middleware (and the gate) before any of
+        # them is allowed to finish.
+        for _ in range(50):
+            await asyncio.sleep(0)
+        gate.set()
+        results = await asyncio.gather(*attempts)
+
+    admitted = [r for r in results if r.status_code != 429]
+    assert len(admitted) <= PAIR_EXCHANGE_LIMIT, (
+        f"{len(admitted)} concurrent guesses were admitted against a budget of "
+        f"{PAIR_EXCHANGE_LIMIT}"
+    )
+
+
+def test_a_refund_gives_back_the_callers_own_charge() -> None:
+    """The middleware charges on entry and refunds when the response says the
+    caller was legitimate. A refund must return that caller's own charge, not
+    forgive an older guess."""
+    now = [0.0]
+    limiter = SlidingWindowLimiter(now=lambda: now[0])
+    limiter.record("ip")                    # an earlier guess
+    now[0] = 10.0
+    charge = limiter.record("ip")           # the request being refunded
+    limiter.refund("ip", charge)
+    assert limiter.under_limit("ip", limit=2)
+    assert not limiter.under_limit("ip", limit=1), "the older guess was forgiven"
+
+
+def test_a_refund_cannot_take_back_a_concurrent_requests_charge() -> None:
+    """Requests share a bucket, so refunding "the newest hit" would hand back a
+    charge that still has a request behind it. Refund by value."""
+    now = [0.0]
+    limiter = SlidingWindowLimiter(now=lambda: now[0])
+    mine = limiter.record("ip")             # request A arrives
+    now[0] = 1.0
+    limiter.record("ip")                    # request B arrives, still in flight
+    limiter.refund("ip", mine)              # A finishes first, legitimately
+    assert not limiter.under_limit("ip", limit=1), "B's charge was refunded too"
+
+
+def test_a_refund_of_an_aged_out_charge_is_harmless() -> None:
+    """A request that outlived the window has nothing left to give back — and
+    must not take a hit it never wrote."""
+    now = [0.0]
+    limiter = SlidingWindowLimiter(now=lambda: now[0])
+    stale = limiter.record("ip")
+    now[0] = 61.0
+    fresh = limiter.record("ip")            # a different caller, same bucket
+    limiter.refund("ip", stale)
+    assert not limiter.under_limit("ip", limit=1), "someone else's charge was taken"
+    limiter.refund("ip", fresh)
+    assert limiter.tracked_keys() == 0
+
+
+def test_a_refund_on_an_untouched_key_is_harmless() -> None:
+    limiter = SlidingWindowLimiter(now=lambda: 0.0)
+    limiter.refund("never-seen", 0.0)
+    assert limiter.tracked_keys() == 0
+
+
+def test_the_ceiling_keeps_the_buckets_that_are_still_being_spent() -> None:
+    """Clearing the map at the ceiling would hand every caller their
+    outstanding budget back at once — a flood spread over enough addresses
+    could keep the limiter switched off for everybody simply by running. Nor
+    can eviction go by insertion order: a guesser that started *before* the
+    flood is at the front of the map and is exactly the bucket that has to
+    survive it.
+    """
+    from pupa_backend.auth.ratelimit import MAX_TRACKED_KEYS
+
+    now = [0.0]
+    limiter = SlidingWindowLimiter(now=lambda: now[0])
+    # The guesser is the *first* bucket in the map — insertion order puts it at
+    # the front, so evicting by that order would drop the one caller here that
+    # is actually being throttled.
+    limiter.record("guesser")
+    for i in range(MAX_TRACKED_KEYS - 1):
+        now[0] += 0.001
+        limiter.record(f"flood-{i}")
+    # It is still spending, right up to the moment the ceiling is tripped.
+    for _ in range(4):
+        now[0] += 0.001
+        limiter.record("guesser")
+    now[0] += 0.001
+    limiter.record("one-more-address")
+
+    assert limiter.tracked_keys() < MAX_TRACKED_KEYS, "nothing was evicted"
+    assert not limiter.under_limit("guesser", limit=5), (
+        "hitting the ceiling forgave a live budget"
+    )

@@ -204,6 +204,20 @@ def _resolve_harnesses(data: dict) -> dict[str, str]:
     return result
 
 
+# Env vars where *unset* does not mean "off", so a `false` in config.yml has
+# to be written out rather than omitted. `PUPA_TRUSTED_PROXY` is the only one:
+# unset makes `auth/proxy.py` infer from `PUPA_CONNECTIVITY`, so omitting it
+# would silently drop an explicit `trusted_proxy: false` on exactly the tunnel
+# deployments that bother to set it.
+#
+# Don't widen this set casually. Most gates read through `devices.truthy`,
+# which handles "0" — but the presence-checked ones (`bool(os.getenv(...))`:
+# `SHELL_TOOL_ENABLED`, and the opt-*out* gates `PUPA_SKILLS_DISABLED` /
+# `PUPA_CLAUDE_CODE_DISABLED`) would read a "0" as set, flipping the feature
+# the wrong way. Omission is the correct signal for all of those.
+_FALSE_IS_MEANINGFUL: frozenset[str] = frozenset({"PUPA_TRUSTED_PROXY"})
+
+
 def _yaml_to_env_dict(data: dict) -> dict[str, str]:
     flat = _flatten(data)
     result: dict[str, str] = {}
@@ -214,7 +228,9 @@ def _yaml_to_env_dict(data: dict) -> dict[str, str]:
         if isinstance(v, bool):
             if v:
                 result[env_var] = "1"
-            # False → omit; unset var is the "disabled" signal
+            elif env_var in _FALSE_IS_MEANINGFUL:
+                result[env_var] = "0"
+            # Otherwise False → omit; unset var is the "disabled" signal
         elif str(v).strip():
             result[env_var] = str(v)
     result.update(_resolve_active_llm_provider(data))

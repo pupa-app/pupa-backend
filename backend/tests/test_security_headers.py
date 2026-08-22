@@ -42,12 +42,16 @@ def test_no_hsts_over_plaintext(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -
     assert "strict-transport-security" not in TestClient(app).get("/x").headers
 
 
-def test_no_hsts_when_tls_is_not_configured(
+def test_hsts_on_a_tunnel_tls_hop_without_a_local_cert(
     app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The tunnel modes are the internet-reachable deployments and the ones
+    with no local cert: tailscaled / cloudflared hold it and speak plain HTTP
+    over loopback. HSTS keys off whether the *hop* was TLS, not off whether
+    this process happens to own the certificate."""
     monkeypatch.setenv("PUPA_TRUSTED_PROXY", "1")
     resp = TestClient(app).get("/x", headers={"X-Forwarded-Proto": "https"})
-    assert "strict-transport-security" not in resp.headers
+    assert resp.headers["strict-transport-security"].startswith("max-age=")
 
 
 def test_hsts_on_a_tls_hop_when_https_is_required(

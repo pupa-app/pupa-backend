@@ -5,8 +5,11 @@ name: Security scan
 # is only one of the ways a vulnerability arrives, and a leaked secret can land
 # in any file in the repo.
 #
-# Neither job is a required check — advisories appear and disappear without any
-# change on our side, so a red scan is a signal to triage, not a merge block.
+# Neither job is a required check (repo settings) — advisories appear and
+# disappear without any change on our side, so a red scan is a signal to
+# triage, not a merge block. That is why there is no `continue-on-error` here:
+# GitHub reports a continue-on-error job as *passing*, so a new CVE or a leaked
+# key would show a green tick and the scan would signal nothing at all.
 on:
   push:
     branches: [main, dev]
@@ -27,7 +30,6 @@ jobs:
   pip-audit:
     name: pip-audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
@@ -52,7 +54,6 @@ jobs:
   secret-scan:
     name: secret scan
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
         with:
@@ -60,7 +61,19 @@ jobs:
           # too, not just the tip.
           fetch-depth: 0
 
+      # The container, not gitleaks-action@v2: that action requires a paid
+      # GITLEAKS_LICENSE secret for organization-owned repos and exits non-zero
+      # without one, which would make every run red for a reason unrelated to
+      # secrets. Exit code 1 = findings.
+      # The container runs as root while the checkout is owned by the runner
+      # user, so git refuses the repo ("dubious ownership") before gitleaks
+      # reads a single commit — and with continue-on-error gone that failure is
+      # a red check, not a silent one. GIT_CONFIG_* is the documented way in.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/repo \
+            ghcr.io/gitleaks/gitleaks:v8.18.4 \
+            detect --source=/repo --redact --no-banner

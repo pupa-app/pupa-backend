@@ -167,6 +167,34 @@ def test_skills_disabled_opt_out_mapping() -> None:
     assert "PUPA_SKILLS_DISABLED" not in _yaml_to_env_dict({})
 
 
+def test_trusted_proxy_false_is_written_out_not_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`PUPA_TRUSTED_PROXY` unset does not mean "off" — `auth/proxy.py` infers
+    from `PUPA_CONNECTIVITY` instead. So an explicit `false` has to reach the
+    environment, or it is a no-op on exactly the tunnel deployments that set
+    it (`connectivity: tailscale` would go on trusting `X-Forwarded-*`).
+    """
+    env = _yaml_to_env_dict({"transport": {"trusted_proxy": False}})
+    assert env["PUPA_TRUSTED_PROXY"] == "0"
+
+    from pupa_backend.auth.proxy import trust_forwarded_headers
+
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "tailscale")
+    monkeypatch.setenv("PUPA_TRUSTED_PROXY", env["PUPA_TRUSTED_PROXY"])
+    assert not trust_forwarded_headers(), "the inference overrode an explicit false"
+
+
+def test_other_false_booleans_are_still_omitted() -> None:
+    """Every other gate is presence-checked (`bool(os.getenv(...))`), where a
+    "0" would read as *enabled*. Those must keep being omitted."""
+    assert "SHELL_TOOL_ENABLED" not in _yaml_to_env_dict({"shell_tool_enabled": False})
+    assert "PUPA_SKILLS_DISABLED" not in _yaml_to_env_dict({"skills_disabled": False})
+    assert "PUPA_REQUIRE_HTTPS" not in _yaml_to_env_dict(
+        {"transport": {"require_https": False}}
+    )
+
+
 # ---------------------------------------------------------------------------
 # deploy/cloud-config.yml — regression test
 # ---------------------------------------------------------------------------

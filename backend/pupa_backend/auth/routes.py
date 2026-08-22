@@ -149,7 +149,9 @@ async def pair_begin(body: _PairBeginRequest | None = None) -> dict:
     from .pairing import DEFAULT_TTL
 
     payload = body or _PairBeginRequest()
-    scopes = payload.scopes if payload.scopes else list(DEFAULT_SCOPES)
+    # `is not None`, not truthiness: an explicit `[]` asks for a device with
+    # no scopes at all, which is the opposite of the default set.
+    scopes = payload.scopes if payload.scopes is not None else list(DEFAULT_SCOPES)
     code_ttl = (
         timedelta(seconds=payload.codeTtlSeconds)
         if payload.codeTtlSeconds is not None

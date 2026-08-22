@@ -29,11 +29,22 @@ from .devices import truthy
 _PROXIED_CONNECTIVITY = frozenset({"tailscale", "cloudflared"})
 
 
+def starts_its_own_proxy() -> bool:
+    """Whether this process launches the proxy that fronts it.
+
+    The same fact the inference below rests on, read by `app.main()` to bind
+    the listener to loopback. The two have to agree: believing `X-Forwarded-*`
+    while the listener is also reachable directly lets anyone who can route to
+    it write their own hop — which is the whole hole the trust gate closes.
+    """
+    return os.getenv("PUPA_CONNECTIVITY", "").strip().lower() in _PROXIED_CONNECTIVITY
+
+
 def trust_forwarded_headers() -> bool:
     explicit = os.getenv("PUPA_TRUSTED_PROXY")
     if explicit is not None and explicit.strip() != "":
         return truthy(explicit)
-    return os.getenv("PUPA_CONNECTIVITY", "").strip().lower() in _PROXIED_CONNECTIVITY
+    return starts_its_own_proxy()
 
 
 def forwarded_values(headers, name: str) -> list[str]:

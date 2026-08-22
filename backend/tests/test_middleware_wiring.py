@@ -79,7 +79,7 @@ def test_https_guard_is_mounted_outside_auth(dispatch_stack: list[Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_lifespan_records_the_run_paths_the_guard_reads() -> None:
+def test_lifespan_records_the_run_paths_the_guard_reads(tmp_path) -> None:
     """`run_scope_middleware` gates on `app.state.run_paths`, which only exists
     because lifespan startup fills it in. Mounting the middleware without that
     assignment un-gates `POST /` completely while every other test stays green
@@ -91,6 +91,22 @@ def test_lifespan_records_the_run_paths_the_guard_reads() -> None:
 
     snapshot = dict(os.environ)
     try:
+        # The real lifespan has real side effects, and it reads the *ambient*
+        # environment. Pin every var that would reach outside this test before
+        # entering it: a developer with `DATABASE_URL` exported would otherwise
+        # run the checkpointer DDL against their live Postgres, `cloudflared`
+        # would be spawned as a child, configured MCP servers would be started,
+        # and the screenshare token of a backend they already have running
+        # would be regenerated on entry and revoked on exit.
+        for var in (
+            "PUPA_CONNECTIVITY",
+            "PUPA_MCP_SERVERS",
+            "PUPA_REQUIRE_DB_SCHEME",
+        ):
+            os.environ.pop(var, None)
+        os.environ["PUPA_SCREENSHARE"] = "0"
+        os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path / 'lifespan.db'}"
+
         from pupa_backend.app import app
 
         # TestClient's context manager runs startup/shutdown for real.
@@ -108,6 +124,59 @@ def test_lifespan_records_the_run_paths_the_guard_reads() -> None:
     finally:
         os.environ.clear()
         os.environ.update(snapshot)
+
+
+def test_uvicorn_does_not_rewrite_the_scope_from_forwarded_headers(
+    monkeypatch,
+) -> None:
+    """`auth/proxy.py` is the only thing allowed to decide whether
+    `X-Forwarded-*` is believable. uvicorn's own `proxy_headers` default folds
+    those headers into `scope["scheme"]` and `scope["client"]` for any peer in
+    `forwarded_allow_ips` — `127.0.0.1`, which is every tunnel deployment and
+    anything else sharing the host. That runs *above* the app, so
+    `is_secure_request` would read a forged scheme before ever consulting
+    `trust_forwarded_headers`, and the rate limiter would bucket on a forged
+    peer. Must stay off.
+    """
+    import uvicorn
+
+    from pupa_backend import app as app_module
+
+    captured: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
+    monkeypatch.delenv("PUPA_CONNECTIVITY", raising=False)
+    monkeypatch.delenv("PUPA_TLS_CERT", raising=False)
+    monkeypatch.delenv("PUPA_TLS_KEY", raising=False)
+
+    app_module.main()
+
+    assert captured.get("proxy_headers") is False
+
+
+def test_an_inferred_proxy_deployment_binds_loopback(monkeypatch) -> None:
+    """`auth/proxy.py` infers forwarded-header trust from `PUPA_CONNECTIVITY`.
+    Wherever it does, the listener must not also be reachable directly — a
+    wildcard bind would let anyone who can route to the port write their own
+    `X-Forwarded-Proto`/`-For` and walk through the HTTPS check and the rate
+    limiter. `cloudflared` is the case that used to bind `0.0.0.0`: unlike
+    Tailscale, nothing in this process forwards for it.
+    """
+    import uvicorn
+
+    from pupa_backend import app as app_module
+
+    captured: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
+    monkeypatch.setenv("PUPA_CONNECTIVITY", "cloudflared")
+    monkeypatch.delenv("PUPA_HOST", raising=False)
+    monkeypatch.delenv("PUPA_TLS_CERT", raising=False)
+    monkeypatch.delenv("PUPA_TLS_KEY", raising=False)
+    # Don't actually start a tunnel.
+    monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
+
+    app_module.main()
+
+    assert captured.get("host") == "127.0.0.1"
 
 
 def test_the_guard_fails_closed_without_run_paths() -> None:

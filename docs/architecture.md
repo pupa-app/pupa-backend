@@ -679,7 +679,12 @@ depend on a harness.
 - **Abuse limits** —
   [`ratelimit.py`](../backend/pupa_backend/auth/ratelimit.py) throttles the
   pairing routes per client (`/auth/pair` 5/min, `/auth/pair/begin` 10/min).
-  **Only failed attempts are charged** — a successful pairing is free, because
+  **Only failed attempts are charged** — the charge goes on at entry and is
+  refunded (by the exact timestamp it wrote, so it can't take back a concurrent
+  request's) once the status code says the caller was legitimate; checking
+  first and charging after would let requests arriving together all clear the
+  check against a bucket none of them had written to. A successful pairing is
+  free, because
   on `/auth/pair` the code *is* the credential (one request, then it's
   consumed) and `/auth/pair/begin` is operator-only, so throttling a caller
   who already holds `PUPA_API_KEY` protects nothing. What it does throttle is
@@ -701,18 +706,35 @@ depend on a harness.
   [`proxy.py`](../backend/pupa_backend/auth/proxy.py) answers "should
   `X-Forwarded-*` be believed here", which every forwarded-header read depends
   on. `PUPA_TRUSTED_PROXY` (config `transport.trusted_proxy`) is explicit and
-  wins; otherwise it's inferred true for `connectivity: tailscale` /
-  `cloudflared`, since the backend starts those proxies itself; otherwise
-  **false**. Pinned true in the cloud image for Railway. Wrong in the safe
-  direction (real proxy, flag unset) collapses callers into one bucket; wrong
-  the other way voids the rate limits and the HTTPS check, which is why the
-  default is off.
+  wins **either way** — `transport.trusted_proxy: false` is written to the env
+  as `0`, not omitted, so it overrides the inference below. Otherwise it's
+  inferred true for `connectivity: tailscale` / `cloudflared`, since the
+  backend starts those proxies itself; otherwise **false**. Pinned true in the
+  cloud image for Railway. Wrong in the safe direction (real proxy, flag unset)
+  collapses callers into one bucket; wrong the other way voids the rate limits
+  and the HTTPS check, which is why the default is off.
+  For this to be the only answer, uvicorn is started with
+  `proxy_headers=False` ([`app.py`](../backend/pupa_backend/app.py)): its
+  default middleware folds `X-Forwarded-Proto`/`-For` into the ASGI scope for
+  any peer within `forwarded_allow_ips` (`127.0.0.1` — every tunnel mode, and
+  anything else on the host), which would rewrite `url.scheme` and
+  `client.host` *above* the app and make the check below read a forged value.
+  Consequence for **operator-run** reverse proxies (nginx, Caddy, a manual
+  `cloudflared`): set `transport.trusted_proxy: true`, or every caller buckets
+  as `127.0.0.1` and `PUPA_REQUIRE_HTTPS` sees a plaintext hop. The modes this
+  process starts itself are inferred and need nothing. Those modes also bind
+  the listener to loopback (`starts_its_own_proxy()` in `main()`) — believing
+  `X-Forwarded-*` while the port is also directly reachable would let anyone
+  who can route to it write their own hop.
 - **Transport** —
   [`transport.py`](../backend/pupa_backend/auth/transport.py) implements
   `PUPA_REQUIRE_HTTPS` (config `transport.require_https`), unset by default so
   LAN and offline installs keep working. When set, any non-TLS request that
   isn't a health probe gets 403, and the screen-share WebSocket closes with
   4403 (WebSockets skip the HTTP middleware stack, so that check is inline).
+  Refused sockets are accepted and *then* closed — a close on a socket that was
+  never accepted has no frame to carry the code, so the client would see a bare
+  HTTP 403 and couldn't tell 4403 from 4401.
   Secure means `url.scheme == https` **or** the rightmost `X-Forwarded-Proto`
   is `https`. There is deliberately no loopback carve-out, for the same reason
   the rate limiter can't key on the peer address. Pinned on in
@@ -720,7 +742,9 @@ depend on a harness.
 - **Response headers** —
   [`headers.py`](../backend/pupa_backend/auth/headers.py) sets `nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and HSTS only on a
-  connection that is actually TLS. No `CORSMiddleware`: there is no browser
+  connection that is actually TLS — which is `is_secure_request` and nothing
+  else, so the tunnel modes get it too even though the cert lives in the
+  terminator rather than here. No `CORSMiddleware`: there is no browser
   origin to allow, and a permissive one would let any web page call this
   backend with a user's credentials.
 - **Device store** —

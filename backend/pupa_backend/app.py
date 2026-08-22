@@ -307,9 +307,18 @@ def main() -> None:
     # With `connectivity: tailscale`, let tailscaled forward the tailnet into a
     # loopback-bound listener — a wildcard bind is unreachable on macOS without
     # the Local Network privacy grant. See tailscale_proxy.py.
+    from pupa_backend.auth.proxy import starts_its_own_proxy
     from pupa_backend.tailscale_proxy import bind_host, start_serve_proxy
 
     proxy = start_serve_proxy(port)
+    # `cloudflared` reaches us over loopback too, and `auth/proxy.py` infers
+    # forwarded-header trust from the same env var — so a wildcard bind there
+    # would let anyone who can route to the port write their own
+    # `X-Forwarded-Proto`/`-For` and walk through both the HTTPS check and the
+    # rate limiter. `start_serve_proxy` only covers the Tailscale case (and
+    # returns None when the CLI is missing), so ask the connectivity mode
+    # directly. `PUPA_HOST` still overrides.
+    loopback_only = proxy is not None or starts_its_own_proxy()
 
     tls_cert = os.getenv("PUPA_TLS_CERT")
     tls_key = os.getenv("PUPA_TLS_KEY")
@@ -329,9 +338,16 @@ def main() -> None:
     try:
         uvicorn.run(
             "pupa_backend.app:app",
-            host=bind_host(proxied=proxy is not None),
+            host=bind_host(proxied=loopback_only),
             port=port,
             reload=False,
+            # uvicorn's own proxy-header handling folds client-supplied
+            # `X-Forwarded-Proto`/`-For` into the ASGI scope for any peer in
+            # `forwarded_allow_ips` (default `127.0.0.1` — every tunnel mode).
+            # That would rewrite `url.scheme` and `client.host` *underneath*
+            # `auth/proxy.py`, which is the one place allowed to decide whether
+            # those headers are believable. Off: we read the raw headers.
+            proxy_headers=False,
             **ssl_kwargs,
         )
     finally:

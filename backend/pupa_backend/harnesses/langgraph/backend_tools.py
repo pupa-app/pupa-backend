@@ -90,9 +90,9 @@ def _shell_env_exclude() -> frozenset[str]:
 # Env var names that are secrets by shape. `SHELL_PASS_ENV=1` hands the
 # backend's environment to a subprocess the *model* drives, so the default has
 # to be "don't", not "whatever the operator remembered to list". Matched
-# case-sensitively against the whole name; `SHELL_ENV_ALLOW` puts one back.
-# Matched case-insensitively against the whole name. Substring globs, not
-# suffix ones: `PGPASSWORD` has no underscore, so `*_PASSWORD` misses it.
+# case-insensitively against the whole name; `SHELL_ENV_ALLOW` puts one back.
+# Substring globs, not suffix ones: `PGPASSWORD` has no underscore, so
+# `*_PASSWORD` misses it.
 _SECRET_NAME_GLOBS: tuple[str, ...] = (
     "*KEY",           # *_API_KEY, SECRET_KEY, bare OPENAI_KEY / SUPABASE_KEY
     "*APIKEY*",
@@ -164,11 +164,29 @@ def _shell_env_allow() -> frozenset[str]:
     return frozenset(v.strip() for v in raw.split(",") if v.strip())
 
 
+def shell_env_filter() -> Callable[[str], bool]:
+    """`shell_env_excluded`, bound to one snapshot of the rules.
+
+    Both rule sets are read from the environment on every call, and
+    `SHELL_ENV_EXCLUDE_FROM` re-opens and re-scans a file to build one of them.
+    Filtering a whole environment calls the predicate once per variable, so
+    take the snapshot first.
+    """
+    allow = _shell_env_allow()
+    exclude = _shell_env_exclude()
+
+    def excluded(name: str) -> bool:
+        if name in allow:
+            return False
+        return name in exclude or is_secret_env_name(name)
+
+    return excluded
+
+
 def shell_env_excluded(name: str) -> bool:
-    """Whether `name` is withheld from the shell subprocess."""
-    if name in _shell_env_allow():
-        return False
-    return name in _shell_env_exclude() or is_secret_env_name(name)
+    """Whether `name` is withheld from the shell subprocess. For one-off
+    questions — to filter a whole environment, use `shell_env_filter`."""
+    return shell_env_filter()(name)
 
 
 def _shell_subprocess_env() -> dict[str, str] | None:
@@ -180,7 +198,8 @@ def _shell_subprocess_env() -> dict[str, str] | None:
     """
     if not os.getenv("SHELL_PASS_ENV"):
         return None
-    return {k: v for k, v in os.environ.items() if not shell_env_excluded(k)}
+    excluded = shell_env_filter()
+    return {k: v for k, v in os.environ.items() if not excluded(k)}
 
 
 def _build_startup_commands() -> list[str]:

@@ -164,6 +164,24 @@ def test_pair_begin_with_custom_scopes(
     assert resp.json()["scopes"] == ["agent"]
 
 
+def test_pair_begin_with_an_empty_scope_list_grants_nothing(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI
+) -> None:
+    """An explicit `[]` asks for a device with no privileges — the opposite of
+    omitting the field. Treating it as falsy would hand the request that most
+    clearly asks for least privilege the entire default set, `agent` included.
+    """
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    resp = client.post(
+        "/auth/pair/begin",
+        json={"label": "kiosk", "scopes": []},
+        headers={"Authorization": "Bearer k"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["scopes"] == []
+
+
 # ---------------------------------------------------------------------------
 # /auth/pair (public exchange)
 # ---------------------------------------------------------------------------

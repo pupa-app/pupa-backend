@@ -37,6 +37,8 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from .devices import get_store, truthy
+from .paths import is_health_probe
+from .scopes import auth_disabled, scope_denial
 
 
 def _is_public(path: str) -> bool:
@@ -48,9 +50,7 @@ def _is_public(path: str) -> bool:
     # operator-only via `require_api_key()`; only `/auth/pair` is open.
     if path == "/auth/pair":
         return True
-    # The AGUI helper registers `GET {path}/health` — with `path="/"` that
-    # serialises to `//health` until Starlette normalises it, so match both.
-    if path.endswith("/health"):
+    if is_health_probe(path):
         return True
     return False
 
@@ -118,7 +118,7 @@ async def run_scope_middleware(
     """
     if request.method != "POST":
         return await call_next(request)
-    if truthy(os.getenv("PUPA_AUTH_DISABLED")):
+    if auth_disabled():
         return await call_next(request)
 
     run_paths = getattr(request.app.state, "run_paths", None)
@@ -136,15 +136,12 @@ async def run_scope_middleware(
     if request.url.path not in run_paths:
         return await call_next(request)
 
-    identity = getattr(request.state, "auth", None)
-    if identity is None:
+    # Same decision `Depends(require_scope("agent"))` makes, in response form.
+    denial = scope_denial(request, "agent")
+    if denial is None:
+        return await call_next(request)
+    if denial.status_code == status.HTTP_401_UNAUTHORIZED:
+        # This stack's 401 — it carries the `WWW-Authenticate` challenge that
+        # `api_key_middleware` sends for the same condition.
         return _unauthorized()
-    kind, principal = identity
-    if kind == "api_key":
-        return await call_next(request)
-    if kind == "device" and principal is not None and principal.has_scope("agent"):
-        return await call_next(request)
-    return JSONResponse(
-        status_code=status.HTTP_403_FORBIDDEN,
-        content={"detail": "Missing required scope: 'agent'"},
-    )
+    return JSONResponse(status_code=denial.status_code, content={"detail": denial.detail})

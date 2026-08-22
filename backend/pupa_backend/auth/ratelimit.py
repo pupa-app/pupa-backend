@@ -6,7 +6,11 @@ single-use with a short TTL over a 31^8 space, which makes guessing
 impractical — but nothing stopped a caller from trying at full speed.
 
 **Only failures are charged.** That's the whole design, and it follows from
-what these two routes are:
+what these two routes are. Mechanically the charge goes on at entry and is
+refunded when the response says the caller was legitimate — checking first and
+charging after `call_next` would let any number of concurrent requests clear
+the check before the first is recorded, capping guesses at the connection
+count instead of at the limit.
 
 - On `/auth/pair` a legitimate device sends exactly one request, it succeeds,
   and the success consumes the code so it can't even be replayed. Every
@@ -16,6 +20,14 @@ what these two routes are:
   presented `PUPA_API_KEY` protects nothing — that key grants everything
   anyway — while blocking an operator pairing a batch of devices. What is
   worth throttling there is *wrong-key* attempts.
+
+The one thing the provisional charge does cost: more than `limit` requests
+genuinely *in flight at once* on the same bucket will 429 even when they would
+all have succeeded, because the budget is held for the duration of each. A
+`make pair` loop is sequential and never sees it; firing 15 concurrent mints at
+one backend does. Retrying works immediately — the charges come back off as
+those requests finish, so the `Retry-After` (computed from the in-flight
+charges) is an upper bound, not a wait the caller has to serve.
 
 **Per-client only, no global backstop.** A shared bucket that blocks is a
 denial of service with extra steps: a stranger drains it with junk and every
@@ -57,8 +69,8 @@ WINDOW_SECONDS = 60.0
 # A bucket key is attacker-influenced (it can be a forwarded address), and
 # `under_limit` is asked on every request including the ones never charged. So
 # the map is bounded on both axes: keys are truncated, empty buckets are
-# dropped as soon as they age out, and the whole map is cleared if it somehow
-# still grows past a ceiling no legitimate deployment approaches.
+# dropped as soon as they age out, and the oldest buckets are evicted if it
+# somehow still grows past a ceiling no legitimate deployment approaches.
 MAX_KEY_CHARS = 64
 MAX_TRACKED_KEYS = 10_000
 # Response codes that mean "this caller did not present a valid credential".
@@ -97,21 +109,43 @@ class SlidingWindowLimiter:
 
     def under_limit(self, key: str, limit: int, window: float = WINDOW_SECONDS) -> bool:
         """Whether this key still has budget. A question, not a debit — the
-        middleware asks it on every request but only charges the failures."""
+        middleware charges separately, via `record`."""
         return len(self._live_hits(key, window)) < limit
 
-    def record(self, key: str, window: float = WINDOW_SECONDS) -> None:
-        """Charge one failure against this key."""
+    def record(self, key: str, window: float = WINDOW_SECONDS) -> float:
+        """Charge one attempt against this key. Returns the timestamp written,
+        which `refund` takes back if the response says the caller was
+        legitimate."""
         live = self._live_hits(key, window)
         if len(self._hits) >= MAX_TRACKED_KEYS and key not in self._hits:
-            # Only reachable under a distributed flood of *failures*. Dropping
-            # the map forgives outstanding budget, which is the safe direction:
-            # over-forgiving throttles nobody, while growing without bound
-            # takes the process down.
-            self._hits.clear()
-            live = deque()
-        live.append(self._now())
+            # Only reachable under a distributed flood. Clearing the map would
+            # hand every caller their outstanding budget back at once, so a
+            # flood spread over enough addresses could keep the limiter
+            # switched off for everyone simply by continuing to run. Evict the
+            # buckets closest to ageing out instead — least *recently* charged,
+            # which is not insertion order: `record` re-assigns an existing key
+            # in place, so a guesser that started before the flood sits at the
+            # front of the map and is exactly the bucket that must survive it.
+            by_last_hit = sorted(self._hits, key=lambda k: self._hits[k][-1])
+            for stale in by_last_hit[:MAX_TRACKED_KEYS // 10]:
+                del self._hits[stale]
+        stamp = self._now()
+        live.append(stamp)
         self._hits[key] = live
+        return stamp
+
+    def refund(self, key: str, stamp: float, window: float = WINDOW_SECONDS) -> None:
+        """Give back the exact hit `record` returned. By value, not "the newest
+        one": concurrent requests share a bucket, so popping the tail would
+        return a charge that still has a request behind it, and a request that
+        outlived the window would take back a hit it never wrote."""
+        live = self._live_hits(key, window)
+        try:
+            live.remove(stamp)
+        except ValueError:
+            return  # already aged out of the window — nothing to give back
+        if not live:
+            del self._hits[key]
 
     def retry_after(self, key: str, window: float = WINDOW_SECONDS) -> int:
         """Whole seconds until the oldest hit in this key's window ages out."""
@@ -194,9 +228,10 @@ async def rate_limit_middleware(
     """Throttle the pairing routes. Mounted **outermost** so it runs before any
     auth work and regardless of the outcome — pairing is pre-auth.
 
-    Budget is spent by *failed* attempts only (see the module docstring), so
-    the check runs before the request and the charge after it, once the status
-    code says whether the caller had a valid credential.
+    Budget is spent by *failed* attempts only (see the module docstring). The
+    charge goes on before the request and comes back off once the status code
+    says the caller had a valid credential — charging only afterwards would
+    let concurrent requests all clear the check against the same empty bucket.
 
     `POST /` is deliberately not throttled: a dropped SSE socket re-attaches
     there (see `SSEReplayMiddleware`), so a per-IP cap would break exactly the
@@ -217,12 +252,19 @@ async def rate_limit_middleware(
     if not limiter.under_limit(key, limit):
         return _too_many(limiter.retry_after(key))
 
-    response = await call_next(request)
+    charge = limiter.record(key)
+    try:
+        response = await call_next(request)
+    except BaseException:
+        # A crash downstream is a server bug, not a guess — don't let it spend
+        # the caller's budget.
+        limiter.refund(key, charge)
+        raise
     # `require_https_middleware` sits inside this one and also answers 403.
     # That's a transport misconfiguration, not a guess at a credential — don't
     # spend a legitimate device's budget on it.
-    if response.status_code in FAILURE_STATUSES and not getattr(
+    if response.status_code not in FAILURE_STATUSES or getattr(
         request.state, "transport_refused", False
     ):
-        limiter.record(key)
+        limiter.refund(key, charge)
     return response

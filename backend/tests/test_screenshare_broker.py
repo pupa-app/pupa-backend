@@ -344,3 +344,24 @@ async def test_sidecar_token_allows_publisher_only(monkeypatch: pytest.MonkeyPat
         client=types.SimpleNamespace(host="127.0.0.1"),
     )
     assert not await _authorised(no_token)
+
+
+async def test_a_refused_socket_is_accepted_before_it_is_closed() -> None:
+    """Closing a socket that was never accepted has no frame channel to carry
+    the close code — the ASGI server just answers the upgrade with a plain HTTP
+    403, so 4403 (HTTPS required), 4401 (unauthorised) and 4400 (bad role) all
+    reach the client as the same thing. TestClient is an in-process shim that
+    surfaces the code either way, so only the call order can be asserted."""
+    from pupa_backend.screenshare.routes import _refuse
+
+    calls: list = []
+
+    class _FakeWebSocket:
+        async def accept(self) -> None:
+            calls.append("accept")
+
+        async def close(self, code: int) -> None:
+            calls.append(("close", code))
+
+    await _refuse(_FakeWebSocket(), 4403)
+    assert calls == ["accept", ("close", 4403)]

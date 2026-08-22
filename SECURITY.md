@@ -44,13 +44,22 @@ when assessing risk:
 - **Failed pairing attempts are rate limited.** `/auth/pair` is the one
   unauthenticated write route (the bootstrap code *is* the credential), so
   wrong codes are throttled per client — as are wrong `PUPA_API_KEY` values on
-  `/auth/pair/begin`. Successful requests are never charged, and buckets are
+  `/auth/pair/begin`. Successful requests do not spend budget — the charge goes
+  on when the request arrives and comes back off when the response says the
+  caller was legitimate, so concurrent guesses can't all clear the check
+  against a bucket none of them has been written to yet. (The one cost: more
+  than the limit genuinely *in flight at once* on one bucket will 429 even if
+  they'd all have succeeded. Retrying works immediately.) Buckets are
   per-client with no shared cap, so no amount of third-party abuse can block a
-  caller holding a valid credential. Bucketing uses `X-Forwarded-For` **only where a proxy is
-  trusted** (`PUPA_TRUSTED_PROXY`, inferred for the tunnel modes): the proxied
-  transports terminate in front of a loopback listener so the peer address is
-  useless there, while on a direct bind the header is caller-written and
-  trusting it would void the limits entirely.
+  caller holding a valid credential. Bucketing uses `X-Forwarded-For` **only
+  where a proxy is trusted** (`PUPA_TRUSTED_PROXY`, inferred for the tunnel
+  modes): the proxied transports terminate in front of a loopback listener so
+  the peer address is useless there, while on a direct bind the header is
+  caller-written and trusting it would void the limits entirely. **If you front
+  the backend with your own reverse proxy** (nginx, Caddy, a manually-run
+  `cloudflared`), set `transport.trusted_proxy: true` — uvicorn's own
+  forwarded-header handling is switched off, so without it every caller buckets
+  as `127.0.0.1` and `PUPA_REQUIRE_HTTPS` sees a plaintext hop.
 - **TLS is the operator's to enforce.** `PUPA_REQUIRE_HTTPS=1` refuses
   plaintext; it is pinned on in the cloud image and **must** be set on any
   internet-reachable self-host. See [docs/deploy.md](docs/deploy.md).

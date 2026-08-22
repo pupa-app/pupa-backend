@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from .devices import truthy
+from .paths import is_health_probe
 from .proxy import forwarded_values, trust_forwarded_headers
 
 
@@ -55,12 +56,6 @@ def is_secure_request(request: Request) -> bool:
     return False
 
 
-def _is_health(path: str) -> bool:
-    # Platform health probes hit the listener directly, behind the TLS
-    # terminator; blocking them would fail the deploys this flag exists for.
-    return path.endswith("/health")
-
-
 async def require_https_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -68,7 +63,9 @@ async def require_https_middleware(
     """Refuse plaintext when `PUPA_REQUIRE_HTTPS` is set. No-op otherwise."""
     if not require_https_enabled():
         return await call_next(request)
-    if _is_health(request.url.path) or is_secure_request(request):
+    # Platform health probes hit the listener directly, behind the TLS
+    # terminator; blocking them would fail the deploys this flag exists for.
+    if is_health_probe(request.url.path) or is_secure_request(request):
         return await call_next(request)
     # Read by `rate_limit_middleware`, which wraps this one: a plaintext hop
     # is a misconfiguration, not a guess at a credential, so it must not spend

@@ -37,7 +37,22 @@ bumps (`0.0.X` → `0.0.X+1`).
 - **New `PUPA_TRUSTED_PROXY`.** Says whether `X-Forwarded-*` can be believed
   on this deployment. Inferred for the Tailscale and Cloudflare modes and
   pinned on in the cloud image, so working setups stay working; off everywhere
-  else, because that's the answer that can't be turned against you.
+  else, because that's the answer that can't be turned against you. uvicorn's
+  own forwarded-header handling is switched off so this stays the only answer
+  — it believed those headers from any loopback peer, which on a tunnel
+  deployment is every caller. **If you run your own reverse proxy in front of
+  the backend, set `transport.trusted_proxy: true`**; the modes Pupa starts
+  itself are inferred and need nothing. Those modes now also bind the listener
+  to loopback — `connectivity: cloudflared` bound `0.0.0.0` while trusting
+  `X-Forwarded-*`, so anyone on the LAN could forge a hop.
+- **Concurrent pairing guesses are capped.** The limiter checked a caller's
+  budget before running the request and charged it after, so requests arriving
+  together all passed the check against a bucket none of them had been written
+  to yet. The charge now goes on first and comes back off when the response
+  says the caller was legitimate.
+- **A pairing request asking for no scopes gets none.** `"scopes": []` in a
+  `/auth/pair/begin` body was read as "unspecified" and minted a device with
+  the full default set, `agent` included.
 - **New `PUPA_REQUIRE_HTTPS` refuses plaintext.** Off by default so LAN and
   offline installs keep working; **set it on anything reachable from the
   internet**, where it's the difference between handing the device token to the
@@ -48,16 +63,28 @@ bumps (`0.0.X` → `0.0.X+1`).
   filtered only by a list the operator had to write themselves. Secret-shaped
   names (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …) are now dropped by default;
   `SHELL_ENV_ALLOW` names exceptions.
+- **`transport.trusted_proxy: false` now takes effect.** A `false` in
+  `config.yml` was dropped rather than written out, and an unset
+  `PUPA_TRUSTED_PROXY` means "infer from `connectivity`" — so on a Tailscale or
+  Cloudflare deployment, the one place you'd turn proxy trust off didn't.
 - **Responses carry security headers** — `nosniff`, `X-Frame-Options: DENY`,
-  `Referrer-Policy: no-referrer`, and HSTS on TLS connections. Still no CORS:
-  there's no browser origin to allow.
+  `Referrer-Policy: no-referrer`, and HSTS on TLS connections — including the
+  tunnel modes, where the terminator holds the cert and the backend speaks
+  plain HTTP over loopback. Still no CORS: there's no browser origin to allow.
 - **33 known vulnerabilities in dependencies, fixed.** The lockfile carried
   advisories against `starlette`, `aiohttp`, `cryptography`, `mcp`,
   `python-multipart` and others. Upgraded to zero. CI now runs `pip-audit` and
   a secret scan weekly and on every PR, so the next one surfaces in review.
+  Neither job is a required check, but neither is `continue-on-error` either —
+  GitHub reports those as passing, which would have made a new advisory look
+  identical to a clean run.
 
 ### Fixed
 
+- **A refused screen-share socket reports why.** The 4403 / 4401 / 4400 close
+  codes were sent on a socket that had never been accepted, so a real server
+  answered the upgrade with a bare HTTP 403 and the client couldn't tell an
+  HTTPS problem from an auth one.
 - **A frontend tool call no longer stops the chat when it lands second.**
   `ag-ui-langgraph` 0.0.43 fixes the emit path that only looked for parked
   interrupts on the first task — when one parked elsewhere, the turn ended
