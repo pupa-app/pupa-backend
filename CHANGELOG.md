@@ -88,6 +88,13 @@ bumps (`0.0.X` → `0.0.X+1`).
 
 ### Changed
 
+- **`PUPA_AUTH_DISABLED=1` on a reachable bind is now refused, not warned
+  about.** The switch opens every route — the agent loop and the shell tool
+  included — and pairing it with a `0.0.0.0` bind serves that to anything that
+  can reach the port. Startup now fails with an explanation instead of logging
+  a warning that scrolls past. Loopback binds are unaffected, which is the dev
+  loop the switch exists for; `PUPA_ALLOW_INSECURE_BIND=1` is the deliberate
+  override for a trusted network.
 - **The HTTPS guard now sits outside the rate limiter.** A plaintext request is
   refused before the limiter sees it, so it can't spend a real device's pairing
   budget — the limiter no longer needs to know anything about transport.

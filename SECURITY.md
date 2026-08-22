@@ -36,7 +36,11 @@ when assessing risk:
   [`backend/pupa_backend/auth/scopes.py`](backend/pupa_backend/auth/scopes.py)),
   including the agent run endpoints.
   `PUPA_AUTH_DISABLED=1` removes all auth and is **only** for a same-machine dev
-  loop — never expose such a backend to a network.
+  loop. The backend enforces that rather than trusting it: with the switch set
+  and the listener bound to anything but loopback it refuses to start, because
+  that combination hands every route — the agent loop and the shell tool
+  included — to anyone who can reach the port. `PUPA_ALLOW_INSECURE_BIND=1` is
+  the deliberate override.
 - **Devices cannot mint devices.** `/auth/pair/begin` requires `PUPA_API_KEY`;
   a paired-device token gets 403. So a leaked token cannot issue itself a
   replacement, and revoking the device it belongs to actually ends its access.

@@ -657,7 +657,11 @@ depend on a harness.
   `*/health`). It accepts either the bootstrap
   `PUPA_API_KEY` or a paired-device bearer token resolved via
   `DeviceStore.resolve`. `PUPA_AUTH_DISABLED=1` short-circuits the
-  middleware — dev loops only.
+  middleware — dev loops only, and `main()` enforces that: it **refuses to
+  start** when the switch is set and the listener isn't on loopback, since a
+  warning about a wide-open agent loop scrolls past in a platform log.
+  `PUPA_ALLOW_INSECURE_BIND=1` overrides it — a second, differently-named
+  variable, so pasting the first into a launch script can't reach it.
 - **Per-route authorization** —
   [`scopes.py`](../backend/pupa_backend/auth/scopes.py) provides
   `require_scope("<scope>")` and `require_api_key()` FastAPI

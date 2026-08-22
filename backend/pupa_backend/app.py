@@ -68,6 +68,11 @@ if claude_harness_enabled():
 
 _TUNNEL_URL_FILE = Path.home() / ".pupa-backend" / "tunnel_url"
 
+# Bind addresses only this machine can reach. Anything else — `0.0.0.0`, or an
+# explicit `PUPA_HOST` on a LAN address — is reachable by something that isn't
+# the operator, which is what `PUPA_AUTH_DISABLED` must never be paired with.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 def _start_cloudflared_tunnel() -> "subprocess.Popen[str] | None":
     """Start a cloudflared quick tunnel, write URL to _TUNNEL_URL_FILE, return process."""
@@ -358,7 +363,31 @@ def main() -> None:
         warn_unusable_cert(tls_cert)
 
     host = bind_host(proxied=fronted)
-    if trust_forwarded_headers() and host not in ("127.0.0.1", "::1", "localhost"):
+
+    if truthy(os.getenv("PUPA_AUTH_DISABLED")) and host not in _LOOPBACK_HOSTS:
+        # Refuse, don't warn. `PUPA_AUTH_DISABLED=1` opens every route
+        # including the agent loop and the shell tool, and a warning scrolls
+        # past in a platform log — the two together are how a dev shortcut ends
+        # up serving a stranger. The escape hatch is deliberately a second,
+        # differently-named variable so it can't be reached by pasting the
+        # first one into a launch script.
+        if not truthy(os.getenv("PUPA_ALLOW_INSECURE_BIND")):
+            raise SystemExit(
+                f"Refusing to start: PUPA_AUTH_DISABLED=1 with the listener "
+                f"bound to {host}, which is reachable from off this machine. "
+                f"Every route would be open to anyone who can route to it. "
+                f"Pair a device instead (see `pupa-backend pair`), bind "
+                f"127.0.0.1, or set PUPA_ALLOW_INSECURE_BIND=1 if this network "
+                f"really is trusted."
+            )
+        logger.warning(
+            "auth is DISABLED and the listener is bound to %s — every route is "
+            "open to anything that can reach this port. Allowed only because "
+            "PUPA_ALLOW_INSECURE_BIND is set.",
+            host,
+        )
+
+    if trust_forwarded_headers() and host not in _LOOPBACK_HOSTS:
         # Not fatal: Railway and friends need the wildcard bind and do sanitise
         # the headers. But anyone who can reach the port directly can now write
         # their own hop, so it has to be a deliberate choice, not a default.

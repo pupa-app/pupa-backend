@@ -166,7 +166,8 @@ def _run_main(monkeypatch, **env) -> dict:
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: captured.update(kw))
     monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
     for var in ("PUPA_HOST", "PUPA_TLS_CERT", "PUPA_TLS_KEY", "PUPA_CONNECTIVITY",
-                "PUPA_TRUSTED_PROXY"):
+                "PUPA_TRUSTED_PROXY", "PUPA_AUTH_DISABLED",
+                "PUPA_ALLOW_INSECURE_BIND"):
         monkeypatch.delenv(var, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -288,3 +289,54 @@ def test_the_guard_fails_closed_without_run_paths(monkeypatch) -> None:
         f"run endpoint answered {resp.status_code} with no scope data — the "
         "fail-closed branch did not fire"
     )
+
+
+# ---------------------------------------------------------------------------
+# PUPA_AUTH_DISABLED is a same-machine switch, and the bind address says so
+# ---------------------------------------------------------------------------
+
+
+def test_auth_disabled_on_a_reachable_bind_refuses_to_start(monkeypatch) -> None:
+    """`PUPA_AUTH_DISABLED=1` opens every route — the agent loop, the shell
+    tool, the device store. A warning scrolls past in a platform log, so the
+    combination that actually serves a stranger has to be refused, not noted.
+    """
+    import uvicorn
+
+    from pupa_backend import app as app_module
+
+    called: list = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: called.append(kw))
+    monkeypatch.setattr(app_module, "_start_cloudflared_tunnel", lambda: None)
+    for var in ("PUPA_HOST", "PUPA_CONNECTIVITY", "PUPA_TLS_CERT", "PUPA_TLS_KEY",
+                "PUPA_TRUSTED_PROXY", "PUPA_ALLOW_INSECURE_BIND"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PUPA_AUTH_DISABLED", "1")
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_module.main()
+
+    assert "PUPA_AUTH_DISABLED" in str(excinfo.value)
+    assert not called, "the server started anyway"
+
+
+def test_auth_disabled_on_loopback_is_the_supported_dev_loop(monkeypatch) -> None:
+    """Same laptop, same machine — the case the switch exists for."""
+    captured = _run_main(monkeypatch, PUPA_AUTH_DISABLED="1", PUPA_HOST="127.0.0.1")
+    assert captured.get("host") == "127.0.0.1"
+
+
+def test_the_insecure_bind_escape_hatch_is_a_separate_variable(monkeypatch) -> None:
+    """A second, differently-named switch, so it can't be reached by pasting
+    `PUPA_AUTH_DISABLED=1` into a launch script."""
+    captured = _run_main(
+        monkeypatch, PUPA_AUTH_DISABLED="1", PUPA_ALLOW_INSECURE_BIND="1"
+    )
+    assert captured.get("host") == "0.0.0.0"
+
+
+def test_a_reachable_bind_with_auth_on_is_untouched(monkeypatch) -> None:
+    """The gate is about the *combination*. Auth on and bound wide is how every
+    LAN and cloud deployment runs."""
+    captured = _run_main(monkeypatch)
+    assert captured.get("host") == "0.0.0.0"
