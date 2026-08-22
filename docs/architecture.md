@@ -678,8 +678,15 @@ depend on a harness.
   device-token TTL is also operator-configurable per-request.
 - **Abuse limits** —
   [`ratelimit.py`](../backend/pupa_backend/auth/ratelimit.py) throttles the
-  pairing routes per client (`/auth/pair` 5/min, `/auth/pair/begin` 10/min,
-  plus a 60/min global backstop). Keyed on the **rightmost**
+  pairing routes per client (`/auth/pair` 5/min, `/auth/pair/begin` 10/min).
+  **Only failed attempts are charged** — a successful pairing is free, because
+  on `/auth/pair` the code *is* the credential (one request, then it's
+  consumed) and `/auth/pair/begin` is operator-only, so throttling a caller
+  who already holds `PUPA_API_KEY` protects nothing. What it does throttle is
+  wrong codes and wrong keys. Buckets are **per client with no global cap**: a
+  shared bucket that blocks is a denial of service with extra steps, since a
+  stranger could drain it and lock out everyone holding a real credential.
+  Keyed on the **rightmost**
   `X-Forwarded-For` entry, not `request.client.host`: every transport mode
   terminates TLS in front of a loopback-bound listener, so the peer address is
   `127.0.0.1` for all remote callers and would bucket the internet as one.

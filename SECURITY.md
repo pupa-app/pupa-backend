@@ -41,10 +41,14 @@ when assessing risk:
   a paired-device token gets 403. So a leaked token cannot issue itself a
   replacement, and revoking the device it belongs to actually ends its access.
   Keep `PUPA_API_KEY` set — it is the only credential that can pair.
-- **Pairing is rate limited.** `/auth/pair` is the one unauthenticated write
-  route (the bootstrap code *is* the credential), so it is throttled per client
-  with a global backstop. Bucketing uses `X-Forwarded-For`, because every
-  supported transport terminates TLS in front of a loopback-bound listener.
+- **Failed pairing attempts are rate limited.** `/auth/pair` is the one
+  unauthenticated write route (the bootstrap code *is* the credential), so
+  wrong codes are throttled per client — as are wrong `PUPA_API_KEY` values on
+  `/auth/pair/begin`. Successful requests are never charged, and buckets are
+  per-client with no shared cap, so no amount of third-party abuse can block a
+  caller holding a valid credential. Bucketing uses `X-Forwarded-For`, because
+  every supported transport terminates TLS in front of a loopback-bound
+  listener.
 - **TLS is the operator's to enforce.** `PUPA_REQUIRE_HTTPS=1` refuses
   plaintext; it is pinned on in the cloud image and **must** be set on any
   internet-reachable self-host. See [docs/deploy.md](docs/deploy.md).

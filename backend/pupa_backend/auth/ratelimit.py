@@ -3,8 +3,29 @@
 `/auth/pair` is the only unauthenticated write route on the backend: the
 bootstrap code *is* the credential, so it can't sit behind a token. Codes are
 single-use with a short TTL over a 31^8 space, which makes guessing
-impractical — but nothing stopped a caller from trying at full speed, or from
-flooding the route outright. This adds the missing per-client ceiling.
+impractical — but nothing stopped a caller from trying at full speed.
+
+**Only failures are charged.** That's the whole design, and it follows from
+what these two routes are:
+
+- On `/auth/pair` a legitimate device sends exactly one request, it succeeds,
+  and the success consumes the code so it can't even be replayed. Every
+  *failed* request is therefore a guess. Charging successes would spend the
+  budget only on the people entitled to it.
+- `/auth/pair/begin` is operator-only. Throttling a caller who already
+  presented `PUPA_API_KEY` protects nothing — that key grants everything
+  anyway — while blocking an operator pairing a batch of devices. What is
+  worth throttling there is *wrong-key* attempts.
+
+**Per-client only, no global backstop.** A shared bucket that blocks is a
+denial of service with extra steps: a stranger drains it with junk and every
+legitimate caller gets 429 regardless of the credential they hold. Charging
+only failures slows the draining but doesn't change the outcome. The shared
+cap's one purpose was a botnet spreading guesses over many addresses, and the
+arithmetic already covers that — 31^8 is 8.5e11 codes, each single-use and
+alive for five minutes, so even 10k addresses at five guesses a minute get
+nowhere. A limit that can be turned against the people it protects buys less
+than it costs.
 
 Hand-rolled rather than `slowapi`: the surface is two routes, the process is
 single-worker (`app.py` runs uvicorn with no `workers=`), and the useful part
@@ -25,14 +46,17 @@ from starlette.responses import Response
 
 from .devices import truthy
 
-# Attempts per client per minute. `/auth/pair` is the public one, so it's the
-# tighter of the two; a human pairing a device types one code, once.
+# FAILED attempts per client per minute — successful requests are free.
+# `/auth/pair` is the public one and a human types one code once, so a
+# legitimate caller never sees this; five wrong codes in a minute is a guesser.
 PAIR_EXCHANGE_LIMIT = 5
+# Wrong `PUPA_API_KEY` (401) or a device token trying to mint (403).
 PAIR_BEGIN_LIMIT = 10
-# Backstop across all clients, so a botnet can't sidestep the per-client cap
-# by spreading the attempts out.
-PAIR_GLOBAL_LIMIT = 60
 WINDOW_SECONDS = 60.0
+# Response codes that mean "this caller did not present a valid credential".
+# 422 is deliberately absent: a malformed body is a client bug, not a guess at
+# a secret, and charging it would let a buggy client lock itself out.
+FAILURE_STATUSES = frozenset({401, 403, 404})
 
 
 class SlidingWindowLimiter:
@@ -48,17 +72,21 @@ class SlidingWindowLimiter:
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._now = now
 
-    def allow(self, key: str, limit: int, window: float = WINDOW_SECONDS) -> bool:
-        """Record a hit and report whether it's within the allowance."""
-        now = self._now()
+    def _prune(self, key: str, window: float) -> deque[float]:
         hits = self._hits[key]
-        cutoff = now - window
+        cutoff = self._now() - window
         while hits and hits[0] <= cutoff:
             hits.popleft()
-        if len(hits) >= limit:
-            return False
-        hits.append(now)
-        return True
+        return hits
+
+    def under_limit(self, key: str, limit: int, window: float = WINDOW_SECONDS) -> bool:
+        """Whether this key still has budget. A question, not a debit — the
+        middleware asks it on every request but only charges the failures."""
+        return len(self._prune(key, window)) < limit
+
+    def record(self, key: str, window: float = WINDOW_SECONDS) -> None:
+        """Charge one failure against this key."""
+        self._prune(key, window).append(self._now())
 
     def retry_after(self, key: str, window: float = WINDOW_SECONDS) -> int:
         """Whole seconds until the oldest hit in this key's window ages out."""
@@ -115,12 +143,24 @@ def _limit_for(path: str) -> int | None:
     return None
 
 
+def _too_many(retry_after: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many failed pairing attempts. Try again shortly."},
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 async def rate_limit_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     """Throttle the pairing routes. Mounted **outermost** so it runs before any
     auth work and regardless of the outcome — pairing is pre-auth.
+
+    Budget is spent by *failed* attempts only (see the module docstring), so
+    the check runs before the request and the charge after it, once the status
+    code says whether the caller had a valid credential.
 
     `POST /` is deliberately not throttled: a dropped SSE socket re-attaches
     there (see `SSEReplayMiddleware`), so a per-IP cap would break exactly the
@@ -137,12 +177,11 @@ async def rate_limit_middleware(
 
     limiter = get_limiter()
     key = f"{request.url.path}:{client_key(request)}"
-    global_key = f"{request.url.path}:*"
-    if not limiter.allow(key, limit) or not limiter.allow(global_key, PAIR_GLOBAL_LIMIT):
-        blocked = key if limiter.retry_after(key) > 1 else global_key
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Too many pairing attempts. Try again shortly."},
-            headers={"Retry-After": str(limiter.retry_after(blocked))},
-        )
-    return await call_next(request)
+
+    if not limiter.under_limit(key, limit):
+        return _too_many(limiter.retry_after(key))
+
+    response = await call_next(request)
+    if response.status_code in FAILURE_STATUSES:
+        limiter.record(key)
+    return response

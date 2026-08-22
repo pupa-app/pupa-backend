@@ -21,12 +21,17 @@ bumps (`0.0.X` → `0.0.X+1`).
   `POST /harnesses/{id}` previously accepted any valid token regardless of the
   scopes it was issued with — which is the most powerful thing a token can do,
   since it reaches every backend tool.
-- **The pairing endpoints are rate limited.** `/auth/pair` is the one route a
-  stranger can call, and nothing stopped them calling it at full speed. Now 5
-  attempts per client per minute, 60 across all clients, with
-  `PUPA_RATE_LIMIT_DISABLED=1` for local loops. Bucketing reads
-  `X-Forwarded-For`: every tunnel mode terminates in front of a loopback
-  listener, so the peer address is `127.0.0.1` for everyone.
+- **Failed pairing attempts are rate limited.** `/auth/pair` is the one route
+  a stranger can call, and nothing stopped them calling it at full speed. Now
+  5 wrong codes per client per minute (and 10 wrong operator keys on
+  `/auth/pair/begin`), with `PUPA_RATE_LIMIT_DISABLED=1` for local loops.
+  **Only failures count** — pairing a device successfully, or minting codes
+  with the operator key, is never throttled, so the limit falls on guessing
+  rather than on using the thing. There's no shared cap either: one that
+  everybody drew from could be drained by a stranger to lock out people
+  holding real credentials. Bucketing reads `X-Forwarded-For`: every tunnel
+  mode terminates in front of a loopback listener, so the peer address is
+  `127.0.0.1` for everyone.
 - **New `PUPA_REQUIRE_HTTPS` refuses plaintext.** Off by default so LAN and
   offline installs keep working; **set it on anything reachable from the
   internet**, where it's the difference between handing the device token to the

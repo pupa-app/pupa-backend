@@ -16,6 +16,7 @@ from pupa_backend.auth import api_key_middleware, rate_limit_middleware, router 
 from pupa_backend.auth.devices import reset_for_testing as reset_devices
 from pupa_backend.auth.pairing import reset_for_testing as reset_pairing
 from pupa_backend.auth.ratelimit import (
+    PAIR_BEGIN_LIMIT,
     PAIR_EXCHANGE_LIMIT,
     SlidingWindowLimiter,
     client_key,
@@ -43,30 +44,39 @@ def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
 # ---------------------------------------------------------------------------
 
 
-def test_limiter_allows_up_to_the_limit_then_blocks() -> None:
-    clock = iter([0.0] * 10)
-    limiter = SlidingWindowLimiter(now=lambda: next(clock))
-    assert [limiter.allow("ip", limit=3, window=60.0) for _ in range(4)] == [
-        True, True, True, False,
-    ]
+def test_limiter_blocks_once_the_budget_is_spent() -> None:
+    limiter = SlidingWindowLimiter(now=lambda: 0.0)
+    for _ in range(3):
+        assert limiter.under_limit("ip", limit=3)
+        limiter.record("ip")
+    assert not limiter.under_limit("ip", limit=3)
+
+
+def test_peeking_does_not_spend_budget() -> None:
+    """`under_limit` is a question, not a debit — the middleware asks it on
+    every request but only charges the ones that fail."""
+    limiter = SlidingWindowLimiter(now=lambda: 0.0)
+    for _ in range(50):
+        assert limiter.under_limit("ip", limit=1)
+    limiter.record("ip")
+    assert not limiter.under_limit("ip", limit=1)
 
 
 def test_limiter_forgets_hits_older_than_the_window() -> None:
-    times = [0.0, 1.0, 2.0, 61.0]
-    clock = iter(times)
-    limiter = SlidingWindowLimiter(now=lambda: next(clock))
-    assert limiter.allow("ip", limit=3, window=60.0)
-    assert limiter.allow("ip", limit=3, window=60.0)
-    assert limiter.allow("ip", limit=3, window=60.0)
-    # t=61 — the first three hits have aged out of the 60 s window.
-    assert limiter.allow("ip", limit=3, window=60.0)
+    now = [0.0]
+    limiter = SlidingWindowLimiter(now=lambda: now[0])
+    for _ in range(3):
+        limiter.record("ip")
+    assert not limiter.under_limit("ip", limit=3)
+    now[0] = 61.0  # the three hits have aged out of the 60 s window
+    assert limiter.under_limit("ip", limit=3)
 
 
 def test_limiter_buckets_are_independent_per_key() -> None:
     limiter = SlidingWindowLimiter(now=lambda: 0.0)
-    assert limiter.allow("a", limit=1, window=60.0)
-    assert not limiter.allow("a", limit=1, window=60.0)
-    assert limiter.allow("b", limit=1, window=60.0)
+    limiter.record("a")
+    assert not limiter.under_limit("a", limit=1)
+    assert limiter.under_limit("b", limit=1)
 
 
 # ---------------------------------------------------------------------------
@@ -103,34 +113,134 @@ def test_client_key_survives_a_missing_peer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# /auth/pair throttling
+# Throttling charges failures, not legitimate use
 # ---------------------------------------------------------------------------
 
 
-def _hammer(client: TestClient, n: int, xff: str = "203.0.113.7") -> list[int]:
-    return [
-        client.post(
-            "/auth/pair",
-            json={"code": "NOSUCHCO", "label": "x"},
-            headers={"X-Forwarded-For": xff},
-        ).status_code
-        for _ in range(n)
-    ]
+def _bad_code(client: TestClient, xff: str = "203.0.113.7"):
+    return client.post(
+        "/auth/pair",
+        json={"code": "NOSUCHCO", "label": "x"},
+        headers={"X-Forwarded-For": xff},
+    )
 
 
-def test_pair_exchange_throttles_after_the_limit(app: FastAPI) -> None:
-    client = TestClient(app)
-    codes = _hammer(client, PAIR_EXCHANGE_LIMIT + 1)
-    # Wrong codes, so every allowed attempt is a 404 — the point is the last one.
+def test_wrong_codes_are_throttled(app: FastAPI) -> None:
+    """The 8-char code IS the credential on this route, so every failure is a
+    guess."""
+    codes = [_bad_code(TestClient(app)).status_code for _ in range(PAIR_EXCHANGE_LIMIT + 1)]
     assert codes[:-1] == [404] * PAIR_EXCHANGE_LIMIT
+    assert codes[-1] == 429
+
+
+def test_a_successful_pairing_costs_nothing(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of the whole redesign: a legitimate device pairs in one
+    request and must never be pushed toward the limit for doing so. Spend the
+    budget down to its last unit, then prove a real pairing still goes
+    through — and still doesn't tip it over."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    xff = {"X-Forwarded-For": "203.0.113.7"}
+
+    for _ in range(PAIR_EXCHANGE_LIMIT - 1):
+        assert _bad_code(client).status_code == 404
+
+    begin = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": "Bearer k", **xff}
+    ).json()
+    ok = client.post(
+        "/auth/pair", json={"code": begin["code"], "label": "phone"}, headers=xff
+    )
+    assert ok.status_code == 200
+
+    # The success didn't spend anything: one failure of headroom remains.
+    assert _bad_code(client).status_code == 404
+    assert _bad_code(client).status_code == 429
+
+
+def test_authenticated_minting_is_not_throttled(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/auth/pair/begin` is operator-only. Throttling a caller who already
+    presented PUPA_API_KEY protects nothing — they hold the credential that
+    grants everything — and blocks an operator pairing a batch of devices."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer k", "X-Forwarded-For": "203.0.113.7"}
+    for _ in range(PAIR_BEGIN_LIMIT * 3):
+        assert client.post("/auth/pair/begin", json={}, headers=headers).status_code == 200
+
+
+def test_wrong_operator_keys_are_throttled(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What throttling this route is actually for: guessing PUPA_API_KEY."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer wrong", "X-Forwarded-For": "203.0.113.7"}
+    codes = [
+        client.post("/auth/pair/begin", json={}, headers=headers).status_code
+        for _ in range(PAIR_BEGIN_LIMIT + 1)
+    ]
+    assert codes[:-1] == [401] * PAIR_BEGIN_LIMIT
+    assert codes[-1] == 429
+
+
+def test_a_rejected_device_token_is_throttled(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A device token gets 403 here (devices can't mint devices). That's a
+    failure, so it's charged — a compromised device can't grind against the
+    route hunting for a way in."""
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+    begin = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": "Bearer k"}
+    ).json()
+    token = client.post(
+        "/auth/pair", json={"code": begin["code"], "label": "phone"}
+    ).json()["token"]
+
+    headers = {"Authorization": f"Bearer {token}", "X-Forwarded-For": "198.51.100.5"}
+    codes = [
+        client.post("/auth/pair/begin", json={}, headers=headers).status_code
+        for _ in range(PAIR_BEGIN_LIMIT + 1)
+    ]
+    assert codes[:-1] == [403] * PAIR_BEGIN_LIMIT
     assert codes[-1] == 429
 
 
 def test_throttling_is_per_client(app: FastAPI) -> None:
     client = TestClient(app)
-    assert _hammer(client, PAIR_EXCHANGE_LIMIT)[-1] == 404
-    # A different forwarded client gets its own bucket.
-    assert _hammer(client, 1, xff="198.51.100.9") == [404]
+    for _ in range(PAIR_EXCHANGE_LIMIT):
+        assert _bad_code(client).status_code == 404
+    assert _bad_code(client, xff="198.51.100.9").status_code == 404
+
+
+def test_no_amount_of_third_party_abuse_blocks_a_legitimate_pairing(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property that ruled out a shared/global bucket. Whatever strangers
+    do, from however many addresses, a caller holding a real credential is
+    unaffected — buckets are per-client, so there is nothing shared to drain.
+    """
+    monkeypatch.setenv("PUPA_API_KEY", "k")
+    client = TestClient(app)
+
+    for i in range(500):
+        _bad_code(client, xff=f"203.0.113.{i % 250}")
+
+    begin = client.post(
+        "/auth/pair/begin", json={}, headers={"Authorization": "Bearer k"}
+    ).json()
+    ok = client.post(
+        "/auth/pair",
+        json={"code": begin["code"], "label": "phone"},
+        headers={"X-Forwarded-For": "198.51.100.77"},
+    )
+    assert ok.status_code == 200, "third-party abuse blocked a real pairing"
 
 
 def test_rate_limit_can_be_disabled_for_dev(
@@ -138,18 +248,16 @@ def test_rate_limit_can_be_disabled_for_dev(
 ) -> None:
     monkeypatch.setenv("PUPA_RATE_LIMIT_DISABLED", "1")
     client = TestClient(app)
-    assert 429 not in _hammer(client, PAIR_EXCHANGE_LIMIT + 3)
+    codes = [_bad_code(client).status_code for _ in range(PAIR_EXCHANGE_LIMIT + 3)]
+    assert 429 not in codes
 
 
 def test_throttled_response_says_how_long_to_wait(app: FastAPI) -> None:
     client = TestClient(app)
-    codes = _hammer(client, PAIR_EXCHANGE_LIMIT + 1)
-    assert codes[-1] == 429
-    resp = client.post(
-        "/auth/pair",
-        json={"code": "NOSUCHCO", "label": "x"},
-        headers={"X-Forwarded-For": "203.0.113.7"},
-    )
+    for _ in range(PAIR_EXCHANGE_LIMIT):
+        _bad_code(client)
+    resp = _bad_code(client)
+    assert resp.status_code == 429
     assert resp.headers.get("retry-after") is not None
 
 
@@ -157,4 +265,3 @@ def test_unrelated_routes_are_not_throttled(app: FastAPI) -> None:
     client = TestClient(app)
     for _ in range(PAIR_EXCHANGE_LIMIT + 5):
         assert client.get("/auth/config").status_code == 200
-
