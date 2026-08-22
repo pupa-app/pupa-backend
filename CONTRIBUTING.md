@@ -108,6 +108,117 @@ bumped before the release.
   - `swift build --package-path screenshare-sidecar` (when the sidecar is touched; macOS-only)
 - If you change behaviour, update [docs/architecture.md](docs/architecture.md) — that doc is the entrypoint anyone uses to understand the backend.
 
+## Running from a clone
+
+Everything a user needs is on the `pupa-backend` CLI. From a clone there is also
+a `Makefile` for the dev loop — `make help` lists every target.
+
+```sh
+make install         # uv sync of backend deps
+make setup           # interactive wizard — writes ~/.pupa-backend/config.yml
+make backend         # run on :8004
+make pair            # mint a pairing code
+make test            # backend pytest suite (FILTER=foo scopes via -k)
+```
+
+Other useful ones: `make backend-open` (auth disabled), `make backend-shell`
+(shell tool on, with env-passing knobs), `make backend-keyed` /
+`make backend-tunneled` + `make tunnel` (Cloudflare quick tunnel, for testing
+from a phone), `make smoke` (auth + scope check matrix against a running
+backend), `make install-playwright` (deps + chromium), `make install-cli`
+(drops the `pupa-backend` CLI in `~/.local/bin/`).
+
+**Fast same-laptop loop.** `PUPA_AUTH_DISABLED=1` skips pair-once auth
+entirely — same-machine only, never on a reachable backend:
+
+```sh
+PUPA_AUTH_DISABLED=1 make backend
+```
+
+**Screen-share sidecar.** A separate Swift package, not shipped in the Python
+wheel. `swift build --package-path screenshare-sidecar` from a fresh clone
+compiles it (macOS 14 + Xcode toolchain); `make screenshare` runs it against the
+local broker and `make screenshare-viewer` serves the debug browser viewer at
+`http://localhost:8005/viewer.html`.
+
+## How it fits together
+
+The client speaks [AG-UI](https://github.com/ag-ui-protocol/ag-ui) to the backend
+over one `POST /` SSE stream. The backend runs the **agent harness** chosen for
+that connection; the harness talks to a model and, when it wants one of the
+client's tools, round-trips back to the device to run it (the AG-UI
+interrupt/resume contract). Auth, persistence, MCP, and the screen-share broker
+sit around the harness and are identical whichever one is active.
+
+```
+                     AG-UI  ·  POST /  ·  SSE
+   iOS / macOS  ───────────────────────────────▶  pupa-backend  (FastAPI :8004)
+        ▲                                                 │
+        │  tool call ─▶ device runs it ─▶ result          │  active harness ─▶ a model
+        └─────────  AG-UI interrupt / resume  ────────────┘
+
+   Agent harness  (chosen per connection):
+     • Claude Code loop         →  your Claude subscription
+     • Deepagents (LangGraph)   →  Bedrock / Anthropic / OpenAI-compatible
+     • … more to come
+
+   Harness-independent:  pair-once auth · forwarded client tools · MCP servers ·
+   persistence (SQLite / Postgres / in-memory) · /screenshare/ws
+```
+
+Full reference — per-harness detail, per-request model swap, auth flow,
+screenshare broker, tool gating — in [docs/architecture.md](docs/architecture.md).
+
+## Adding an agent
+
+An **agent harness** is a self-contained agent loop owning an AG-UI SSE handler.
+Every *enabled* harness is mounted at once at `POST /harnesses/{id}` (the default
+one is also aliased at `POST /`), and the client picks one per connection. Two
+ship today: the Claude Code loop (`claude_code`,
+[`harnesses/claude/`](backend/pupa_backend/harnesses/claude/)) and deepagents
+(`deepagents`, [`harnesses/langgraph/`](backend/pupa_backend/harnesses/langgraph/) —
+the directory name is about the library, the id about the loop).
+
+Adding a third means adding an adapter to the registry in
+[`harnesses/__init__.py`](backend/pupa_backend/harnesses/__init__.py) — implement the
+`AgentHarness` protocol (`register(app, path, deps)`), and the config.yml
+`harnesses:` block (or the `PUPA_HARNESSES` JSON override) enables it. A public
+plugin entry point is deferred until that surface settles. Rules that matter:
+
+- **Nothing above the harness boundary may import from a harness.** Shared code
+  goes in [`agui/`](backend/pupa_backend/agui/) or a top-level module.
+- **The client's wire protocol must not change.** Same AG-UI event shapes, same
+  interrupt/resume contract, whichever harness answers.
+
+Read [docs/architecture.md § Agent harnesses](docs/architecture.md) before
+starting — the credential stash, tool gating, and coexistence rules are all
+there.
+
+## Runtime internals
+
+**Auth.** Required by default; per-route authorization lives in
+[`auth/scopes.py`](backend/pupa_backend/auth/scopes.py) — scope-gated surfaces
+(`/db/threads/*`, `GET /harnesses` → `agent`) and operator-only surfaces
+(`/auth/devices/*`, `/auth/pair/begin`). API-key identity bypasses scope checks;
+device tokens must hold the named scope. Token stores: a JSON file at
+`backend/pupa-auth.json` (override with `PUPA_AUTH_DB_PATH`) locally, and
+`PostgresDeviceStore` auto-selected when the checkpointer is Postgres-backed, so
+tokens survive ephemeral filesystems.
+
+**Persistence.** A single `DATABASE_URL` drives both the checkpointer and the
+store — the URL *scheme* picks the backend, so there is no separate `db_type`
+key. Unset → SQLite under `~/.pupa-backend/`. Cloud deploys pin
+`PUPA_REQUIRE_DB_SCHEME=postgresql` to forbid that fallback.
+
+**Env-only knobs**, not in `config.yml`: `LG_RECURSION_LIMIT` (default 100),
+`LG_CLEAR_TOOL_USES_TRIGGER` (default 40000), the shell tool's
+`SHELL_TOOL_WORKSPACE` / `SHELL_PASS_ENV` / `SHELL_ENV_EXCLUDE` /
+`SHELL_ENV_ALLOW` (`SHELL_PASS_ENV=1` forwards the backend env minus every
+secret-shaped name — `*_API_KEY`, `*_TOKEN`, `AWS_*` — and `SHELL_ENV_ALLOW`
+names exceptions), `LANGFUSE_BASE_URL` for self-hosted Langfuse, and the
+frontend-tool wait/liveness timeouts. The annotated reference is
+[`.env.example`](.env.example).
+
 ## What goes where
 
 - **Code:** in the appropriate sub-package (`backend/`, `screenshare-sidecar/`). Bump that sub-package's own version when its code changes.
