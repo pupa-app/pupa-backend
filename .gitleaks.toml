@@ -1,0 +1,20 @@
+# Secret-scan config. `extend.useDefault` keeps the whole upstream ruleset —
+# this file only narrows it where it is provably wrong for this repo.
+title = "pupa-backend"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Package-index URLs in generated lockfiles. `backend/uv.lock` records a
+`files.pythonhosted.org` URL and a sha256 for every wheel, and the random path
+segment in those URLs matches high-entropy token rules — `square-access-token`
+fires on two of them today. Allowlisted by *line*, not by file, so a lockfile
+that ever grows a credentialed private-index URL (`https://user:token@…`) is
+still caught: such a line has no pythonhosted URL on it.
+"""
+regexTarget = "line"
+regexes = [
+  '''files\.pythonhosted\.org/packages/''',
+]

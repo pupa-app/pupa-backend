@@ -65,10 +65,14 @@ jobs:
       # GITLEAKS_LICENSE secret for organization-owned repos and exits non-zero
       # without one, which would make every run red for a reason unrelated to
       # secrets. Exit code 1 = findings.
-      # The container runs as root while the checkout is owned by the runner
-      # user, so git refuses the repo ("dubious ownership") before gitleaks
-      # reads a single commit — and with continue-on-error gone that failure is
-      # a red check, not a silent one. GIT_CONFIG_* is the documented way in.
+      #
+      # GIT_CONFIG_*: the container runs as root while the checkout is owned by
+      # the runner user, so git refuses the repo ("dubious ownership") before
+      # gitleaks reads a single commit.
+      #
+      # --verbose: without it the log says only "leaks found: N" — no rule, no
+      # file, no line, which is nothing to triage, and triage is what this job
+      # is for. --redact keeps the matched value out of the log either way.
       - name: gitleaks
         run: |
           docker run --rm -v "$PWD:/repo" \
@@ -76,4 +80,5 @@ jobs:
             -e GIT_CONFIG_KEY_0=safe.directory \
             -e GIT_CONFIG_VALUE_0=/repo \
             ghcr.io/gitleaks/gitleaks:v8.18.4 \
-            detect --source=/repo --redact --no-banner
+            detect --source=/repo --config=/repo/.gitleaks.toml \
+            --redact --verbose --no-banner
