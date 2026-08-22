@@ -52,11 +52,15 @@ def test_headers_wrap_everything(dispatch_stack: list[Any]) -> None:
     assert dispatch_stack[0] is security_headers_middleware
 
 
-def test_limiter_is_the_outermost_guard(dispatch_stack: list[Any]) -> None:
-    """First thing a flood hits, after the header pass. It protects a pre-auth
-    route, so it has to run before auth and regardless of the outcome."""
+def test_the_https_guard_is_the_outermost_guard(dispatch_stack: list[Any]) -> None:
+    """First thing a request hits, after the header pass — and specifically
+    *outside* the limiter. A plaintext hop is a misconfiguration, not a guess
+    at a credential, so refusing it before the limiter sees it is what keeps it
+    from spending a real device's pairing budget. Anything else needs the
+    limiter to know about transport, which is a coupling this ordering buys
+    its way out of."""
     guards = [m for m in dispatch_stack if m is not security_headers_middleware]
-    assert guards[0] is rate_limit_middleware
+    assert guards[0] is require_https_middleware
 
 
 def test_run_scope_guard_is_mounted_inside_auth(dispatch_stack: list[Any]) -> None:
@@ -65,13 +69,12 @@ def test_run_scope_guard_is_mounted_inside_auth(dispatch_stack: list[Any]) -> No
     assert dispatch_stack.index(api_key_middleware) < dispatch_stack.index(run_scope_middleware)
 
 
-def test_https_guard_is_mounted_outside_auth(dispatch_stack: list[Any]) -> None:
-    """Outside auth so a plaintext request is refused before its bearer token
-    is read at all, and inside the limiter so a flood still gets throttled
-    first."""
-    assert require_https_middleware in dispatch_stack, "https guard is not mounted"
-    assert dispatch_stack.index(rate_limit_middleware) < dispatch_stack.index(require_https_middleware)
-    assert dispatch_stack.index(require_https_middleware) < dispatch_stack.index(api_key_middleware)
+def test_limiter_is_mounted_outside_auth(dispatch_stack: list[Any]) -> None:
+    """It protects a pre-auth route, so it has to run before auth and
+    regardless of the outcome."""
+    assert rate_limit_middleware in dispatch_stack, "limiter is not mounted"
+    assert dispatch_stack.index(require_https_middleware) < dispatch_stack.index(rate_limit_middleware)
+    assert dispatch_stack.index(rate_limit_middleware) < dispatch_stack.index(api_key_middleware)
 
 
 # ---------------------------------------------------------------------------

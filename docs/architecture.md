@@ -683,7 +683,10 @@ depend on a harness.
   refunded (by the exact timestamp it wrote, so it can't take back a concurrent
   request's) once the status code says the caller was legitimate; checking
   first and charging after would let requests arriving together all clear the
-  check against a bucket none of them had written to. A successful pairing is
+  check against a bucket none of them had written to. The cost of holding the
+  budget for the request's duration: more than the limit genuinely in flight on
+  one bucket 429s even when all would have succeeded — retrying works
+  immediately, so `Retry-After` is an upper bound. A successful pairing is
   free, because
   on `/auth/pair` the code *is* the credential (one request, then it's
   consumed) and `/auth/pair/begin` is operator-only, so throttling a caller
@@ -701,6 +704,13 @@ depend on a harness.
   remote caller and would bucket the internet as one — but on a direct bind
   the header is written by the caller, so believing it would let one host
   rotate it per request for unlimited buckets.
+  Mounted *inside* `require_https_middleware`, so a plaintext hop is refused
+  before it can spend a real device's budget — the limiter needs to know
+  nothing about transport. Not `slowapi`: it charges before `call_next` and
+  offers no post-response hook, so "charge only failures" cannot be expressed
+  in it; the shared-bucket ceiling is an `OrderedDict` keyed by last charge, so
+  eviction is O(1) and drops the bucket charged longest ago rather than a
+  guesser still spending.
   `PUPA_RATE_LIMIT_DISABLED=1` opts out for local loops. `POST /` is
   deliberately *not* throttled — a dropped SSE socket re-attaches there, so a
   per-IP cap would break the flaky-network case `SSEReplayMiddleware` exists

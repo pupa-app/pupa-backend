@@ -1,55 +1,36 @@
 """Per-client throttling for the pairing endpoints.
 
 `/auth/pair` is the only unauthenticated write route on the backend: the
-bootstrap code *is* the credential, so it can't sit behind a token. Codes are
-single-use with a short TTL over a 31^8 space, which makes guessing
-impractical — but nothing stopped a caller from trying at full speed.
+bootstrap code *is* the credential, so it can't sit behind a token.
 
-**Only failures are charged.** That's the whole design, and it follows from
-what these two routes are. Mechanically the charge goes on at entry and is
-refunded when the response says the caller was legitimate — checking first and
-charging after `call_next` would let any number of concurrent requests clear
-the check before the first is recorded, capping guesses at the connection
-count instead of at the limit.
+Two facts drive everything here; the argument for each is in
+[docs/architecture.md](../../../docs/architecture.md) under "Auth", not
+repeated at length:
 
-- On `/auth/pair` a legitimate device sends exactly one request, it succeeds,
-  and the success consumes the code so it can't even be replayed. Every
-  *failed* request is therefore a guess. Charging successes would spend the
-  budget only on the people entitled to it.
-- `/auth/pair/begin` is operator-only. Throttling a caller who already
-  presented `PUPA_API_KEY` protects nothing — that key grants everything
-  anyway — while blocking an operator pairing a batch of devices. What is
-  worth throttling there is *wrong-key* attempts.
+1. **Only failures are charged.** A legitimate device pairs in one request and
+   the success consumes the code; `/auth/pair/begin` is operator-only. So a
+   failure is a guess and a success is the thing the route is for.
+2. **The charge goes on at entry** and is refunded when the response says the
+   caller was legitimate. Checking first and charging after `call_next` would
+   let concurrent requests all clear the check against a bucket none of them
+   had been written to, capping guesses at the connection count.
 
-The one thing the provisional charge does cost: more than `limit` requests
-genuinely *in flight at once* on the same bucket will 429 even when they would
-all have succeeded, because the budget is held for the duration of each. A
-`make pair` loop is sequential and never sees it; firing 15 concurrent mints at
-one backend does. Retrying works immediately — the charges come back off as
-those requests finish, so the `Retry-After` (computed from the in-flight
-charges) is an upper bound, not a wait the caller has to serve.
+Costs of (2), both accepted: more than `limit` requests genuinely in flight on
+one bucket will 429 even if they'd all have succeeded (retrying works
+immediately, so `Retry-After` is an upper bound), and the refund has to name
+the exact charge rather than "the newest one".
 
-**Per-client only, no global backstop.** A shared bucket that blocks is a
-denial of service with extra steps: a stranger drains it with junk and every
-legitimate caller gets 429 regardless of the credential they hold. Charging
-only failures slows the draining but doesn't change the outcome. The shared
-cap's one purpose was a botnet spreading guesses over many addresses, and the
-arithmetic already covers that — 31^8 is 8.5e11 codes, each single-use and
-alive for five minutes, so even 10k addresses at five guesses a minute get
-nowhere. A limit that can be turned against the people it protects buys less
-than it costs.
-
-Hand-rolled rather than `slowapi`: the surface is two routes, the process is
-single-worker (`app.py` runs uvicorn with no `workers=`), and the useful part
-of a limiter here is the key function, which we'd have to write either way —
-`get_remote_address` reads `request.client.host` and walks straight into the
-loopback trap documented on `client_key`. If workers are ever added, this
-needs a shared backing store.
+Hand-rolled rather than `slowapi`: that library charges before `call_next` with
+no post-response hook, so (1) is not expressible in it at all — and the useful
+part here is the key function, which we'd write either way (`get_remote_address`
+reads `request.client.host` and walks into the loopback trap documented on
+`client_key`). Single-worker only: `app.py` runs uvicorn with no `workers=`. If
+workers are ever added, this needs a shared backing store.
 """
 
 import os
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 
 from fastapi import Request
@@ -69,8 +50,9 @@ WINDOW_SECONDS = 60.0
 # A bucket key is attacker-influenced (it can be a forwarded address), and
 # `under_limit` is asked on every request including the ones never charged. So
 # the map is bounded on both axes: keys are truncated, empty buckets are
-# dropped as soon as they age out, and the oldest buckets are evicted if it
-# somehow still grows past a ceiling no legitimate deployment approaches.
+# dropped as soon as they age out, and the least recently charged bucket is
+# evicted if it somehow still grows past a ceiling no legitimate deployment
+# approaches.
 MAX_KEY_CHARS = 64
 MAX_TRACKED_KEYS = 10_000
 # Response codes that mean "this caller did not present a valid credential".
@@ -89,7 +71,8 @@ class SlidingWindowLimiter:
     """
 
     def __init__(self, now: Callable[[], float] = time.monotonic) -> None:
-        self._hits: dict[str, deque[float]] = {}
+        # Ordered by *last charge*, not first sight — see `record`.
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
         self._now = now
 
     def _live_hits(self, key: str, window: float) -> deque[float]:
@@ -117,21 +100,17 @@ class SlidingWindowLimiter:
         which `refund` takes back if the response says the caller was
         legitimate."""
         live = self._live_hits(key, window)
-        if len(self._hits) >= MAX_TRACKED_KEYS and key not in self._hits:
-            # Only reachable under a distributed flood. Clearing the map would
-            # hand every caller their outstanding budget back at once, so a
-            # flood spread over enough addresses could keep the limiter
-            # switched off for everyone simply by continuing to run. Evict the
-            # buckets closest to ageing out instead — least *recently* charged,
-            # which is not insertion order: `record` re-assigns an existing key
-            # in place, so a guesser that started before the flood sits at the
-            # front of the map and is exactly the bucket that must survive it.
-            by_last_hit = sorted(self._hits, key=lambda k: self._hits[k][-1])
-            for stale in by_last_hit[:MAX_TRACKED_KEYS // 10]:
-                del self._hits[stale]
         stamp = self._now()
         live.append(stamp)
         self._hits[key] = live
+        self._hits.move_to_end(key)
+        # Position is recency, so the ceiling drops the bucket charged longest
+        # ago — never a guesser that is still spending. Clearing the map (or
+        # evicting by first sight) would forgive one of those, and a flood
+        # spread over enough addresses could then keep the limiter switched off
+        # for everyone simply by continuing to run.
+        while len(self._hits) > MAX_TRACKED_KEYS:
+            self._hits.popitem(last=False)
         return stamp
 
     def refund(self, key: str, stamp: float, window: float = WINDOW_SECONDS) -> None:
@@ -225,8 +204,11 @@ async def rate_limit_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Throttle the pairing routes. Mounted **outermost** so it runs before any
-    auth work and regardless of the outcome — pairing is pre-auth.
+    """Throttle the pairing routes. Mounted outside auth so it runs before any
+    auth work and regardless of the outcome — pairing is pre-auth. It sits
+    *inside* `require_https_middleware`, so a plaintext hop is refused before
+    it reaches here: that's a misconfiguration, not a guess at a credential,
+    and it must not spend a real device's budget.
 
     Budget is spent by *failed* attempts only (see the module docstring). The
     charge goes on before the request and comes back off once the status code
@@ -260,11 +242,6 @@ async def rate_limit_middleware(
         # the caller's budget.
         limiter.refund(key, charge)
         raise
-    # `require_https_middleware` sits inside this one and also answers 403.
-    # That's a transport misconfiguration, not a guess at a credential — don't
-    # spend a legitimate device's budget on it.
-    if response.status_code not in FAILURE_STATUSES or getattr(
-        request.state, "transport_refused", False
-    ):
+    if response.status_code not in FAILURE_STATUSES:
         limiter.refund(key, charge)
     return response

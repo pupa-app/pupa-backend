@@ -271,12 +271,13 @@ app.add_middleware(SSEKeepAliveMiddleware)
 # it reads the `request.state.auth` that auth puts there.
 app.middleware("http")(run_scope_middleware)
 app.middleware("http")(api_key_middleware)
-# Outside auth: a plaintext request should be refused before its bearer token
-# is read at all. No-op unless PUPA_REQUIRE_HTTPS is set.
-app.middleware("http")(require_https_middleware)
-# Outermost (added last): throttles the pre-auth pairing exchange before any
-# auth work happens, and regardless of how that auth turns out.
+# Outside auth: throttles the pre-auth pairing exchange before any auth work
+# happens, and regardless of how that auth turns out.
 app.middleware("http")(rate_limit_middleware)
+# Outside the limiter: a plaintext hop is a misconfiguration, not a guess at a
+# credential, so it must be refused before it can spend a real device's pairing
+# budget. No-op unless PUPA_REQUIRE_HTTPS is set.
+app.middleware("http")(require_https_middleware)
 # Outermost of all: every response gets the headers, including the ones the
 # guards above return on their own (403/429 never reach the inner stack).
 app.middleware("http")(security_headers_middleware)

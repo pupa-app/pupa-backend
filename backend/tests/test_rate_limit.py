@@ -481,7 +481,7 @@ def test_the_ceiling_keeps_the_buckets_that_are_still_being_spent() -> None:
     now[0] += 0.001
     limiter.record("one-more-address")
 
-    assert limiter.tracked_keys() < MAX_TRACKED_KEYS, "nothing was evicted"
+    assert limiter.tracked_keys() <= MAX_TRACKED_KEYS, "the ceiling did not hold"
     assert not limiter.under_limit("guesser", limit=5), (
         "hitting the ceiling forgave a live budget"
     )
@@ -495,17 +495,18 @@ def test_the_ceiling_keeps_the_buckets_that_are_still_being_spent() -> None:
 def test_a_transport_refusal_does_not_spend_a_pairing_budget(
     app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`require_https_middleware` sits inside the limiter and also answers 403.
-    A plaintext hop is a misconfiguration, not a guess at a credential — an
+    """A plaintext hop is a misconfiguration, not a guess at a credential — an
     operator who forgot the scheme must not burn a real device's budget
-    discovering it."""
+    discovering it. `require_https_middleware` is mounted outside the limiter
+    so the 403 is returned before the charge is ever made; this mirrors that
+    stack (added last = outermost)."""
     from pupa_backend.auth import require_https_middleware
 
     monkeypatch.setenv("PUPA_REQUIRE_HTTPS", "1")
     reset_limiter()
     inner = FastAPI()
-    inner.middleware("http")(require_https_middleware)
     inner.middleware("http")(rate_limit_middleware)
+    inner.middleware("http")(require_https_middleware)
     inner.include_router(auth_router, prefix="/auth")
 
     client = TestClient(inner)

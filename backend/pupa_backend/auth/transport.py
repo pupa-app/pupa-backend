@@ -67,10 +67,6 @@ async def require_https_middleware(
     # terminator; blocking them would fail the deploys this flag exists for.
     if is_health_probe(request.url.path) or is_secure_request(request):
         return await call_next(request)
-    # Read by `rate_limit_middleware`, which wraps this one: a plaintext hop
-    # is a misconfiguration, not a guess at a credential, so it must not spend
-    # a legitimate device's pairing budget.
-    request.state.transport_refused = True
     return JSONResponse(
         status_code=403,
         content={

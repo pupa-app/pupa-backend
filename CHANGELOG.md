@@ -86,6 +86,12 @@ bumps (`0.0.X` → `0.0.X+1`).
   GitHub reports those as passing, which would have made a new advisory look
   identical to a clean run.
 
+### Changed
+
+- **The HTTPS guard now sits outside the rate limiter.** A plaintext request is
+  refused before the limiter sees it, so it can't spend a real device's pairing
+  budget — the limiter no longer needs to know anything about transport.
+
 ### Fixed
 
 - **A refused screen-share socket reports why.** The 4403 / 4401 / 4400 close
