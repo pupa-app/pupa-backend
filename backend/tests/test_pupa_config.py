@@ -313,3 +313,89 @@ def test_multiple_providers_only_default_exported() -> None:
     assert result["ANTHROPIC_API_KEY"] == "sk-ant-a"
     assert "LLM_BASE_URL" not in result
     assert "LLM_API_KEY" not in result
+
+
+# ---------------------------------------------------------------------------
+# `env:` passthrough block
+# ---------------------------------------------------------------------------
+#
+# The typed schema can only name vars someone thought to add to `_YAML_TO_ENV`.
+# `env:` is the escape hatch: any var the backend (or an MCP server, or a tool)
+# reads can be set from config.yml without a code change. This is what makes a
+# background service — which inherits nothing from the shell — configurable at
+# all for vars outside the schema.
+
+def test_env_block_passes_arbitrary_vars_through() -> None:
+    assert _yaml_to_env_dict({"env": {"AWS_ACCESS_KEY_ID": "AKIA"}})["AWS_ACCESS_KEY_ID"] == "AKIA"
+
+
+def test_env_block_absent_is_noop() -> None:
+    assert _yaml_to_env_dict({}) == {}
+
+
+def test_env_block_stringifies_non_string_values() -> None:
+    assert _yaml_to_env_dict({"env": {"PORT": 8004}})["PORT"] == "8004"
+
+
+def test_env_block_omits_blank_values() -> None:
+    assert "EMPTY" not in _yaml_to_env_dict({"env": {"EMPTY": "  "}})
+
+
+def test_env_block_bool_true_becomes_one() -> None:
+    assert _yaml_to_env_dict({"env": {"FLAG": True}})["FLAG"] == "1"
+
+
+def test_typed_key_wins_over_env_block() -> None:
+    """`env:` is an escape hatch, not an override — the documented schema key is
+    the more specific expression of intent, so it takes precedence."""
+    data = {"auth": {"api_key": "typed"}, "env": {"PUPA_API_KEY": "raw"}}
+    assert _yaml_to_env_dict(data)["PUPA_API_KEY"] == "typed"
+
+
+# ---------------------------------------------------------------------------
+# known_env_vars — derived, never hand-maintained
+# ---------------------------------------------------------------------------
+
+def test_known_env_vars_covers_every_flat_schema_key() -> None:
+    from pupa_backend.pupa_config import _YAML_TO_ENV, known_env_vars
+
+    known = known_env_vars()
+    for env_var in _YAML_TO_ENV.values():
+        assert env_var in known
+
+
+def test_known_env_vars_prefers_nested_spelling_for_dual_homed_vars() -> None:
+    """A few vars have both a legacy flat key and a nested `harnesses.claude_code.*`
+    key. Both load; the hint should name the preferred (nested) spelling."""
+    from pupa_backend.pupa_config import known_env_vars
+
+    known = known_env_vars()
+    assert known["CLAUDE_CODE_WORKSPACE"] == "harnesses.claude_code.workspace"
+    assert known["PUPA_CLAUDE_LOOP_NATIVE"] == "harnesses.claude_code.native"
+
+
+def test_known_env_vars_covers_every_llm_provider_field() -> None:
+    from pupa_backend.pupa_config import _LLM_PROVIDER_KEY_TO_ENV, known_env_vars
+
+    known = known_env_vars()
+    for ptype, mapping in _LLM_PROVIDER_KEY_TO_ENV.items():
+        for cfg_key, env_var in mapping.items():
+            assert env_var in known
+            assert cfg_key in known[env_var]
+
+
+def test_known_env_vars_covers_claude_harness_keys() -> None:
+    from pupa_backend.pupa_config import _CLAUDE_HARNESS_KEY_TO_ENV, known_env_vars
+
+    known = known_env_vars()
+    for cfg_key, env_var in _CLAUDE_HARNESS_KEY_TO_ENV.items():
+        assert known.get(env_var) == f"harnesses.claude_code.{cfg_key}"
+
+
+def test_known_env_vars_includes_block_resolvers() -> None:
+    from pupa_backend.pupa_config import known_env_vars
+
+    known = known_env_vars()
+    assert known["PUPA_MCP_SERVERS"] == "mcp_servers"
+    assert known["PUPA_HARNESSES"] == "harnesses"
+    assert known["LLM_PROVIDER"] == "llm_providers.<name>.provider"
