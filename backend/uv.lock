@@ -2582,7 +2582,7 @@ wheels = [
 
 [[package]]
 name = "pupa-backend"
-version = "0.0.90"
+version = "0.0.91"
 source = { editable = "." }
 dependencies = [
     { name = "ag-ui-langgraph" },

@@ -4,6 +4,15 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.91] — 2026-08-25
+
+### Changed
+
+- **Claude harness model menu shows plain tier names.** `Opus (latest)` and
+  friends are now just `Opus` / `Sonnet` / `Haiku` / `Fable`. The aliases still
+  resolve to the newest model in each tier; the suffix only added noise to the
+  picker.
+
 ## [0.0.90] — 2026-08-21
 
 ### Security
