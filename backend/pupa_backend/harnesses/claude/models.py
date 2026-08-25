@@ -20,10 +20,10 @@ from __future__ import annotations
 # current as new model versions ship. `opus` leads because the loop default
 # (Opus 4.8) is an Opus-tier model.
 LOOP_MODEL_ALIASES: list[tuple[str, str]] = [
-    ("opus", "Opus (latest)"),
-    ("sonnet", "Sonnet (latest)"),
-    ("haiku", "Haiku (latest)"),
-    ("fable", "Fable (latest)"),
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet"),
+    ("haiku", "Haiku"),
+    ("fable", "Fable"),
 ]
 
 # The provider tag the loop reports to iOS. The loop ignores the provider on the
