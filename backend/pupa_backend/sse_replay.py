@@ -85,9 +85,8 @@ import time
 from collections import deque
 from typing import Any, AsyncIterator
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -126,11 +125,14 @@ def _max_bytes() -> int:
         return 8 * 1024 * 1024
 
 
-def _is_sse(response) -> bool:
-    if getattr(response, "media_type", None) == _SSE_MEDIA_TYPE:
-        return True
-    content_type = response.headers.get("content-type", "")
-    return content_type.split(";", 1)[0].strip() == _SSE_MEDIA_TYPE
+def _is_sse_start(message: Message) -> bool:
+    """True when an ASGI `http.response.start` announces an SSE body."""
+    for name, value in message.get("headers", []):
+        if name.lower() != b"content-type":
+            continue
+        media = value.decode("latin-1").split(";", 1)[0].strip().lower()
+        return media == _SSE_MEDIA_TYPE
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -412,18 +414,73 @@ def _is_run_path(path: str) -> bool:
     return path == "/" or path.startswith("/harnesses/")
 
 
-class SSEReplayMiddleware(BaseHTTPMiddleware):
+async def _read_body(receive: Receive) -> bytes | None:
+    """Drain the request body. `None` if the client hung up while sending."""
+    body = b""
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return None
+        body += message.get("body", b"")
+        if not message.get("more_body", False):
+            return body
+
+
+def _detached_receive(body: bytes) -> Receive:
+    """A `receive` for the handler that reports the body and then nothing.
+
+    Never yields `http.disconnect`. That is the point: `StreamingResponse`
+    races the body against `listen_for_disconnect(receive)` and cancels the
+    body the moment a disconnect arrives, which is precisely the teardown a
+    detached run must not be subject to. The client's own connection is
+    watched by the tail response instead, where hanging up is harmless.
+    """
+    delivered = False
+    forever = asyncio.Event()
+
+    async def receive() -> Message:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await forever.wait()  # the handler is done with the request
+        raise AssertionError("unreachable")
+
+    return receive
+
+
+class SSEReplayMiddleware:
     """Detach harness-run SSE bodies into per-thread replay logs; serve re-attaches.
 
     Covers `POST /` and `POST /harnesses/{id}` (a thread pins to one harness, so
-    the thread-keyed log is unambiguous)."""
+    the thread-keyed log is unambiguous).
 
-    async def dispatch(self, request: Request, call_next):
+    Pure ASGI, deliberately, and not `BaseHTTPMiddleware`: that base runs the
+    inner app inside the *request's* task group, so a client disconnect cancels
+    the handler and closes the stream the pump is draining. Detaching the run is
+    this module's whole purpose, and it cannot be done from inside a scope the
+    client can collapse.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        # Detached pumps are only referenced by the event loop; without a strong
+        # reference they are fair game for the garbage collector mid-run.
+        self._runs: set[asyncio.Task] = set()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         ttl = _ttl()
-        if ttl <= 0 or request.method != "POST" or not _is_run_path(request.url.path):
-            return await call_next(request)
+        if (
+            scope["type"] != "http"
+            or ttl <= 0
+            or scope.get("method") != "POST"
+            or not _is_run_path(scope.get("path", ""))
+        ):
+            return await self.app(scope, receive, send)
 
-        body = await request.body()  # cached by Starlette; downstream re-reads fine
+        body = await _read_body(receive)
+        if body is None:
+            return
         thread_id, after_seq = _extract(body)
         _sweep(ttl)
 
@@ -431,7 +488,7 @@ class SSEReplayMiddleware(BaseHTTPMiddleware):
         if thread_id is not None and after_seq is not None:
             log = _LOGS.get(thread_id)
             if log is None:
-                return Response(status_code=204)
+                return await Response(status_code=204)(scope, receive, send)
             logger.info(
                 "sse_replay: reattach thread_id=%s after_seq=%d (next=%d live=%d)",
                 thread_id, after_seq, log.next_seq, log.live_pumps,
@@ -439,26 +496,80 @@ class SSEReplayMiddleware(BaseHTTPMiddleware):
             # The client is demonstrably alive: let any loop parking a turn on
             # this thread re-arm its liveness clock.
             notify_reattach(thread_id)
-            return StreamingResponse(
+            response = StreamingResponse(
                 log.tail(after_seq),
                 media_type=_SSE_MEDIA_TYPE,
                 headers=_replay_headers(log),
             )
+            return await response(scope, receive, send)
 
-        # --- Normal run: detach the handler stream into the log. ------------
-        response = await call_next(request)
-        if thread_id is None or not _is_sse(response):
-            return response
+        # --- Normal run: detach the handler from this connection. -----------
+        state: dict[str, Any] = {"log": None, "sse": False}
+        started = asyncio.Event()
+        splitter = FrameSplitter()
 
-        log = _get_or_create(thread_id)
-        start_seq = log.next_seq - 1  # tail everything this run appends
-        log.mark_pump_started()
-        asyncio.ensure_future(_pump(response.body_iterator, log))
+        async def capture(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                state["start"] = message
+                state["sse"] = thread_id is not None and _is_sse_start(message)
+                if state["sse"]:
+                    log = _get_or_create(thread_id)
+                    log.mark_pump_started()
+                    state["log"] = log
+                    state["start_seq"] = log.next_seq - 1
+                else:
+                    await send(message)
+                started.set()
+                return
+            if message["type"] != "http.response.body":
+                return await send(message)
+            log = state["log"]
+            if log is None:
+                return await send(message)
+            chunk = message.get("body", b"")
+            if isinstance(chunk, str):  # StreamingResponse allows str chunks
+                chunk = chunk.encode("utf-8")
+            for frame in splitter.feed(chunk):
+                if not _is_comment(frame):
+                    log.append(frame)
+            if not message.get("more_body", False):
+                trailing = splitter.flush()
+                if trailing is not None and not _is_comment(trailing):
+                    log.append(trailing)
 
-        return StreamingResponse(
-            log.tail(start_seq),
-            status_code=response.status_code,
-            headers={**dict(response.headers), **_replay_headers(log)},
-            media_type=response.media_type or _SSE_MEDIA_TYPE,
-            background=response.background,
+        async def run() -> None:
+            try:
+                await self.app(scope, _detached_receive(body), capture)
+            except asyncio.CancelledError:  # app shutdown
+                raise
+            except Exception:  # noqa: BLE001 — agent error; tails end cleanly
+                logger.exception("sse_replay: run failed thread_id=%s", thread_id)
+            finally:
+                started.set()  # a handler that died before starting must not hang us
+                log = state["log"]
+                if log is not None:
+                    log.mark_pump_done()
+
+        task = asyncio.ensure_future(run())
+        self._runs.add(task)
+        task.add_done_callback(self._runs.discard)
+
+        await started.wait()
+        if not state["sse"]:
+            # Not ours: the handler is talking to the client directly, so this
+            # request is only over when it is.
+            return await task
+
+        # Ours: hand the client a tail over the log and let the run outlive it.
+        log = state["log"]
+        response = StreamingResponse(
+            log.tail(state["start_seq"]),
+            status_code=state["start"]["status"],
+            headers={
+                **{k.decode("latin-1"): v.decode("latin-1")
+                   for k, v in state["start"].get("headers", [])},
+                **_replay_headers(log),
+            },
+            media_type=_SSE_MEDIA_TYPE,
         )
+        await response(scope, receive, send)
