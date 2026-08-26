@@ -318,3 +318,31 @@ async def test_new_turn_retires_the_parked_session_gracefully(
     )
 
     await registry.remove("wake-thread")
+
+
+async def test_a_new_turn_evicts_sessions_other_threads_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing else reaps `_REGISTRY`.
+
+    `sweep_idle` existed but was never called from anywhere, so a client that
+    started a turn and never came back left its session — and the SDK transport
+    behind it — held for the life of the process. The sweep runs on the
+    new-turn path now, on the same lazy idiom the replay log uses.
+    """
+    _RecordingSDKClient.instances.clear()
+    app = _app(monkeypatch)
+
+    stale = registry.create("abandoned-thread")
+    # Older than the idle timeout: its client is long gone.
+    stale.last_activity -= 10_000
+    assert registry.get("abandoned-thread") is not None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await asyncio.wait_for(
+            client.post("/", json=_body("live-thread", "r1")), timeout=5.0
+        )
+
+    assert registry.get("abandoned-thread") is None, "the abandoned session was kept"
+    await registry.retire("live-thread")

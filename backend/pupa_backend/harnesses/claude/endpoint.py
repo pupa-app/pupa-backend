@@ -797,6 +797,14 @@ def register_claude_loop_endpoint(
             return _stream(parked)
 
         # --- New-turn POST: build the session and start the pump ---------------
+        # Evict whatever other threads abandoned, on the same lazy-sweep idiom
+        # as the replay log: nothing else ever reaps `_REGISTRY`, so a client
+        # that never came back left its session — and its SDK transport — held
+        # for the life of the process. A parked turn is bounded far below the
+        # idle timeout and a backgrounded client keeps touching its own session,
+        # so anything this old is genuinely gone.
+        await registry.sweep_idle()
+
         # Any session still on this thread is parked mid-tool-call (the app went
         # away and came back with something new). Wind it down cleanly first —
         # closing its transport from under an in-flight hook leaves the SDK
