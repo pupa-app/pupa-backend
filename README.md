@@ -164,6 +164,20 @@ environment wins when both are set.
 | **Sub-agents** | on by default | `PUPA_SUBAGENTS_DISABLED=1` | Lets your own model hand parts of a job to specialist helpers. |
 | **Skills** | on by default, `skills_disabled: true` to turn off | `PUPA_SKILLS_DISABLED=1` | Reusable instructions you drop in `~/.pupa-backend/skills/`, loaded only when relevant. Starts empty. |
 
+Anything not in that table can go under an `env:` block, which is passed through
+to the backend as-is:
+
+```yaml
+env:
+  SOME_SDK_TOKEN: ...
+```
+
+That block is the only way to give a setting to the background service
+(`pupa-backend service-install`), which — unlike `pupa-backend run` — does not
+inherit your shell. If you keep a key in `~/.zshrc`, the service can't see it,
+and install will stop and tell you so rather than leave you with a service that
+won't start.
+
 Conversation history is kept for you automatically: on your machine by default,
 or in Postgres if you point `DATABASE_URL` at one.
 

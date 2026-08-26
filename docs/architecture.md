@@ -18,7 +18,25 @@ in-process dispatcher for `run` / `stop` / `status` / `pair` / `setup` / `mcp`
 The server process is launched as `python -m pupa_backend.app` (Makefile,
 Dockerfile, Railway `startCommand`, and the generated launchd/systemd unit in
 [`service.py`](../backend/pupa_backend/scripts/service.py)); `pupa-backend run`
-calls the same `pupa_backend.app:main`. The version an app sees at
+calls the same `pupa_backend.app:main`.
+
+The two differ in **environment**. `run` is a child of your shell and inherits
+its exports; the service inherits nothing and reads `~/.pupa-backend/config.yml`
+itself (`app.py` calls `load_pupa_config()` at import). The generated unit
+therefore carries **only `PATH`** — launchd/systemd start with a minimal one and
+the backend can't reconstruct the operator's, so that single var has to be
+passed in. Nothing else is snapshotted: the unit would only duplicate what the
+process already reads, the plist is world-readable where config.yml is `0600`,
+and a snapshot goes stale the moment config.yml is edited.
+
+The consequence is that a credential exported only in a shell profile works
+interactively and is invisible to the service. `service-install` therefore
+refuses when it finds one, naming each var and the config.yml key it belongs
+under (`_assert_no_shell_only_secrets`; bypass with
+`PUPA_SERVICE_ALLOW_SHELL_ONLY=1`), rather than writing a unit that crash-loops
+in a log file. The var list is derived from `pupa_config.known_env_vars()` —
+the same maps the loader writes through, so it can't drift — plus whatever
+`service.check_env` adds. The version an app sees at
 `GET /auth/config` is `importlib.metadata.version("pupa-backend")` — the exact
 installed release, so a client can pin a compatible backend with
 `pipx install pupa-backend==0.0.X`. Publishing to PyPI is automatic: a push to
@@ -912,6 +930,16 @@ at startup. Shell env always wins. The schema covers:
   entry leaves `LLM_PROVIDER` unset and startup fails loudly).
   `openrouter` entries carry just `model` (→ `LLM_MODEL`) and an optional
   `api_key` (→ `OPENROUTER_API_KEY`, else from shell).
+- `env.*` — arbitrary env vars, passed through verbatim. The escape hatch
+  for anything the typed schema doesn't name (raw AWS keys, an MCP server's
+  token, a third-party SDK's var). Applied *before* the typed keys, so a
+  documented key wins on collision. It matters most for the OS service, which
+  inherits nothing from the operator's shell: without it, a var outside the
+  schema could only ever be set by exporting it in a terminal, and so could
+  never reach a background service.
+- `service.check_env` — extra var names for the `service-install` guard to
+  watch (see below). `known_env_vars()` already covers the whole typed schema;
+  this list adds the `env.*` ones, which have no schema entry to derive from.
 - `auth.api_key` — optional bootstrap key (the env var
   `PUPA_API_KEY` still wins).
 - `persistence.database_url` / `persistence.require_db_scheme` —

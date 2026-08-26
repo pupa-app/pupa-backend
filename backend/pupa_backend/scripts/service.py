@@ -19,7 +19,10 @@ import platform
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+
+from pupa_backend.pupa_config import known_env_vars
 
 LABEL = "com.pupa.backend"
 SERVICE_NAME = "pupa-backend"
@@ -63,6 +66,117 @@ def _service_path(env_dict: dict[str, str]) -> str:
     return os.pathsep.join(parts)
 
 
+def _unit_env() -> dict[str, str]:
+    """The env the generated unit carries. PATH, and nothing else.
+
+    `app.py` calls `load_pupa_config()` at import, so the service process reads
+    config.yml itself — snapshotting those values into the unit was redundant and
+    actively harmful. The plist is written 0644 while config.yml is 0600, so the
+    snapshot copied every secret into a world-readable file; and it froze at
+    install time, so editing config.yml did nothing until a reinstall.
+
+    PATH is the exception: launchd/systemd start with a minimal PATH and the
+    backend cannot reconstruct the operator's, so it has to be passed in.
+    """
+    from pupa_backend.pupa_config import load_pupa_config  # type: ignore[import]
+
+    # A PATH set under `env:` in config.yml wins; otherwise the installing
+    # process's own PATH is carried over.
+    return {"PATH": _service_path(load_pupa_config(apply=False))}
+
+
+# ---------------------------------------------------------------------------
+# Shell-only credential guard
+# ---------------------------------------------------------------------------
+
+_BYPASS_VAR = "PUPA_SERVICE_ALLOW_SHELL_ONLY"
+
+
+def _check_env_names(data: dict) -> list[str]:
+    """Operator-supplied extra var names from `service.check_env` in config.yml.
+
+    `known_env_vars()` covers everything the config *schema* can name. Vars that
+    only exist under the `env:` passthrough (raw AWS keys, an MCP server's token,
+    a third-party SDK's var) have no schema entry, so an operator lists them here
+    to have the install guard watch them too.
+    """
+    block = data.get("service")
+    if not isinstance(block, dict):
+        return []
+    names = block.get("check_env")
+    if not isinstance(names, list):
+        return []
+    return [str(n) for n in names if str(n).strip()]
+
+
+def _shell_only_secrets(
+    env_dict: dict[str, str],
+    extra: Sequence[str] = (),
+) -> list[str]:
+    """Vars set in the installing shell but absent from config.yml.
+
+    The candidate set is derived from `pupa_config.known_env_vars()` — the same
+    maps the loader writes through — plus `extra`, so nothing is hand-maintained
+    here. A var outside both is not reported: config.yml could not have set it
+    anyway, so there would be no fix to offer.
+    """
+    candidates = set(known_env_vars()) | set(extra)
+    return sorted(
+        name
+        for name in candidates
+        if os.environ.get(name) and not (env_dict.get(name) or "").strip()
+    )
+
+
+def _assert_no_shell_only_secrets(
+    env_dict: dict[str, str],
+    extra: Sequence[str] = (),
+) -> None:
+    """Abort the install rather than write a unit that will crash-loop.
+
+    `pupa-backend run` inherits the shell; a launchd agent / systemd unit does
+    not. Failing here — with the terminal still in front of the operator — beats
+    failing at startup inside a log file.
+    """
+    missing = _shell_only_secrets(env_dict, extra)
+    if not missing or os.environ.get(_BYPASS_VAR):
+        return
+
+    from pupa_backend.pupa_config import YAML_FILE  # type: ignore[import]
+
+    schema = known_env_vars()
+    width = max(len(n) for n in missing)
+    lines = [
+        "Refusing to install: these vars are set in your shell but missing from",
+        f"{YAML_FILE}:",
+        "",
+    ]
+    for name in missing:
+        # Vars outside the schema have no typed home — they go under `env:`.
+        hint = schema.get(name) or f"env.{name}"
+        lines.append(f"  {name:<{width}}  ->  config.yml: {hint}")
+    lines += [
+        "",
+        "A background service does not inherit your shell environment. `pupa-backend",
+        "run` works because it is a child of your terminal; the service is not, so",
+        "anything exported in ~/.zshrc or ~/.bashrc is invisible to it. Put these",
+        "values in config.yml (mode 0600), then re-run service-install.",
+        "",
+        f"To install anyway (the service starts without them): {_BYPASS_VAR}=1",
+    ]
+    sys.exit("\n".join(lines))
+
+
+def _guard_install_env() -> None:
+    """Run the shell-only guard against the operator's real config.yml."""
+    from pupa_backend.pupa_config import load_pupa_config, load_raw_config  # type: ignore[import]
+
+    _assert_no_shell_only_secrets(
+        load_pupa_config(apply=False),
+        extra=_check_env_names(load_raw_config()),
+    )
+
+
 # ---------------------------------------------------------------------------
 # macOS — launchd LaunchAgent
 # ---------------------------------------------------------------------------
@@ -74,13 +188,10 @@ def _launchd_plist_path() -> Path:
 def _launchd_plist(backend_dir: Path, python: Path) -> str:
     log_dir = _log_dir()
 
-    # Load config from config.yml (or .env legacy) without applying to os.environ.
-    from pupa_backend.pupa_config import load_pupa_config  # type: ignore[import]
-    env_dict = load_pupa_config(apply=False)
-    env_dict["PATH"] = _service_path(env_dict)
-
+    # PATH only — see `_unit_env`. Everything else is read from config.yml by the
+    # service process itself, at startup.
     env_vars = ""
-    for key, val in env_dict.items():
+    for key, val in _unit_env().items():
         val = val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         env_vars += f"        <key>{key}</key>\n        <string>{val}</string>\n"
 
@@ -129,6 +240,8 @@ def _launchd_plist(backend_dir: Path, python: Path) -> str:
 
 
 def _install_launchd(backend_dir: Path) -> None:
+    _guard_install_env()
+
     python = _service_python()
 
     plist_path = _launchd_plist_path()
@@ -189,10 +302,7 @@ def _systemd_env_line(key: str, value: str) -> str:
 
 
 def _systemd_unit(backend_dir: Path, python: Path) -> str:
-    from pupa_backend.pupa_config import load_pupa_config  # type: ignore[import]
-    env_dict = load_pupa_config(apply=False)
-    env_dict["PATH"] = _service_path(env_dict)
-    env_lines = "".join(_systemd_env_line(k, v) for k, v in env_dict.items())
+    env_lines = "".join(_systemd_env_line(k, v) for k, v in _unit_env().items())
 
     # StartLimit* belong in [Unit], not [Service] — systemd ignores them in
     # [Service], so the restart limiter would never engage on a crash loop.
@@ -219,6 +329,8 @@ WantedBy=default.target
 def _install_systemd(backend_dir: Path) -> None:
     if not shutil.which("systemctl"):
         sys.exit("systemctl not found — is systemd running?")
+
+    _guard_install_env()
 
     python = _service_python()
 

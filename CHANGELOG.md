@@ -4,6 +4,44 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.92] — 2026-08-25
+
+### Security
+
+- **The generated launchd plist no longer contains your secrets.**
+  `service-install` snapshotted every config value into the unit file, and the
+  plist is written `0644` while `~/.pupa-backend/config.yml` is `0600` — so
+  installing the service copied `PUPA_API_KEY`, `LANGFUSE_SECRET_KEY`, MCP
+  server tokens and the rest into a world-readable file. The unit now carries
+  only `PATH`. Re-run `pupa-backend service-install` to replace an existing
+  plist, and treat any key that was in it as exposed.
+
+### Fixed
+
+- **`service-install` no longer installs a service that can't start.** A
+  background service does not inherit your shell environment, but the generated
+  unit was built from config.yml alone — so a key exported in `~/.zshrc` worked
+  under `pupa-backend run` and vanished under the service, which then
+  crash-looped with an opaque `MissingCredentialsError` buried in
+  `~/.pupa-backend/logs/backend.log`. Install now checks the vars set in your
+  shell against config.yml and refuses, naming each one and the config.yml key
+  it belongs under. `PUPA_SERVICE_ALLOW_SHELL_ONLY=1` installs anyway.
+- **Editing config.yml no longer needs a service reinstall.** The unit's env
+  block was a snapshot taken at install time. The service now reads config.yml
+  at startup (it always did — the snapshot was redundant), so a restart is
+  enough.
+
+### Added
+
+- **`env:` block in config.yml** — arbitrary env vars, passed through verbatim,
+  for anything the typed schema doesn't name (raw AWS keys, an MCP server's
+  token, a third-party SDK's var). Previously those could only be exported in a
+  shell, which meant they could never reach the background service. A
+  documented key wins over `env:` on collision.
+- **`service.check_env`** — extra var names for the install guard to watch.
+  The guard derives its list from the config schema; this adds the `env:` ones,
+  which have no schema entry to derive from.
+
 ## [0.0.91] — 2026-08-25
 
 ### Changed

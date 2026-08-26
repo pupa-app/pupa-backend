@@ -88,6 +88,23 @@ def _flatten(d: dict, prefix: str = "") -> dict[str, object]:
     return out
 
 
+# Provider type → {config.yml field: env var}. The single source of truth for
+# per-provider fields: `_resolve_active_llm_provider` writes them out and
+# `known_env_vars` reads them back, so neither can drift from the other.
+# Every field is optional — an omitted one just isn't exported. OpenRouter's
+# base_url is fixed in agent.py, hence no entry.
+_LLM_PROVIDER_KEY_TO_ENV: dict[str, dict[str, str]] = {
+    "bedrock":           {"aws_profile": "AWS_PROFILE"},
+    "anthropic":         {"api_key": "ANTHROPIC_API_KEY"},
+    "openai_compatible": {
+        "base_url": "LLM_BASE_URL",
+        "api_key":  "LLM_API_KEY",
+        "model":    "LLM_MODEL",
+    },
+    "openrouter":        {"api_key": "OPENROUTER_API_KEY", "model": "LLM_MODEL"},
+}
+
+
 def _resolve_active_llm_provider(data: dict) -> dict[str, str]:
     """Extract LLM env vars from the llm_providers / default_llm_provider block.
 
@@ -123,27 +140,9 @@ def _resolve_active_llm_provider(data: dict) -> dict[str, str]:
         return {}
 
     result: dict[str, str] = {"LLM_PROVIDER": ptype}
-    if ptype == "bedrock":
-        if v := str(cfg.get("aws_profile") or "").strip():
-            result["AWS_PROFILE"] = v
-    elif ptype == "anthropic":
-        if v := str(cfg.get("api_key") or "").strip():
-            result["ANTHROPIC_API_KEY"] = v
-    elif ptype == "openai_compatible":
-        for cfg_key, env_key in (
-            ("base_url", "LLM_BASE_URL"),
-            ("api_key",  "LLM_API_KEY"),
-            ("model",    "LLM_MODEL"),
-        ):
-            if v := str(cfg.get(cfg_key) or "").strip():
-                result[env_key] = v
-    elif ptype == "openrouter":
-        # Native OpenRouter: base_url is fixed in agent.py. api_key is optional —
-        # blank falls back to OPENROUTER_API_KEY from the shell (shell wins on apply).
-        if v := str(cfg.get("api_key") or "").strip():
-            result["OPENROUTER_API_KEY"] = v
-        if v := str(cfg.get("model") or "").strip():
-            result["LLM_MODEL"] = v
+    for cfg_key, env_key in _LLM_PROVIDER_KEY_TO_ENV.get(ptype, {}).items():
+        if v := str(cfg.get(cfg_key) or "").strip():
+            result[env_key] = v
     return result
 
 
@@ -218,9 +217,55 @@ def _resolve_harnesses(data: dict) -> dict[str, str]:
 _FALSE_IS_MEANINGFUL: frozenset[str] = frozenset({"PUPA_TRUSTED_PROXY"})
 
 
+def _resolve_env_passthrough(data: dict) -> dict[str, str]:
+    """Serialise the top-level `env:` block — arbitrary env vars, verbatim.
+
+    The typed schema only knows vars someone added to `_YAML_TO_ENV`. `env:` is
+    the escape hatch for everything else (raw AWS keys, an MCP server's token, a
+    third-party SDK's var). It matters most for the OS service, which inherits
+    nothing from the operator's shell, so config.yml has to be able to express
+    every var the process needs.
+
+    Applied *before* the typed keys, so a documented key wins on collision.
+    """
+    block = data.get("env")
+    if not isinstance(block, dict) or not block:
+        return {}
+    result: dict[str, str] = {}
+    for name, v in block.items():
+        if isinstance(v, bool):
+            if v:
+                result[str(name)] = "1"
+        elif v is not None and str(v).strip():
+            result[str(name)] = str(v)
+    return result
+
+
+def known_env_vars() -> dict[str, str]:
+    """Every env var config.yml can set → the config key that sets it.
+
+    Derived from the same maps `_yaml_to_env_dict` writes through, so it cannot
+    drift from what the loader actually supports. Used by `scripts/service.py`
+    to tell an operator which shell-only var belongs where in config.yml.
+
+    Excludes the `env:` passthrough, whose names are per-config rather than
+    schema — those carry no fixed home to point at.
+    """
+    known = {env_var: yaml_key for yaml_key, env_var in _YAML_TO_ENV.items()}
+    known["LLM_PROVIDER"] = "llm_providers.<name>.provider"
+    for mapping in _LLM_PROVIDER_KEY_TO_ENV.values():
+        for cfg_key, env_var in mapping.items():
+            known[env_var] = f"llm_providers.<name>.{cfg_key}"
+    known["PUPA_MCP_SERVERS"] = "mcp_servers"
+    known["PUPA_HARNESSES"] = "harnesses"
+    for cfg_key, env_var in _CLAUDE_HARNESS_KEY_TO_ENV.items():
+        known[env_var] = f"harnesses.claude_code.{cfg_key}"
+    return known
+
+
 def _yaml_to_env_dict(data: dict) -> dict[str, str]:
     flat = _flatten(data)
-    result: dict[str, str] = {}
+    result: dict[str, str] = _resolve_env_passthrough(data)
     for yaml_key, env_var in _YAML_TO_ENV.items():
         v = flat.get(yaml_key)
         if v is None:
@@ -239,21 +284,29 @@ def _yaml_to_env_dict(data: dict) -> dict[str, str]:
     return result
 
 
+def load_raw_config() -> dict:
+    """Parsed config.yml as-is — `{}` when the file is absent.
+
+    The typed loader maps this onto env vars; callers that need a block the env
+    mapping doesn't cover (e.g. `service.check_env`) read it from here rather
+    than re-implementing the parse.
+    """
+    import yaml  # type: ignore[import]
+
+    if not YAML_FILE.exists():
+        return {}
+    return yaml.safe_load(YAML_FILE.read_text()) or {}
+
+
 def load_pupa_config(apply: bool = True) -> dict[str, str]:
     """Read config.yml and return {ENV_VAR: value}.
 
     When apply=True (default) each var is written to os.environ only if the
     shell hasn't already set it (shell env always wins).
     Pass apply=False to get the dict without touching os.environ — used by
-    service.py when building the launchd/systemd env block.
+    `scripts/service.py` to check an install against the operator's shell.
     """
-    import yaml  # type: ignore[import]
-
-    if not YAML_FILE.exists():
-        return {}
-
-    data = yaml.safe_load(YAML_FILE.read_text()) or {}
-    env_dict = _yaml_to_env_dict(data)
+    env_dict = _yaml_to_env_dict(load_raw_config())
 
     if apply:
         for k, v in env_dict.items():
