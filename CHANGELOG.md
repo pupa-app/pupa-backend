@@ -4,6 +4,23 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.94] — 2026-08-27
+
+### Fixed
+
+- **A client that never came back no longer holds a session forever.** Every
+  abandoned turn left its agent session — and the Claude Code transport behind
+  it — held for the life of the process. The eviction sweep existed but nothing
+  ever called it; it now runs when the next turn starts, the same way the replay
+  log is swept.
+
+### Internal
+
+- The keep-alive and replay middlewares are pinned in the order the
+  architecture doc describes. Every auth guard mounts as `BaseHTTPMiddleware`,
+  so the existing wiring test could not see the transport pair at all — and
+  that order is load-bearing.
+
 ## [0.0.93] — 2026-08-26
 
 ### Fixed

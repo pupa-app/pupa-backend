@@ -45,6 +45,23 @@ def dispatch_stack() -> list[Any]:
     return [m.kwargs["dispatch"] for m in app.user_middleware if "dispatch" in m.kwargs]
 
 
+@pytest.fixture
+def middleware_classes() -> list[Any]:
+    """Every mounted middleware class, outermost first.
+
+    `dispatch_stack` only sees the function-style guards; the transport
+    middlewares are classes and are invisible to it, which is how their order
+    went unpinned while the docs claimed otherwise.
+    """
+    snapshot = dict(os.environ)
+    try:
+        from pupa_backend.app import app
+    finally:
+        os.environ.clear()
+        os.environ.update(snapshot)
+    return [m.cls for m in app.user_middleware]
+
+
 def test_headers_wrap_everything(dispatch_stack: list[Any]) -> None:
     """Outermost, so the guards' own 403/429 responses carry the headers too —
     those never reach the inner stack."""
@@ -395,3 +412,46 @@ def test_the_loopback_check_covers_the_whole_127_range(monkeypatch) -> None:
     assert not _is_loopback("192.168.1.5")
     # A hostname we can't cheaply resolve fails closed — treated as reachable.
     assert not _is_loopback("my-laptop.local")
+
+
+def test_replay_is_the_innermost_middleware(middleware_classes: list[Any]) -> None:
+    """The replay pump must wrap the route and nothing else.
+
+    It detaches the handler's body into the log; anything mounted inside it
+    would sit between the pump and the run it is buffering.
+    """
+    from pupa_backend.sse_replay import SSEReplayMiddleware
+
+    assert middleware_classes[-1] is SSEReplayMiddleware
+
+
+def test_keepalive_wraps_replay(middleware_classes: list[Any]) -> None:
+    """Keep-alive comments must be added outside the replay pump.
+
+    Inside it they would be stamped with sequence numbers and buffered as if
+    they were agent output; `_pump` drops comment frames precisely because the
+    ordering is meant to keep them out in the first place.
+    """
+    from pupa_backend.sse_keepalive import SSEKeepAliveMiddleware
+    from pupa_backend.sse_replay import SSEReplayMiddleware
+
+    assert middleware_classes.index(SSEKeepAliveMiddleware) < middleware_classes.index(
+        SSEReplayMiddleware
+    )
+
+
+def test_the_transport_middlewares_are_the_innermost_pair(
+    middleware_classes: list[Any],
+) -> None:
+    """Keep-alive then replay, inside everything else.
+
+    Every guard is a function-style middleware and so mounts as
+    `BaseHTTPMiddleware` — indistinguishable from each other by class. Pinning
+    the pair as the innermost two says the same thing from the other side: no
+    guard is inside them, so an unauthenticated request cannot reach the replay
+    log and allocate a ring for a thread id it made up.
+    """
+    from pupa_backend.sse_keepalive import SSEKeepAliveMiddleware
+    from pupa_backend.sse_replay import SSEReplayMiddleware
+
+    assert middleware_classes[-2:] == [SSEKeepAliveMiddleware, SSEReplayMiddleware]
