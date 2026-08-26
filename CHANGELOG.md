@@ -4,6 +4,30 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.93] — 2026-08-26
+
+### Fixed
+
+- **A turn no longer dies with the app that started it.** Closing the client
+  mid-turn killed the run on the server: the agent stopped where it stood, its
+  output was never buffered, and the re-attach that followed the client's
+  relaunch found nothing to serve — the turn came back reported as finished
+  with the work gone. The run now continues to its end and the client picks up
+  everything it missed.
+
+  This is the behaviour `sse_replay` has always documented; it was not the
+  behaviour it had. `SSEReplayMiddleware` was a `BaseHTTPMiddleware`, which
+  runs the inner app inside the request's own task group, so a disconnect
+  collapsed the handler and the pump together. It is plain ASGI now, and the
+  run is genuinely detached. No test covered the claim — the only one that came
+  close said in its own docstring that it could not simulate a real
+  disconnect. One does now, over a real ASGI `http.disconnect`.
+
+  Fixed once, above the harness boundary, so every loop inherits it: the
+  Claude Code producer already survived on its own and simply had nowhere to
+  put its output, and the deepagents generator now survives because the pump
+  outlives the connection driving it.
+
 ## [0.0.92] — 2026-08-25
 
 ### Security

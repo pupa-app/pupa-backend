@@ -98,6 +98,16 @@ monotonic per-thread sequence number (the SSE `id:` field) into an in-memory
 `ReplayLog` ring, while the response body is merely a tail reader over that log.
 A client disconnect closes the tail only — **the run keeps going**.
 
+That last sentence is why the middleware is plain ASGI rather than a
+`BaseHTTPMiddleware`: the Starlette base runs the inner app inside the
+*request's* task group, so a disconnect cancels the handler and closes the
+stream the pump is draining. Detaching a run cannot be done from inside a scope
+the client can collapse. For the same reason the handler is given a `receive`
+that never reports `http.disconnect` — `StreamingResponse` races the body
+against `listen_for_disconnect` and cancels it the moment one arrives. The
+client's own connection is watched by the tail response, where hanging up is
+harmless.
+
 A client that lost its socket re-attaches by POSTing
 `forwardedProps.command.reattach.after_seq`; the middleware short-circuits that
 request before either agent loop sees it and replays every frame with a higher

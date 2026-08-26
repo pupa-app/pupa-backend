@@ -167,6 +167,90 @@ async def test_reattach_unknown_thread_is_204(monkeypatch) -> None:
     assert r.status_code == 204
 
 
+async def _drive_until_disconnect(app, body: bytes, produced: list) -> None:
+    """Run one POST through the raw ASGI interface and hang up mid-stream.
+
+    `httpx.ASGITransport` buffers whole responses, so it cannot express this;
+    a real disconnect is the whole point here.
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},  # what uvicorn sends
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "headers": [(b"content-type", b"application/json"), (b"host", b"test")],
+        "client": ("127.0.0.1", 1234),
+        "server": ("test", 80),
+    }
+    sent_body = False
+    disconnected = asyncio.Event()
+
+    async def receive():
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    chunks = 0
+
+    async def send(message):
+        nonlocal chunks
+        if message["type"] == "http.response.body" and message.get("body"):
+            chunks += 1
+            if chunks == 1:
+                # The client is gone from here on.
+                disconnected.set()
+
+    await app(scope, receive, send)
+
+
+async def test_run_survives_a_real_client_disconnect(monkeypatch) -> None:
+    """The promise in this module's docstring, exercised over a real ASGI
+    disconnect rather than at the generator level.
+
+    A client that dies mid-turn must not take the run with it: the agent keeps
+    producing, the pump keeps logging, and the re-attach that follows the
+    client's relaunch serves what it missed. Without that the turn is lost —
+    the client reattaches, finds nothing past its cursor, and reports the turn
+    settled with the work gone.
+    """
+    app = _app(monkeypatch)
+    produced: list[int] = []
+    finished = asyncio.Event()
+
+    @app.post("/")
+    async def run() -> StreamingResponse:
+        async def body():
+            for i in range(6):
+                produced.append(i)
+                yield f"id: {i}\ndata: frame-{i}\n\n".encode()
+                await asyncio.sleep(0.01)
+            finished.set()
+
+        return StreamingResponse(body(), media_type="text/event-stream")
+
+    import json
+
+    await _drive_until_disconnect(app, json.dumps(_run_body()).encode(), produced)
+
+    # The run must reach its end even though nobody was listening.
+    await asyncio.wait_for(finished.wait(), timeout=2)
+    assert produced == list(range(6)), f"the run stopped when the client did: {produced}"
+
+    # And what it produced must be reattachable.
+    resp = await _post(app, _reattach_body(after_seq=-1))
+    assert resp.status_code == 200, "the thread was evicted with the socket"
+    seqs = [seq for seq, _ in _events(resp.content)]
+    assert len(seqs) == 6, f"the tail lost frames produced after the disconnect: {seqs}"
+
+
 async def test_tail_close_does_not_kill_pump_or_other_tails() -> None:
     """The core promise, exercised at the generator level (httpx's
     ASGITransport buffers whole responses, so it cannot simulate a real
