@@ -2,14 +2,11 @@
 
 Run via `make pair` (which sets `BACKEND_URL` + reads `PUPA_API_KEY`).
 Posts to `/auth/pair/begin` and prints the code in big letters so the
-operator can show it to whoever's pairing. When the `qrcode` package is
-installed (via `uv pip install -e '.[setup]'`), also renders a QR code
-encoding a `pupa-pair://` URL so the iOS user can scan to pair
-without typing the code.
+operator can show it to whoever's pairing. Also renders a QR code encoding a
+`pupa-pair://` URL so the iOS user can scan to pair without typing the code.
 
 Standalone Python (stdlib `urllib`) so it works wherever `make` works — no
-extra deps, no `httpx` / `requests`. QR output is opt-in via the `qrcode`
-extra.
+extra deps, no `httpx` / `requests`.
 """
 
 from __future__ import annotations

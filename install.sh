@@ -106,9 +106,9 @@ if [ "$CLI_ONLY" = false ]; then
   make install-backend
   info "Backend deps installed ✓"
 
-  step "Installing setup extras (qrcode + cryptography for TLS and QR pairing)…"
-  cd backend && uv pip install -e '.[setup]' && cd ..
-  info "Setup extras installed ✓"
+  step "Installing the pupa-backend package…"
+  cd backend && uv pip install -e . && cd ..
+  info "Package installed ✓"
 
   # ── Run the setup wizard ─────────────────────────────────────────────────────
 

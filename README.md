@@ -33,8 +33,8 @@ Install from PyPI with [uv](https://docs.astral.sh/uv/). This puts the
 `pupa-backend` command on your PATH:
 
 ```bash
-uv tool install "pupa-backend[setup]"          # latest
-uv tool install "pupa-backend[setup]==0.0.72"  # or pin a version your app is happy with
+uv tool install pupa-backend            # latest
+uv tool install pupa-backend==0.0.72    # or pin a version your app is happy with
 ```
 
 Or use the one-line installer, which sets up `uv` for you and runs the setup

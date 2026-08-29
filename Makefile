@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install install-local install-backend install-playwright install-setup install-cli setup backend backend-shell backend-open backend-keyed backend-tunneled tunnel tunnel-named tunneled pair screenshare screenshare-viewer service-install service-uninstall service-status test test-backend clean
+.PHONY: help install install-local install-backend install-playwright install-cli setup backend backend-shell backend-open backend-keyed backend-tunneled tunnel tunnel-named tunneled pair screenshare screenshare-viewer service-install service-uninstall service-status test test-backend clean
 
 BACKEND := backend
 SCREENSHARE := screenshare-sidecar
@@ -15,13 +15,10 @@ help:  ## Show this help
 
 install: install-backend  ## Install backend deps (uv)
 
-install-local: install-backend install-setup setup install-cli  ## Full install from inside the repo (deps + setup wizard + CLI)
+install-local: install-backend setup install-cli  ## Full install from inside the repo (deps + setup wizard + CLI)
 
 install-backend:  ## Install backend deps via uv sync (respects uv.lock)
 	cd $(BACKEND) && uv sync
-
-install-setup:  ## Install setup extras (qrcode + cryptography + pyyaml for TLS cert gen and QR pairing)
-	cd $(BACKEND) && uv sync --extra setup
 
 install-cli:  ## Install the pupa-backend CLI to ~/.local/bin/
 	@bash install.sh --local --cli-only
