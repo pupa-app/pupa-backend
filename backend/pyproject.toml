@@ -1,6 +1,6 @@
 [project]
 name = "pupa-backend"
-version = "0.0.94"
+version = "0.0.95"
 description = "Pupa A2UI agent backend"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,10 @@ dependencies = [
     "langfuse>=3.0.0,<4.0.0",
     "deepagents>=0.6.0",
     "qrcode>=8.0.0",
+    # TLS cert generation in the setup wizard and the cert sanity check in
+    # tls_check.py. Arrives transitively via fastmcp -> authlib anyway; pinned
+    # here so those code paths do not depend on someone else's dependency.
+    "cryptography>=49.0.0",
     # MCP client plumbing for the config-driven `mcp_servers:` block
     # (backend/mcp_servers.py). Shipped by default — not optional — so every
     # install resolves FastMCP 3.x. The `>=0.2.2` floor keeps the resolver off
@@ -49,10 +53,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-setup = [
-    "cryptography>=49.0.0",
-    "pyyaml>=6.0",
-]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=0.23.0",

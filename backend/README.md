@@ -12,8 +12,8 @@ Install from PyPI with [uv](https://docs.astral.sh/uv/) (isolated tool venv, put
 the `pupa-backend` CLI on your PATH):
 
 ```bash
-uv tool install "pupa-backend[setup]"          # latest
-uv tool install "pupa-backend[setup]==0.0.72"  # pin to match your app
+uv tool install pupa-backend            # latest
+uv tool install pupa-backend==0.0.72    # pin to match your app
 ```
 
 ## Quick start

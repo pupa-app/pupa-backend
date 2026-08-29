@@ -19,7 +19,6 @@ import platform
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".pupa-backend"
@@ -394,20 +393,12 @@ def _generate_tls_cert(hostname: str) -> tuple[Path, Path, str]:
     """Generate a self-signed CA + server cert in ~/.pupa-backend/tls/.
 
     Returns (cert_path, key_path, sha256_fingerprint_hex).
-    Requires `cryptography` package (installed via `uv pip install -e '.[setup]'`).
     """
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.x509.oid import NameOID
-        import datetime
-    except ImportError:
-        print()
-        print("  [!] 'cryptography' package not found.")
-        print("      Install setup extras first:")
-        print("      cd backend && uv pip install -e '.[setup]'")
-        sys.exit(1)
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime
 
     TLS_DIR.mkdir(parents=True, exist_ok=True)
     cert_path = TLS_DIR / "server.crt"
@@ -474,14 +465,7 @@ def _generate_tls_cert(hostname: str) -> tuple[Path, Path, str]:
 
 def _write_yaml(config: dict) -> None:
     """Write config dict to ~/.pupa-backend/config.yml."""
-    try:
-        import yaml  # type: ignore[import]
-    except ImportError:
-        print()
-        print("  [!] 'pyyaml' package not found.")
-        print("      Install setup extras first:")
-        print("      cd backend && uv pip install -e '.[setup]'")
-        sys.exit(1)
+    import yaml  # type: ignore[import]
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     header = (

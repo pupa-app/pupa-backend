@@ -4,6 +4,33 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.95] — 2026-08-29
+
+### Changed
+
+- **Installing is now `uv tool install pupa-backend`.** The `[setup]` extra is
+  gone. It resolved to `cryptography` and `pyyaml`, both of which every install
+  already had: `pyyaml` was a base dependency, and `cryptography` arrives
+  through `fastmcp` -> `authlib`. So the extra pulled in nothing while making
+  every user type shell-quoted brackets, which fail outright in zsh without the
+  quotes. `cryptography` is now a declared base dependency, so the TLS paths no
+  longer lean on someone else's dependency tree. The resolved package set is
+  unchanged.
+
+  Nothing to change if you already have the old command in a script: uv only
+  warns about an extra a package no longer declares, then installs the same
+  thing.
+
+### Fixed
+
+- The setup wizard no longer dies with `cd backend && uv pip install -e
+  '.[setup]'` when generating a TLS cert. That branch could only be reached by
+  someone who installed from source, yet it was shown to anyone who installed
+  from PyPI, where there is no `backend/` directory to cd into.
+- A missing `cryptography` no longer silently disables the check that warns
+  about self-signed certs Apple clients refuse (over 398 days). The guard
+  swallowed the ImportError and returned, so the warning just vanished.
+
 ## [0.0.94] — 2026-08-27
 
 ### Fixed

@@ -19,13 +19,10 @@ def warn_unusable_cert(cert_path: str) -> None:
     iOS/macOS reject TLS server certs valid for more than 398 days, and reject
     any cert past its notAfter — both *before* the client's fingerprint pinning
     runs, so the app just reports "the backend refused a secure connection".
-    Certs minted by older setup runs were 10-year, hence unusable. Silent when
-    `cryptography` isn't installed (it ships with the `[setup]` extra).
+    Certs minted by older setup runs were 10-year, hence unusable.
     """
-    try:
-        from cryptography import x509
-    except ImportError:
-        return
+    from cryptography import x509
+
     try:
         cert = x509.load_pem_x509_certificate(Path(cert_path).read_bytes())
     except (OSError, ValueError) as exc:
