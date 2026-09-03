@@ -412,15 +412,15 @@ async def test_task_updated_patch_status_is_terminal(loop_app) -> None:
 # Regressions from the first review round
 # --------------------------------------------------------------------------- #
 
-async def test_permission_ask_with_no_run_open_denies_instead_of_parking(
+async def test_an_ask_the_user_cannot_see_is_recorded_as_undelivered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Nobody can answer a question asked between runs.
+    """Delivery is recorded, not inferred.
 
-    Parking the future would silently consume the user's next message as the
-    answer (the endpoint checks `pending_decision` before the new-turn branch)
-    and leave that run with no terminal event. Deny, and leave a note that
-    surfaces on the next run.
+    Neither `run_open` nor the background hold identifies "nobody can answer" on
+    its own — a turn parked on a frontend tool call has no open run either, and
+    its ask *is* delivered on the resume's SSE. What matters is whether the text
+    left the backlog, so that is what gets recorded.
     """
     from pupa_backend.harnesses.claude import gate
 
@@ -429,25 +429,28 @@ async def test_permission_ask_with_no_run_open_denies_instead_of_parking(
     monkeypatch.delenv("PUPA_CLAUDE_LOOP_AUTO_APPROVE", raising=False)
     session = registry.LiveSession(thread_id="t-perm-bg")
     session.current_run_id = "r1"
-    session.run_open = False  # no SSE attached...
-    session.background.start("bg-1", "long job")
-    session.background.hold()  # ...because the session is held for background work
+    session.run_open = False
     hook = gate.make_pre_tool_use_hook({}, session)
-
-    decision = await asyncio.wait_for(
-        hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None),
-        timeout=2,
+    task = asyncio.ensure_future(
+        hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None)
     )
+    await _settle(lambda: session.pending_decision is not None)
 
-    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert session.pending_decision is None, "armed a future nobody can resolve"
-    assert session.queue.qsize() == 0, "the note jumped ahead of the next RunStarted"
+    assert session.pending_decision_delivered is False
+    assert session.queue.qsize() == 0, "the ask jumped ahead of the next RunStarted"
     assert len(session.deferred) == 3  # start / content / end, held for the next run
 
+    # Opening a run releases the backlog, so from then on it *is* delivered.
+    session.open_run("r2", object())
+    assert session.pending_decision_delivered is True
 
-async def test_a_deferred_permission_note_does_not_eat_the_next_message(loop_app) -> None:
-    """End to end: the user's next message must reach the model, not be read as
-    a yes/no to a question they never saw."""
+    session.pending_decision.set_result(False)
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_an_undelivered_ask_does_not_eat_the_next_message(loop_app) -> None:
+    """The endpoint reads the next message as the yes/no. An ask the user never
+    saw must be denied instead — and their message must reach the model."""
     _FakeSDKClient.script = [
         [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
         [_assistant("answering", "m-2"), _result()],
@@ -460,17 +463,24 @@ async def test_a_deferred_permission_note_does_not_eat_the_next_message(loop_app
 
         from pupa_backend.harnesses.claude import gate
 
-        assert await gate._ask_user(session, "Bash", {"command": "ls"}) is False
-        assert session.pending_decision is None
+        ask = asyncio.ensure_future(gate._ask_user(session, "Bash", {"command": "ls"}))
+        await _settle(lambda: session.pending_decision is not None)
+        assert session.pending_decision_delivered is False
 
-        events = await asyncio.wait_for(
+        response = await asyncio.wait_for(
             client.post("/", json=_body("run-2", "what is the weather?")), timeout=5
         )
 
-    types = [e["type"] for e in _sse(events.text)]
+    assert await asyncio.wait_for(ask, timeout=1) is False  # denied, fail-closed
+    events = _sse(response.text)
+    types = [e["type"] for e in events]
     assert types[0] == "RUN_STARTED"
     assert types[-1] == "RUN_FINISHED"
+    assert {e.get("runId") for e in events if e.get("runId")} == {"run-2"}
     assert _FakeSDKClient.instances[0].queries[-1] == "what is the weather?"
+    # The question still reaches the user, as part of this run.
+    text = "".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT")
+    assert "I need your permission" in text
 
 
 def test_a_status_less_patch_does_not_resurrect_a_finished_task() -> None:
@@ -664,12 +674,15 @@ async def test_a_parked_frontend_call_still_gets_a_permission_prompt() -> None:
     session = registry.LiveSession(thread_id="t-parked-ask")
     session.current_run_id = "r1"
     session.run_open = False          # the pump emitted an interrupt for a device call
-    assert not session.background.holding  # ...not held for background work
 
     task = asyncio.ensure_future(gate._ask_user(session, "Bash", {"command": "ls"}))
     await _settle(lambda: session.pending_decision is not None)
 
     assert session.pending_decision is not None, "denied an ask the user could answer"
+    # The resume POST releases the backlog, so the ask reaches them and their
+    # next message is a real answer to it.
+    session.open_run("r2", object())
+    assert session.pending_decision_delivered is True
     session.pending_decision.set_result(True)
     assert await asyncio.wait_for(task, timeout=1) is True
 
@@ -702,12 +715,24 @@ def test_the_failsafe_trim_never_orphans_a_frame(monkeypatch: pytest.MonkeyPatch
         else:
             assert e.message_id in open_frames, f"orphaned {e.type} for {e.message_id}"
 
-    # A later delta of a frame whose START was dropped is dropped too, rather
-    # than heading a backlog with no START.
+    # A later delta of a frame whose `START` was dropped is dropped too — on the
+    # live SSE as much as in the backlog, so a run opening mid-frame can't put an
+    # orphan on the wire. (Here the frames above all closed, so use one that
+    # never did.)
     session.deferred.clear()
-    session.defer(TextMessageContentEvent(
-        type=EventType.TEXT_MESSAGE_CONTENT, message_id="m0", delta="late"))
+    for i in range(40):
+        session.defer(TextMessageStartEvent(
+            type=EventType.TEXT_MESSAGE_START, message_id=f"open{i}", role="assistant"))
+    assert session.dropped_frames, "nothing was dropped, so nothing to suppress"
+    dropped_id = next(iter(session.dropped_frames))
+    session.deferred.clear()
+    late = TextMessageContentEvent(
+        type=EventType.TEXT_MESSAGE_CONTENT, message_id=dropped_id, delta="late")
+    assert session.route(late) is False
     assert session.deferred == []
+    session.run_open = True
+    assert session.route(late) is False
+    assert session.queue.qsize() == 0
 
 
 def test_trimming_does_not_log_or_rebuild_on_every_event(
@@ -818,3 +843,27 @@ async def test_harness_sweep_evicts_an_expired_hold() -> None:
         await _settle(lambda: registry.get("thread-expired") is None, timeout=3.0)
     finally:
         task.cancel()
+
+
+def test_the_trim_converges_on_a_tool_call_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A background subagent's injected turn is a tool-call loop — `START` /
+    `ARGS` / `END`, only a third of it trimmable. Body-only trimming falls further
+    behind on every batch, so the backlog grows without bound and logs a warning
+    per event."""
+    from ag_ui.core import EventType
+    from ag_ui.core.events import ToolCallArgsEvent, ToolCallEndEvent, ToolCallStartEvent
+
+    monkeypatch.setattr(registry, "_MAX_DEFERRED", 100)
+    monkeypatch.setattr(registry, "_TRIM_SLACK", 20)
+    session = registry.LiveSession(thread_id="t-converge")
+    peak = 0
+    for i in range(2000):
+        session.defer(ToolCallStartEvent(
+            type=EventType.TOOL_CALL_START, tool_call_id=f"c{i}", tool_call_name="Bash"))
+        session.defer(ToolCallArgsEvent(
+            type=EventType.TOOL_CALL_ARGS, tool_call_id=f"c{i}", delta="{}"))
+        session.defer(ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=f"c{i}"))
+        peak = max(peak, len(session.deferred))
+
+    assert peak <= registry._MAX_DEFERRED + registry._TRIM_SLACK + 1, peak
+    assert len(session.dropped_frames) <= registry._MAX_DROPPED_FRAMES

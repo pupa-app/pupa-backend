@@ -206,17 +206,23 @@ def _describe(tool_name: str, tool_input: dict[str, Any]) -> str:
     return f"use the `{tool_name}` tool"
 
 
-def _emit_prompt(session: Any, text: str) -> None:
+def _emit_prompt(session: Any, text: str) -> bool:
     """Push an assistant-text message (start/content/end) to the session.
 
     Routed, not emitted: with no run open (the loop asking mid-way through a
     background task's injected turn) the prompt is held for the user's next run
     instead of landing on the queue ahead of that run's `RunStarted`.
+
+    Returns whether it went out on a live run — i.e. whether the user can be
+    expected to have seen it. See `_ask_user`.
     """
     mid = f"perm_{uuid.uuid4().hex}"
-    session.route(TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=mid, role="assistant"))
+    delivered = session.route(
+        TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=mid, role="assistant")
+    )
     session.route(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=mid, delta=text))
     session.route(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=mid))
+    return bool(delivered)
 
 
 def _disabled_set(state: dict[str, Any] | None) -> set[str]:
@@ -323,42 +329,29 @@ async def _ask_user(session: Any, tool_name: str, tool_input: dict[str, Any]) ->
     Emits the request as plain assistant text, ends the current SSE turn, and waits
     on a per-session future the endpoint resolves from the user's next message.
     Returns True if the user approved.
-    """
-    # "Nobody can answer" is *not* the same as "no run is open": a turn parked on
-    # a frontend tool call also has `run_open` False, and there the user is right
-    # there with a resume POST in flight — that ask must still happen. The one
-    # state with no consumer is a session held open only for background work,
-    # where the CLI is running a turn nobody requested. Parking a future there
-    # would silently consume the user's next message as the answer (the
-    # endpoint's permission-reply branch runs before the new-turn branch) and
-    # leave that run with no terminal event.
-    background = getattr(session, "background", None)
-    if getattr(background, "holding", False) and not getattr(session, "run_open", True):
-        # Deny, fail-closed, and leave a note that surfaces on the next run.
-        logger.info(
-            "claude_code loop: denying %s — permission asked while the session is "
-            "held only for background work (thread=%s)",
-            tool_name, getattr(session, "thread_id", "?"),
-        )
-        _emit_prompt(
-            session,
-            f"A background task wanted to {_describe(tool_name, tool_input)}, but "
-            "I could not ask you at the time, so I did not run it. Tell me to go "
-            "ahead if you still want it.",
-        )
-        return False
 
+    **Whether the question was delivered is recorded, not inferred.** The endpoint
+    treats the user's next message as the yes/no, so a question that never left
+    the backlog — the loop asking during a turn nobody requested — would silently
+    consume a message the user meant as a new request. Neither `run_open` nor the
+    background hold identifies that state on its own (a turn parked on a frontend
+    tool call has no open run either, and its ask *is* delivered on the resume's
+    SSE). `pending_decision_delivered` is the fact itself: the endpoint denies an
+    undelivered ask rather than answering it from a message the user wrote blind.
+    """
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     session.pending_decision = fut
 
-    _emit_prompt(
+    session.pending_decision_delivered = _emit_prompt(
         session,
         f"I need your permission to {_describe(tool_name, tool_input)}. "
         "Reply **yes** to allow, **no** to deny, or **always** to run everything "
         "this session without asking again.",
     )
-    session.emit(cl_events.run_finished(session.thread_id, session.current_run_id or ""))
-    session.mark_interrupt()
+    # Only a run that is open has an SSE to end.
+    if session.run_open:
+        session.emit(cl_events.run_finished(session.thread_id, session.current_run_id or ""))
+        session.mark_interrupt()
 
     return bool(await fut)

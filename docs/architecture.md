@@ -367,7 +367,10 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   subagents (`Agent` with `run_in_background`) and background shell jobs keep
   running inside the CLI child after the turn's `ResultMessage`, and report
   completion later as a turn the session *injects on its own*
-  (`ResultMessage.origin == {"kind": "task-notification"}`). Disposing at turn
+  (`ResultMessage.origin == {"kind": "task-notification"}` — matched as an
+  **allow-list**, since the SDK's `kind` vocabulary is open and reading "not
+  human" as "injected" would hang a real turn on an unrecognised kind).
+  Disposing at turn
   end kills them — the next turn is a fresh child and can only report
   `No completion record was found for background agent …`. So the pump tracks
   every `task_started` / `task_progress` / `task_notification` / `task_updated`
@@ -385,18 +388,23 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
     `RunStarted`. So the background result reaches the user on their next
     message, in the correct frame order. The permission gate routes the same way
     (its prompt would otherwise land ahead of the next `RunStarted`, and its
-    `INTERRUPT` would end that SSE before it began). While the session is held
-    *only* for background work it denies instead of asking: the endpoint reads
-    `pending_decision` before the new-turn branch, so a question nobody can see
-    would eat the user's next message as its yes/no and leave that run with no
-    terminal. Note the predicate — a turn parked on a frontend tool call also has
-    no run open, and there the user *is* waiting, so that ask still happens.
-    The backlog is capped, and an overflow drops only the oldest *body* events
-    (`TEXT_MESSAGE_CONTENT`, `TOOL_CALL_ARGS`), never a `START` or an `END`: one
-    long report is most of the backlog, so trimming by position would take its
-    `START` and orphan everything after it. If a backlog is somehow all structure
-    and nothing is trimmable, whole frames go instead, oldest first, and the rest
-    of a dropped frame's deltas are dropped with it. A frontend tool call from an
+    `INTERRUPT` would end that SSE before it began). Because the endpoint reads
+    the user's next message as the answer to a parked permission ask, the gate
+    **records whether the question was delivered** (`pending_decision_delivered`)
+    rather than inferring it: neither `run_open` nor the background hold
+    identifies "nobody can answer" on its own — a turn parked on a frontend tool
+    call has no open run either, and its ask *is* delivered, on the resume's SSE.
+    A new-turn POST denies an undelivered ask (fail-closed) and treats the message
+    as a new turn; `open_run` marks a still-parked ask delivered once the backlog
+    it sits in has been released.
+    The backlog is capped. An overflow drops the oldest *body* events first
+    (`TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_CONTENT`, `TOOL_CALL_ARGS`) —
+    one long report is most of the backlog, so trimming by position would take its
+    `START` and orphan everything after it. When there is not enough body to give
+    (a tool-call loop is only a third trimmable, so body-only trimming would never
+    converge) whole frames go, oldest first, and the rest of a dropped frame's
+    deltas are dropped with them — in `route`, so they can't reach a live SSE
+    either once a run opens. A frontend tool call from an
     injected turn is rejected
     (`app_not_attached`) rather than parked — the device isn't listening and no
     resume can ever answer it. That slot is marked `rejected`: `claim_call` takes

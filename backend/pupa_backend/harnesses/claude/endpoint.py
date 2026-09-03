@@ -76,6 +76,10 @@ from .gate import (
 
 logger = logging.getLogger("uvicorn.error")
 
+# `ResultMessage.origin["kind"]` values that mean "the session ran this turn on
+# its own". See `_is_injected_turn` for why this is an allow-list.
+_INJECTED_TURN_KINDS = frozenset({"task-notification"})
+
 # Task lifecycle messages the CLI emits for subagents and background shell jobs.
 # Folded into the session's background tracker; see `_track_task`.
 _TASK_MESSAGES = (
@@ -556,9 +560,26 @@ async def _start_continuation(session: registry.LiveSession, descriptors: list[A
     """
     old_client = session.client
     resume_id = session.sdk_session_id
+    # `_options_for` writes what the *new* client will be shaped like onto the
+    # session. If the swap never happens, those fields describe a client the
+    # session does not have — and `_cannot_continue_live` would then compare the
+    # next turn against the wrong tool surface and never notice the drift.
+    shape_before = (
+        session.frontend_qualified, session.gate_state,
+        session.client_shape, session.context_pairs,
+    )
+
+    def _restore_shape() -> None:
+        (session.frontend_qualified, session.gate_state,
+         session.client_shape, session.context_pairs) = shape_before
+
     options = _options_for(session.turn_input, session, session.turn_mcp, descriptors, resume_id)
-    new_client = ClaudeSDKClient(options)
-    await new_client.connect()
+    try:
+        new_client = ClaudeSDKClient(options)
+        await new_client.connect()
+    except Exception:
+        _restore_shape()
+        raise
     logger.info(
         "claude_code loop: continuation turn (resume=%s, tools=%d) thread=%s",
         resume_id, len(session.frontend_qualified), session.thread_id,
@@ -571,6 +592,7 @@ async def _start_continuation(session: registry.LiveSession, descriptors: list[A
     try:
         await new_client.query(_CONTINUATION_PROMPT)
     except Exception:
+        _restore_shape()
         try:
             await new_client.disconnect()
         except Exception:  # noqa: BLE001 — best-effort teardown of the unused client
@@ -618,12 +640,29 @@ def _is_injected_turn(msg: ResultMessage) -> bool:
     """True when this result answers a turn the CLI ran on its own.
 
     `ResultMessage.origin` is absent (or `{"kind": "human"}`) for a prompt this
-    backend sent, and carries e.g. `{"kind": "task-notification"}` for a turn the
+    backend sent, and carries `{"kind": "task-notification"}` for a turn the
     session injected when a background task reported in. Those have no HTTP run
     waiting on them, so they must not emit a terminal AG-UI event.
+
+    An **allow-list**, deliberately. The SDK's `kind` vocabulary is open and the
+    dependency is floored rather than pinned, so "anything that is not human is
+    injected" fails open: a new kind on a turn this backend prompted would emit no
+    terminal at all and hang the user's request until the idle sweep. Misreading
+    an injected turn as ours costs a terminal event on a run that has already
+    ended — which is routed to the backlog, not the wire.
     """
     origin = getattr(msg, "origin", None)
-    return isinstance(origin, dict) and origin.get("kind") not in (None, "human")
+    if not isinstance(origin, dict):
+        return False
+    kind = origin.get("kind")
+    if kind in _INJECTED_TURN_KINDS:
+        return True
+    if kind not in (None, "human"):
+        logger.info(
+            "claude_code loop: treating unrecognised ResultMessage origin %r as this "
+            "backend's own turn", kind,
+        )
+    return False
 
 
 def _track_task(session: registry.LiveSession, msg: Any) -> None:
@@ -1028,7 +1067,20 @@ def register_claude_loop_endpoint(
             return _stream(session)
 
         # --- Permission reply: the user is answering a parked approval -----
+        # Only when the question actually reached them. An ask raised while the
+        # session was held for background work sits in the backlog unseen, and
+        # reading the next message as its yes/no would consume a message the user
+        # meant as a new request — see `gate._ask_user`.
         parked = registry.get(thread_id)
+        if parked is not None and not parked.disposed and parked.pending_decision is not None \
+                and not parked.pending_decision.done() and not parked.pending_decision_delivered:
+            logger.info(
+                "claude_code loop: denying an approval the user never saw — their "
+                "message starts a new turn instead (thread=%s)", thread_id,
+            )
+            undelivered = parked.pending_decision
+            parked.pending_decision = None
+            undelivered.set_result(False)  # fail-closed; the ask text rides this run
         if parked is not None and not parked.disposed and parked.pending_decision is not None \
                 and not parked.pending_decision.done():
             reply = _latest_user_text(input.messages)

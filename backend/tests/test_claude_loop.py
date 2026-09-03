@@ -612,6 +612,7 @@ async def test_endpoint_permission_reply_resolves_parked_decision(monkeypatch: p
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     session.pending_decision = fut
+    session.pending_decision_delivered = True  # the user saw the question
     session.current_run_id = "r0"
 
     async def _fake_pump():
@@ -652,6 +653,7 @@ async def test_endpoint_permission_always_sets_auto_approve(monkeypatch: pytest.
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     session.pending_decision = fut
+    session.pending_decision_delivered = True  # the user saw the question
     session.current_run_id = "r0"
 
     async def _fake_pump():

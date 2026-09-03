@@ -153,14 +153,19 @@ _TRIMMABLE_EVENTS = frozenset({
     EventType.TOOL_CALL_ARGS,
 })
 
-# Failsafe for a backlog that is somehow all structure and no body: nothing is
-# trimmable, so the cap above can't bite. Then whole frames go, oldest first.
-_HARD_MAX_DEFERRED_FACTOR = 4
+# Frame ids the trim dropped the `START` of, remembered so the rest of their
+# deltas go too. Bounded: a frame whose `END` never arrives would otherwise stay
+# forever.
+_MAX_DROPPED_FRAMES = 256
 
 # How far over the cap the backlog may run before a trim. Trimming on every
 # `defer` would rebuild the list per streamed delta (and log a line per event);
 # a batch keeps it amortised.
 _TRIM_SLACK = 200
+
+# Runs after which an unclaimed pending call is assumed abandoned: its handler
+# can only have hit `wait_timeout_for` and raised.
+_STALE_PENDING_RUNS = 3
 
 # Events that open and close a frame. A body event whose `START` was dropped is
 # unrenderable, so the trim drops frames whole rather than by position.
@@ -266,6 +271,10 @@ class LiveSession:
     # A native-command permission request the gate parked, awaiting the user's
     # next chat message (yes/no). Resolved by the endpoint; see gate.py.
     pending_decision: asyncio.Future | None = None
+    # Whether that question actually went out on a live run. The endpoint reads
+    # the user's next message as the answer, so an ask still sitting in the
+    # backlog must be denied rather than answered blind. See `gate._ask_user`.
+    pending_decision_delivered: bool = False
     # Once the user approves with "always", every later command in this thread
     # runs without a prompt (set by the endpoint from the approval reply).
     auto_approve: bool = False
@@ -300,7 +309,7 @@ class LiveSession:
     # Frames the backlog trim dropped the `START` of. Their remaining deltas are
     # dropped too — a body event with no `START` is unrenderable. An id leaves the
     # set when its `END` goes by.
-    dropped_frames: set = field(default_factory=set)
+    dropped_frames: dict = field(default_factory=dict)
     # Model + thinking level the live client was built with. Both are frozen at
     # `connect()`, so a turn wanting different ones needs a fresh client.
     client_shape: tuple | None = None
@@ -337,12 +346,6 @@ class LiveSession:
         SSE is attached to carry it. Held here and released by the next
         `open_run`, so it reaches the user on their next message.
         """
-        if _frame_id(event) is not None and _frame_id(event) in self.dropped_frames:
-            # This frame's `START` is already gone; its body would be orphaned.
-            # The `END` closes the frame out of the drop set.
-            if getattr(event, "type", None) in _FRAME_END_EVENTS:
-                self.dropped_frames.discard(_frame_id(event))
-            return
         self.deferred.append(event)
         # Trim in batches, not on every event: `defer` is called one event at a
         # time, so trimming at the cap would rebuild the whole list per delta and
@@ -362,11 +365,12 @@ class LiveSession:
                 continue
             survivors.append(held)
         self.deferred = survivors
-        if len(self.deferred) > _MAX_DEFERRED * _HARD_MAX_DEFERRED_FACTOR:
-            # All structure and no body, so the trim above could not bite. Drop
-            # the oldest events and then every event orphaned by that — a frame
-            # whose `START` is gone is dropped whole, here and (via
-            # `dropped_frames`) for the rest of its deltas.
+        if len(self.deferred) > _MAX_DEFERRED:
+            # Not enough body to give: a tool-call loop is `START`/`ARGS`/`END`,
+            # only a third of it trimmable, so body-trimming alone would fall
+            # further behind on every batch and never converge. Give up whole
+            # frames instead, oldest first — the backlog is back under the cap
+            # when this returns, so the trim always converges.
             self._drop_oldest_frames(len(self.deferred) - _MAX_DEFERRED)
         if before != len(self.deferred):
             logger.warning(
@@ -385,30 +389,48 @@ class LiveSession:
             # `None` must never enter the set — it would swallow every standalone
             # event (a `CustomEvent`, a terminal) from then on.
             if frame is not None and getattr(held, "type", None) in _FRAME_START_EVENTS:
-                self.dropped_frames.add(frame)
+                self.dropped_frames[frame] = None
         del self.deferred[:count]
-        kept = []
-        for held in self.deferred:
-            frame = _frame_id(held)
-            if frame in self.dropped_frames:
-                if getattr(held, "type", None) in _FRAME_END_EVENTS:
-                    self.dropped_frames.discard(frame)
-                continue
-            kept.append(held)
-        self.deferred = kept
+        self.deferred = [held for held in self.deferred if not self._is_orphan(held)]
+        while len(self.dropped_frames) > _MAX_DROPPED_FRAMES:
+            self.dropped_frames.pop(next(iter(self.dropped_frames)), None)
 
-    def route(self, event: Any) -> None:
+    def _is_orphan(self, event: Any) -> bool:
+        """True for an event whose frame lost its `START` to a trim.
+
+        Its `END` closes the frame out of the drop set — the id can be reused
+        after that, and a later frame carrying it must not be swallowed too.
+        """
+        frame = _frame_id(event)
+        # `None` must never match — it would swallow every standalone event (a
+        # `CustomEvent`, a terminal) from then on.
+        if frame is None or frame not in self.dropped_frames:
+            return False
+        if getattr(event, "type", None) in _FRAME_END_EVENTS:
+            self.dropped_frames.pop(frame, None)
+        return True
+
+    def route(self, event: Any) -> bool:
         """Emit onto the open run's SSE, or hold it for the next one.
 
         The single chokepoint for anything produced *by the loop* (the pump, the
         permission gate): between runs there is no drain and no run the event can
         belong to. Teardown events bypass this deliberately — they exist to
         unblock a drain that may be attached right now.
+
+        Returns whether the event went out live. The permission gate needs that
+        answer: an ask the user cannot have seen must not be answered by their
+        next message. Events orphaned by a backlog trim are dropped here rather
+        than in `defer`, so a trimmed frame's later deltas can't reach a live SSE
+        either once a run opens.
         """
+        if self._is_orphan(event):
+            return False
         if self.run_open:
             self.emit(event)
-        else:
-            self.defer(event)
+            return True
+        self.defer(event)
+        return False
 
     def take_deferred(self) -> list:
         """Hand the backlog to whoever will deliver it, and forget it here.
@@ -440,6 +462,13 @@ class LiveSession:
                 "work thread_id=%s", len(self.deferred), self.thread_id,
             )
             self.deferred.clear()
+        if self.pending_decision is not None and not self.pending_decision.done():
+            # Its text has now reached the client — either live when it was
+            # asked, or in the backlog this run just released. From here the
+            # user's next message really is the answer. (The endpoint denies an
+            # ask it could not deliver *before* opening a run, so anything still
+            # parked here is one the user is about to see.)
+            self.pending_decision_delivered = True
         self.touch()
 
     def mark_interrupt(self) -> None:
@@ -594,10 +623,17 @@ class LiveSession:
         opens — `_continue_live_turn` awaits the query first, so a rejection can
         land in that window — and pruning it out from under that handler would
         block the handler for the full park wall.
+
+        A slot older than `_STALE_PENDING_RUNS` goes regardless: its handler can
+        only have hit the park wall and raised, so nobody is waiting on it, and
+        leaving it makes `_cannot_continue_live` decline for a reason that is no
+        longer true.
         """
         stale = [
             call_id for call_id, pc in self.pending.items()
-            if pc.consumed or (pc.run_id is None and pc.seq <= self.run_seq - 2)
+            if pc.consumed
+            or (pc.run_id is None and pc.seq <= self.run_seq - 2)
+            or pc.seq <= self.run_seq - _STALE_PENDING_RUNS
         ]
         for call_id in stale:
             self.pending.pop(call_id, None)

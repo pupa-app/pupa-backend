@@ -28,10 +28,12 @@ bumps (`0.0.X` → `0.0.X+1`).
 
 ### Changed
 
-- A permission request raised while no run is open (a background task's
-  injected turn) is now **denied** rather than parked. Nobody can answer a
-  question that has no SSE to travel on, and parking it made the user's next
-  message the yes/no. The user gets a note on their next run instead.
+- A permission request the user never saw is now denied rather than answered by
+  their next message. The backend treats that message as the yes/no to a parked
+  ask, so a question raised while no run was open — a background task's injected
+  turn — silently consumed a message the user meant as a new request. Whether the
+  question was delivered is now recorded rather than inferred; an undelivered one
+  is denied (fail-closed) and its text reaches the user on the next run.
 - Enabled harnesses are now swept on a timer (`PUPA_SESSION_SWEEP_INTERVAL`,
   default 60s) rather than only when the next request arrives, so a retention
   wall is a real bound even for a user who closed the app. Harnesses opt in with
