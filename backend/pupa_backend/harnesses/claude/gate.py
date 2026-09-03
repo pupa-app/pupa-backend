@@ -207,11 +207,16 @@ def _describe(tool_name: str, tool_input: dict[str, Any]) -> str:
 
 
 def _emit_prompt(session: Any, text: str) -> None:
-    """Push an assistant-text message (start/content/end) onto the session queue."""
+    """Push an assistant-text message (start/content/end) to the session.
+
+    Routed, not emitted: with no run open (the loop asking mid-way through a
+    background task's injected turn) the prompt is held for the user's next run
+    instead of landing on the queue ahead of that run's `RunStarted`.
+    """
     mid = f"perm_{uuid.uuid4().hex}"
-    session.emit(TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=mid, role="assistant"))
-    session.emit(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=mid, delta=text))
-    session.emit(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=mid))
+    session.route(TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=mid, role="assistant"))
+    session.route(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=mid, delta=text))
+    session.route(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=mid))
 
 
 def _disabled_set(state: dict[str, Any] | None) -> set[str]:
@@ -329,7 +334,11 @@ async def _ask_user(session: Any, tool_name: str, tool_input: dict[str, Any]) ->
         "Reply **yes** to allow, **no** to deny, or **always** to run everything "
         "this session without asking again.",
     )
-    session.emit(cl_events.run_finished(session.thread_id, session.current_run_id or ""))
-    session.mark_interrupt()
+    # Only a run that is actually open has an SSE to end. Asking during a turn
+    # nobody requested (a background task reporting in) just parks the future:
+    # the prompt text is deferred, and the user's next message answers it.
+    if session.run_open:
+        session.emit(cl_events.run_finished(session.thread_id, session.current_run_id or ""))
+        session.mark_interrupt()
 
     return bool(await fut)

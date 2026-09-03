@@ -375,26 +375,45 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   ([`agui/background.py`](../backend/pupa_backend/agui/background.py)) and, when
   a turn ends cleanly with tasks still in flight, **parks** (`PARK`) instead of
   finishing: the run's SSE closes with its `RunFinished`, the child stays
-  connected, and the pump keeps draining. Three consequences:
+  connected, and the pump keeps draining. Consequences:
   - The pump reads `receive_messages()` (the session's whole stream), not
     `receive_response()` (one turn) — one pump serves every turn a live client
     runs.
-  - Events produced with **no run open** (an injected turn) go to
-    `LiveSession.deferred` and are released by the next run's `open_run`, right
-    after its `RunStarted`, so the background result reaches the user on their
-    next message in the correct frame order. A frontend tool call from such a
-    turn is rejected (`app_not_attached`) rather than parked — the device isn't
-    listening and no resume can ever answer it.
+  - Everything the loop produces goes through `LiveSession.route()`: onto the
+    open run's SSE, or — with **no run open**, i.e. an injected turn — into
+    `LiveSession.deferred`, released by the next run's `open_run` right after its
+    `RunStarted`. So the background result reaches the user on their next
+    message, in the correct frame order. The permission gate routes the same way
+    (its prompt would otherwise land ahead of the next `RunStarted`, and its
+    `INTERRUPT` would end that SSE before it began). The backlog is capped and
+    trims to a frame boundary — never to a `TEXT_MESSAGE_CONTENT` whose `START`
+    was dropped. A frontend tool call from an injected turn is rejected
+    (`app_not_attached`) rather than parked — the device isn't listening and no
+    resume can ever answer it; `open_run` then prunes that slot so a later
+    identical call can't claim its error instead of the device's real result.
   - The **next user turn is fed into the same live client** (`_continue_live_turn`)
     instead of retiring it for a fresh child. `_cannot_continue_live` declines
     when the turn advertises tools the frozen in-process server can't expose, the
-    host-tool scope changed, or a frontend call / permission ask is still parked;
-    it then starts fresh and logs that the tasks are orphaned.
+    permission-relevant state changed (`_gate_state`), the model or thinking level
+    changed, or a frontend call / permission ask is still parked; it then starts
+    fresh, logs the tasks that orphans, and the replacement session **inherits
+    the deferred backlog** so the background report is still delivered. The
+    ambient context normally refreshes in the system prompt of each fresh client;
+    a continued turn has no fresh client, so a changed `input.context` is
+    re-delivered at the head of the query instead.
+  - A **resume POST** never lands on a session held only for background work: no
+    handler is parked, so attaching would block on a queue the idle pump won't
+    feed. It gets the same stale-session `RunError` as before the hold existed.
   - Bounded by `PUPA_BACKGROUND_HOLD` (default 1800s, `0` disables parking
     entirely): the hold is re-armed at each park, and `sweep_idle` exempts a
-    held session from the idle wall but evicts it once the hold expires. An
-    errored turn never parks — a wedged child must not be kept alive on the
-    strength of tasks it may never report.
+    held session from the idle wall but evicts it once the hold expires. The
+    sweep runs **on a timer** — `sweep_harnesses` in
+    [`harnesses/__init__.py`](../backend/pupa_backend/harnesses/__init__.py),
+    started by the app lifespan, calls each enabled harness's optional `sweep()`
+    every `PUPA_SESSION_SWEEP_INTERVAL` seconds (default 60) — because a wall
+    checked only when the next request arrives is no bound at all for a user who
+    closed the app. An errored turn never parks: a wedged child must not be kept
+    alive on the strength of tasks it may never report.
 - **Assistant text streams token-by-token.** `ClaudeAgentOptions` sets
   `include_partial_messages=True`, so the message stream carries partial
   `StreamEvent`s alongside the whole messages. `_pump` maps each text delta to an

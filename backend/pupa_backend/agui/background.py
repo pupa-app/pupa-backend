@@ -48,6 +48,10 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
 # life of the process.
 _HOLD_DEFAULT = 1800.0  # seconds
 
+# How many finished task ids to remember, so a late message about one can't
+# resurrect it. Only needs to outlive the loop's own chatter about a task.
+_MAX_DONE = 512
+
 
 def hold_window() -> float:
     """`PUPA_BACKGROUND_HOLD` seconds (default 1800). <= 0 disables the hold —
@@ -71,13 +75,19 @@ class BackgroundWork:
     """
 
     tasks: dict[str, str] = field(default_factory=dict)
+    # Ids that already reached a terminal status. A loop may keep talking about a
+    # finished task (a late patch carrying only `end_time`, a duplicate
+    # notification); without this a finished task could be resurrected and hold
+    # the session open forever. Bounded — oldest ids fall off.
+    done: dict[str, None] = field(default_factory=dict)
     # Wall-clock deadline for the current park, or None when not holding.
     hold_until: float | None = None
 
     # -- the loop reports lifecycle -------------------------------------------
 
     def start(self, task_id: str | None, description: str = "") -> None:
-        if not task_id:
+        """Note a task as running. A task that already finished stays finished."""
+        if not task_id or str(task_id) in self.done:
             return
         self.tasks.setdefault(str(task_id), description or "")
 
@@ -85,15 +95,25 @@ class BackgroundWork:
         """Apply a status. Returns True when it was terminal (task cleared).
 
         An update for an unknown id is still honoured — a harness may learn of a
-        task only when it ends.
+        task only when it ends. Callers must pass `status=None` only when the
+        message genuinely carries no status; that is *not* evidence the task is
+        running, so it is ignored rather than treated as a start.
         """
         if not task_id:
             return False
-        if status is not None and str(status).lower() in TERMINAL_STATUSES:
+        if status is None:
+            return False
+        if str(status).lower() in TERMINAL_STATUSES:
             self.tasks.pop(str(task_id), None)
+            self._mark_done(str(task_id))
             return True
-        self.tasks.setdefault(str(task_id), "")
+        self.start(task_id)
         return False
+
+    def _mark_done(self, task_id: str) -> None:
+        self.done[task_id] = None
+        while len(self.done) > _MAX_DONE:
+            self.done.pop(next(iter(self.done)))
 
     # -- the harness asks --------------------------------------------------
 

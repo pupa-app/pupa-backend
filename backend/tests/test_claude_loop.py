@@ -187,6 +187,7 @@ async def test_hook_edit_tool_parks_for_user_then_allows(monkeypatch: pytest.Mon
     monkeypatch.delenv("PUPA_CLAUDE_LOOP_AUTO_APPROVE", raising=False)
     session = registry.LiveSession(thread_id="t-perm")
     session.current_run_id = "r1"
+    session.run_open = True  # the endpoint has a run in flight (see `open_run`)
     hook = gate.make_pre_tool_use_hook({}, session)
     task = asyncio.ensure_future(hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None))
     await asyncio.sleep(0.02)

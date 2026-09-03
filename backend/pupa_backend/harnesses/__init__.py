@@ -18,6 +18,7 @@ a public plugin entry point is deferred until the backend package is published.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,46 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger("uvicorn.error")
+
+
+# How often the harness sweep runs (seconds). A harness may hold an external
+# process alive between turns — the Claude loop does, while background work is in
+# flight — and a retention wall checked only on the next request is not a bound
+# at all: an app that never comes back would leave the child running.
+_SWEEP_INTERVAL_DEFAULT = 60.0
+
+
+def _sweep_interval() -> float:
+    raw = os.getenv("PUPA_SESSION_SWEEP_INTERVAL")
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            logger.warning(
+                "bad PUPA_SESSION_SWEEP_INTERVAL=%r; using %s", raw, _SWEEP_INTERVAL_DEFAULT
+            )
+    return _SWEEP_INTERVAL_DEFAULT
+
+
+async def sweep_harnesses(registry: Any, interval: float | None = None) -> None:
+    """Periodically ask every enabled harness to reap what it is holding.
+
+    Best-effort and never fatal: a harness that raises is logged and the loop
+    keeps running, because the sweep is what bounds process retention.
+    """
+    period = _sweep_interval() if interval is None else interval
+    while True:
+        await asyncio.sleep(period)
+        for harness in registry.enabled():
+            sweep = getattr(harness, "sweep", None)
+            if sweep is None:
+                continue
+            try:
+                await sweep()
+            except Exception:  # noqa: BLE001 — a failing sweep must not end the loop
+                logger.exception("harness %s: sweep failed", harness.id)
 
 
 @dataclass
@@ -50,6 +91,12 @@ class AgentHarness(Protocol):
 
     def register(self, app: Any, path: str, deps: HarnessDeps) -> None: ...
     def models(self) -> list[dict]: ...
+    # Optional: reap sessions this harness is holding open. Called periodically by
+    # the app lifespan (see `app.sweep_harnesses`) and read via getattr, so a
+    # harness that holds nothing may omit it. A harness whose loop can keep an
+    # external process alive between turns MUST implement it — otherwise its
+    # retention wall is only enforced when the next request happens to arrive.
+    async def sweep(self) -> None: ...
     def tools(self) -> list[dict]: ...
     def permission_schema(self) -> list[dict]: ...
     # Optional: extended-thinking levels this harness supports (`[]` = none). The
@@ -69,6 +116,17 @@ class ClaudeCodeHarness:
         # No checkpointer/store: the loop keeps sessions in-process and the
         # Claude Code SDK owns its own history.
         register_claude_loop_endpoint(app, path=path, mcp=deps.mcp)
+
+    async def sweep(self) -> None:
+        """Evict idle sessions and any whose background-work hold has expired.
+
+        The loop keeps a `claude` child alive between turns while background work
+        is in flight, so the wall that bounds that hold has to be checked on a
+        timer — not only when the next turn arrives, which may be never.
+        """
+        from pupa_backend.harnesses.claude.registry import sweep_idle
+
+        await sweep_idle()
 
     def models(self) -> list[dict]:
         from pupa_backend.harnesses.claude.models import loop_model_menu

@@ -28,6 +28,10 @@ bumps (`0.0.X` → `0.0.X+1`).
 
 ### Changed
 
+- Enabled harnesses are now swept on a timer (`PUPA_SESSION_SWEEP_INTERVAL`,
+  default 60s) rather than only when the next request arrives, so a retention
+  wall is a real bound even for a user who closed the app. Harnesses opt in with
+  an optional `sweep()`.
 - `claude-agent-sdk` floor raised to `0.2.143` for the task-lifecycle message
   types (`TaskStartedMessage`, `TaskUpdatedMessage`, …) the fix reads.
 

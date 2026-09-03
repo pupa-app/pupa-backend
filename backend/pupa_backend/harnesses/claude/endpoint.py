@@ -419,6 +419,11 @@ def _options_for(
     system = _compose_system_prompt(base_system, input.context)
     thinking = resolve_thinking(input) or {}
     model = _resolve_loop_model(input)
+    # What this client is frozen with. A later turn may reuse it only if it wants
+    # the same model and thinking level; the ambient context is re-delivered in
+    # the query instead (see `_continue_live_turn`).
+    session.client_shape = (model, tuple(sorted(thinking.items())))
+    session.context_pairs = _context_pairs(input.context)
     skills = loop_skills()
     cwd = os.getenv("CLAUDE_CODE_WORKSPACE") or None
     # Anthropic caches on an exact `tools` → `system` → `messages` prefix and the
@@ -601,21 +606,28 @@ def _is_injected_turn(msg: ResultMessage) -> bool:
 
 
 def _track_task(session: registry.LiveSession, msg: Any) -> None:
-    """Fold one CLI task lifecycle message into the session's background tracker."""
+    """Fold one CLI task lifecycle message into the session's background tracker.
+
+    `task_started` / `task_progress` mean the task is running. The two status
+    messages are the only evidence a task *ended*, and a `task_updated` patch
+    carrying only `end_time` / `result` parses to `status=None` — absence of a
+    status is not evidence of anything, so it is dropped rather than read as a
+    start (which would resurrect a finished task and pin the session open).
+    """
     task_id = getattr(msg, "task_id", None)
-    status = getattr(msg, "status", None)
-    if status is None:
-        patch = getattr(msg, "patch", None)
-        if isinstance(patch, dict):
-            status = patch.get("status")
-    if status is not None:
-        if session.background.update(task_id, status):
-            logger.info(
-                "claude_code loop: background task %s -> %s (thread=%s, remaining=%s)",
-                task_id, status, session.thread_id, session.background.summary(),
-            )
+    if isinstance(msg, (TaskStartedMessage, TaskProgressMessage)):
+        session.background.start(task_id, getattr(msg, "description", "") or "")
         return
-    session.background.start(task_id, getattr(msg, "description", "") or "")
+    status = getattr(msg, "status", None)
+    if status is None and isinstance(getattr(msg, "patch", None), dict):
+        status = msg.patch.get("status")
+    if status is None:
+        return
+    if session.background.update(task_id, status):
+        logger.info(
+            "claude_code loop: background task %s -> %s (thread=%s, remaining=%s)",
+            task_id, status, session.thread_id, session.background.summary(),
+        )
 
 
 def _cannot_continue_live(session: registry.LiveSession, input: RunAgentInput) -> str | None:
@@ -640,6 +652,9 @@ def _cannot_continue_live(session: registry.LiveSession, input: RunAgentInput) -
     gate_state = _gate_state(input.state)
     if session.gate_state is not None and gate_state != session.gate_state:
         return f"permission state changed {session.gate_state} -> {gate_state}"
+    shape = (_resolve_loop_model(input), tuple(sorted((resolve_thinking(input) or {}).items())))
+    if session.client_shape is not None and shape != session.client_shape:
+        return f"model/thinking changed {session.client_shape} -> {shape}"
     return None
 
 
@@ -658,15 +673,26 @@ async def _continue_live_turn(
     latest_user = _latest_user_message(input.messages)
     text = _coerce_content(_msg_content(latest_user))
     image_blocks = _image_blocks(_msg_content(latest_user))
-    session.open_run(run_id, events.run_started(input.thread_id, run_id))
+    # The ambient context normally refreshes in the system prompt on every fresh
+    # client. This turn has no fresh client, so hand the model the new context in
+    # the query — otherwise it answers on a snapshot from the previous turn.
+    pairs = _context_pairs(input.context)
+    if pairs != session.context_pairs:
+        session.context_pairs = pairs
+        block = _render_context(input.context)
+        if block:
+            text = f"{_CONTEXT_HEADER}\n\n{block}\n\n{text}"
+    # Send before opening the run: a failure then costs nothing (the deferred
+    # backlog is still intact for the fresh session to inherit), and anything the
+    # pump produces in between is deferred and released by `open_run` in order.
     try:
         await _send_query(session.client, _query_content(text, image_blocks))
     except Exception:  # noqa: BLE001 — fall back to a fresh session
         logger.exception(
             "claude_code loop: continuing the live session failed; starting fresh"
         )
-        session.run_open = False
         return None
+    session.open_run(run_id, events.run_started(input.thread_id, run_id))
     logger.info(
         "claude_code loop: continuing the live session (background: %s) thread=%s",
         session.background.summary(), session.thread_id,
@@ -699,12 +725,7 @@ async def _pump(session: registry.LiveSession) -> None:
     # Per-turn text-streaming cursor for partial `StreamEvent`s (see below).
     stream_state = events.new_stream_state()
 
-    def out(event: Any) -> None:
-        """Route one event: onto the open run's SSE, else into the backlog."""
-        if session.run_open:
-            session.emit(event)
-        else:
-            session.defer(event)
+    out = session.route  # onto the open run's SSE, else into the backlog
 
     try:
         async for msg in client.receive_messages():
@@ -939,6 +960,20 @@ def register_claude_loop_endpoint(
         # --- Resume POST: deliver on-device tool results to the parked session ---
         if resume_payload is not None:
             session = registry.get(thread_id)
+            # A session held open for background work is NOT parked on a tool
+            # call: no handler is waiting, so attaching would hang the request on
+            # a queue nothing will feed. Answer it like the stale-session case.
+            if (
+                session is not None
+                and not session.disposed
+                and session.background.holding
+                and not session.has_unresolved_pending()
+            ):
+                logger.info(
+                    "claude_code loop: resume POST for a thread with no parked tool "
+                    "call (session held for background work) thread_id=%s", thread_id,
+                )
+                session = None
             if session is None or session.disposed:
                 return _error_stream(
                     "no parked Claude Code session for this thread — the turn may have "
@@ -994,6 +1029,7 @@ def register_claude_loop_endpoint(
         # CLI child owns those tasks, so a fresh subprocess would orphan them.
         # Feed this turn into the live client instead, when it can serve the
         # request (see `_cannot_continue_live`).
+        inherited: list = []
         live = registry.get(thread_id)
         if live is not None and not live.disposed and live.background.holding:
             declined = _cannot_continue_live(live, input)
@@ -1001,12 +1037,16 @@ def register_claude_loop_endpoint(
                 continued = await _continue_live_turn(live, input, run_id, mcp)
                 if continued is not None:
                     return continued
-            else:
-                logger.info(
-                    "claude_code loop: cannot continue the live session (%s) — "
-                    "starting fresh; %s will be orphaned (thread=%s)",
-                    declined, live.background.summary(), thread_id,
-                )
+                declined = "the query could not be sent"
+            logger.info(
+                "claude_code loop: cannot continue the live session (%s) — "
+                "starting fresh; %s will be orphaned (thread=%s)",
+                declined, live.background.summary(), thread_id,
+            )
+            # The background output already collected is the whole point of
+            # holding the session; hand it to the replacement rather than
+            # dropping it with the session that gathered it.
+            inherited = live.take_deferred()
 
         # Any session still on this thread is parked mid-tool-call (the app went
         # away and came back with something new). Wind it down cleanly first —
@@ -1019,6 +1059,7 @@ def register_claude_loop_endpoint(
         # a continuation turn (gate unlock) without this request in scope.
         session.turn_input = input
         session.turn_mcp = mcp
+        session.deferred.extend(inherited)
         session.open_run(run_id, events.run_started(thread_id, run_id))
         try:
             options = _options_for(

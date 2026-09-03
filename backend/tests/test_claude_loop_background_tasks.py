@@ -395,3 +395,213 @@ async def test_task_updated_patch_status_is_terminal(loop_app) -> None:
         )
     )
     await _settle(lambda: not session.background.active)
+
+    # A trailing patch with no status at all must not read as "running again".
+    _FakeSDKClient.instances[0].inject(
+        TaskUpdatedMessage(
+            subtype="task_updated", data={}, task_id="bg-1",
+            patch={"end_time": 2}, status=None, session_id="sdk-bg",
+        )
+    )
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not session.background.active
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from the first review round
+# --------------------------------------------------------------------------- #
+
+async def test_permission_prompt_between_runs_is_deferred_not_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate must route like the pump does.
+
+    Emitting straight onto the queue with no run open puts the prompt — and an
+    `INTERRUPT` sentinel — ahead of the next run's `RunStarted`, so that run's
+    SSE starts mid-message and ends on the previous run's id.
+    """
+    from pupa_backend.harnesses.claude import gate
+
+    monkeypatch.setenv("PUPA_CLAUDE_LOOP_NATIVE", "edit")
+    monkeypatch.setenv("PUPA_CLAUDE_LOOP_REQUIRE_APPROVAL", "1")
+    monkeypatch.delenv("PUPA_CLAUDE_LOOP_AUTO_APPROVE", raising=False)
+    session = registry.LiveSession(thread_id="t-perm-bg")
+    session.current_run_id = "r1"
+    session.run_open = False  # held open for background work, no SSE attached
+    hook = gate.make_pre_tool_use_hook({}, session)
+    task = asyncio.ensure_future(
+        hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None)
+    )
+    await _settle(lambda: session.pending_decision is not None)
+
+    assert session.queue.qsize() == 0, "the prompt jumped ahead of the next RunStarted"
+    assert len(session.deferred) == 3  # start / content / end
+    session.pending_decision.set_result(False)
+    await asyncio.wait_for(task, timeout=1)
+
+
+def test_a_status_less_patch_does_not_resurrect_a_finished_task() -> None:
+    """`task_updated` may carry only `end_time`; the SDK parses that as
+    `status=None`. Reading absence-of-status as "running" pins the session."""
+    work = BackgroundWork()
+    work.start("bg-1", "job")
+    assert work.update("bg-1", "completed")
+    assert not work.active
+    assert not work.update("bg-1", None)
+    work.start("bg-1", "job")  # a late `task_started` echo must not revive it
+    assert not work.active
+
+
+async def test_model_change_starts_fresh(loop_app) -> None:
+    """A live client is frozen on its model — honour the user's new pick."""
+    _FakeSDKClient.script = [
+        [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
+        [_assistant("fresh", "m-2"), _result()],
+    ]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = _body("run-1", "go")
+        first["forwardedProps"] = {"llm": {"model": "haiku"}}
+        await client.post("/", json=first)
+        second = _body("run-2", "again")
+        second["forwardedProps"] = {"llm": {"model": "opus"}}
+        await client.post("/", json=second)
+
+    assert len(_FakeSDKClient.instances) == 2
+    assert _FakeSDKClient.instances[1].options.model == "opus"
+
+
+async def test_a_continued_turn_re_delivers_changed_ambient_context(loop_app) -> None:
+    """The live client's system prompt froze last turn's context, so the new one
+    has to ride the query or the model answers on a stale snapshot."""
+    _FakeSDKClient.script = [
+        [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
+        [_assistant("ok", "m-2"), _result()],
+    ]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = _body("run-1", "go")
+        first["context"] = [{"description": "canvas", "value": "one box"}]
+        await client.post("/", json=first)
+        second = _body("run-2", "and now?")
+        second["context"] = [{"description": "canvas", "value": "two boxes"}]
+        await client.post("/", json=second)
+
+    assert len(_FakeSDKClient.instances) == 1  # continued on the live client
+    sent = _FakeSDKClient.instances[0].queries[1]
+    assert "two boxes" in sent
+    assert sent.endswith("and now?")
+
+
+async def test_declining_to_continue_still_delivers_the_background_report(loop_app) -> None:
+    """The held output is the whole point — it must not die with the session."""
+    _FakeSDKClient.script = [
+        [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
+        [_assistant("fresh", "m-2"), _result()],
+    ]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/", json=_body("run-1", "go"))
+        session = registry.get(THREAD)
+        assert session is not None
+        _FakeSDKClient.instances[0].inject(
+            _assistant("BACKGROUND REPORT: found 3 bugs", "m-bg"),
+            _task_done("bg-1"),
+            _result(origin={"kind": "task-notification"}),
+        )
+        await _settle(lambda: bool(session.deferred))
+
+        # A tool the frozen client can't expose forces a fresh session.
+        tools = [{"name": "renderTracker", "description": "r", "parameters": {"type": "object"}}]
+        events = _sse((await client.post("/", json=_body("run-2", "now render", tools=tools))).text)
+
+    assert len(_FakeSDKClient.instances) == 2
+    types = [e["type"] for e in events]
+    assert types[0] == "RUN_STARTED"
+    text = "".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT")
+    assert "BACKGROUND REPORT: found 3 bugs" in text
+
+
+async def test_resume_post_on_a_background_held_session_does_not_hang(loop_app) -> None:
+    """Nothing is parked on a tool call, so attaching would block on a queue the
+    idle pump never feeds. Answer like any stale resume."""
+    _FakeSDKClient.script = [[
+        _task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result(),
+    ]]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/", json=_body("run-1", "go"))
+        resume = _body("run-2", "")
+        resume["forwardedProps"] = {
+            "command": {"resume": {"tool_results": [{"toolCallId": "nope", "content": "x"}]}}
+        }
+        events = await asyncio.wait_for(
+            client.post("/", json=resume), timeout=5
+        )
+
+    types = [e["type"] for e in _sse(events.text)]
+    assert types == ["RUN_ERROR"]
+    assert registry.get(THREAD) is not None  # the hold survives the stray resume
+
+
+async def test_pruned_rejects_do_not_poison_a_later_identical_call() -> None:
+    """A rejected between-runs call keeps an `app_not_attached` result nobody
+    consumed; `claim_call` matches on (name, args), so the next real call would
+    take it and the device's answer would never be seen."""
+    session = registry.LiveSession(thread_id="t-prune")
+    await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
+    await session.reject_pending(["call-bg"], "app_not_attached")
+
+    session.open_run("run-2", object())
+    assert "call-bg" not in session.pending
+
+    await session.register_pending("call-user", "renderTracker", {}, run_id="run-2")
+    await session.resolve_results([{"toolCallId": "call-user", "content": "real result"}])
+    got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
+    assert got["content"][0]["text"] == "real result"
+
+
+def test_deferred_trim_keeps_a_frame_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dropping the oldest events must not leave the backlog starting on a
+    `TEXT_MESSAGE_CONTENT` whose `START` was trimmed away."""
+    from ag_ui.core import EventType
+    from ag_ui.core.events import (
+        TextMessageContentEvent,
+        TextMessageEndEvent,
+        TextMessageStartEvent,
+    )
+
+    monkeypatch.setattr(registry, "_MAX_DEFERRED", 4)
+    session = registry.LiveSession(thread_id="t-trim")
+    for i in range(3):
+        session.defer(TextMessageStartEvent(
+            type=EventType.TEXT_MESSAGE_START, message_id=f"m{i}", role="assistant"))
+        session.defer(TextMessageContentEvent(
+            type=EventType.TEXT_MESSAGE_CONTENT, message_id=f"m{i}", delta="x"))
+        session.defer(TextMessageEndEvent(
+            type=EventType.TEXT_MESSAGE_END, message_id=f"m{i}"))
+
+    assert session.deferred, "everything was trimmed away"
+    assert session.deferred[0].type == EventType.TEXT_MESSAGE_START
+
+
+async def test_harness_sweep_evicts_an_expired_hold() -> None:
+    """`sweep_idle` runs on a timer, not only when the next turn happens to
+    arrive — otherwise the hold is not a bound at all."""
+    from pupa_backend.harnesses import ClaudeCodeHarness, sweep_harnesses
+
+    registry._REGISTRY.clear()
+    session = registry.create("thread-expired")
+    session.background.start("t1", "job")
+    session.background.hold_until = 0.0
+
+    class _Registry:
+        def enabled(self):
+            return [ClaudeCodeHarness()]
+
+    task = asyncio.ensure_future(sweep_harnesses(_Registry(), interval=0.01))
+    try:
+        await _settle(lambda: registry.get("thread-expired") is None, timeout=3.0)
+    finally:
+        task.cancel()

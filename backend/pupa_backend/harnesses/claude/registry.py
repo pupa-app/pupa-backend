@@ -61,6 +61,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from ag_ui.core import EventType
+
 from pupa_backend.agui.background import BackgroundWork
 
 logger = logging.getLogger("uvicorn.error")
@@ -140,6 +142,19 @@ _DEFAULT_IDLE_TIMEOUT = 900.0
 # Cap on events held between runs (a background task's injected turn). Bounds a
 # session that keeps reporting while nobody ever sends another message.
 _MAX_DEFERRED = 2000
+
+# Event types that only make sense *after* the frame they belong to opened. When
+# the deferred backlog is trimmed, leading events of these types are dropped too
+# — a backlog that starts with a `TEXT_MESSAGE_CONTENT` whose `START` was trimmed
+# away is a protocol violation, not merely a lossy one.
+_CONTINUATION_EVENTS = frozenset({
+    EventType.TEXT_MESSAGE_CONTENT,
+    EventType.TEXT_MESSAGE_END,
+    EventType.THINKING_TEXT_MESSAGE_CONTENT,
+    EventType.THINKING_TEXT_MESSAGE_END,
+    EventType.TOOL_CALL_ARGS,
+    EventType.TOOL_CALL_END,
+})
 
 # How long a new `attach()` waits for the consumer it displaced to hand the
 # queue over. Bounded: a generator nobody is iterating (client gone, close not
@@ -253,6 +268,12 @@ class LiveSession:
     # `deferred` until the next run opens. See `emit` / `open_run`.
     run_open: bool = False
     deferred: list = field(default_factory=list)
+    # Model + thinking level the live client was built with. Both are frozen at
+    # `connect()`, so a turn wanting different ones needs a fresh client.
+    client_shape: tuple | None = None
+    # Ambient context (`input.context`) the live client's system prompt carries.
+    # A continued turn re-delivers it in the query when it has changed.
+    context_pairs: list | None = None
     # The permission-relevant slice of the state the live client was built with
     # (`endpoint._gate_state`). A turn wanting a different one can't reuse this
     # client — the gate's hooks closed over the old state — so it starts fresh.
@@ -284,13 +305,41 @@ class LiveSession:
         `open_run`, so it reaches the user on their next message.
         """
         self.deferred.append(event)
-        if len(self.deferred) > _MAX_DEFERRED:
-            dropped = len(self.deferred) - _MAX_DEFERRED
-            del self.deferred[:dropped]
-            logger.warning(
-                "claude_code loop: deferred backlog full thread_id=%s — dropped "
-                "%d oldest event(s)", self.thread_id, dropped,
-            )
+        if len(self.deferred) <= _MAX_DEFERRED:
+            return
+        before = len(self.deferred)
+        del self.deferred[: before - _MAX_DEFERRED]
+        # Keep trimming until the backlog opens on a frame boundary: releasing a
+        # `TEXT_MESSAGE_CONTENT` whose `START` was just dropped would break the
+        # client's message assembly, not merely lose text.
+        while self.deferred and getattr(self.deferred[0], "type", None) in _CONTINUATION_EVENTS:
+            self.deferred.pop(0)
+        logger.warning(
+            "claude_code loop: deferred backlog full thread_id=%s — dropped %d "
+            "oldest event(s)", self.thread_id, before - len(self.deferred),
+        )
+
+    def route(self, event: Any) -> None:
+        """Emit onto the open run's SSE, or hold it for the next one.
+
+        The single chokepoint for anything produced *by the loop* (the pump, the
+        permission gate): between runs there is no drain and no run the event can
+        belong to. Teardown events bypass this deliberately — they exist to
+        unblock a drain that may be attached right now.
+        """
+        if self.run_open:
+            self.emit(event)
+        else:
+            self.defer(event)
+
+    def take_deferred(self) -> list:
+        """Hand the backlog to whoever will deliver it, and forget it here.
+
+        Used when this session is being torn down but its held background output
+        should still reach the user — the replacement session inherits it.
+        """
+        held, self.deferred = self.deferred, []
+        return held
 
     def open_run(self, run_id: str, started: Any) -> None:
         """Start an HTTP run: emit `started`, then release the deferred backlog.
@@ -302,6 +351,7 @@ class LiveSession:
         self.current_run_id = run_id
         self.run_open = True
         self.background.release()  # a live run is in flight; re-armed at the next park
+        self.prune_pending()
         self.queue.put_nowait(started)
         for event in self.deferred:
             self.queue.put_nowait(event)
@@ -436,6 +486,23 @@ class LiveSession:
                     pc.result = json.dumps({"ok": False, "error": "missing_tool_result"})
             self.cond.notify_all()
         self.touch()
+
+    def prune_pending(self) -> None:
+        """Drop pending calls no handler can still legitimately claim.
+
+        One pump now spans every turn of a live session, so `pending` would grow
+        for the session's whole life. Worse, a call rejected between runs
+        (`reject_pending`) keeps an `app_not_attached` result nobody consumed: a
+        later identical `(name, args)` call would claim *that* slot and never see
+        the device's real answer. Both are cleared when a new run opens — by then
+        the handler that could have taken them has had its whole turn.
+        """
+        stale = [
+            call_id for call_id, pc in self.pending.items()
+            if pc.consumed or pc.run_id is None
+        ]
+        for call_id in stale:
+            self.pending.pop(call_id, None)
 
     def has_unresolved_pending(self) -> bool:
         """True while any frontend call is still waiting for its on-device result."""
