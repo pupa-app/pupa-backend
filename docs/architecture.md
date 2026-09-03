@@ -385,22 +385,34 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
     `RunStarted`. So the background result reaches the user on their next
     message, in the correct frame order. The permission gate routes the same way
     (its prompt would otherwise land ahead of the next `RunStarted`, and its
-    `INTERRUPT` would end that SSE before it began). The backlog is capped and
-    trims to a frame boundary — never to a `TEXT_MESSAGE_CONTENT` whose `START`
-    was dropped. A frontend tool call from an injected turn is rejected
+    `INTERRUPT` would end that SSE before it began) — and with no run open it
+    *denies* rather than parking a question nobody can answer: the endpoint reads
+    `pending_decision` before the new-turn branch, so a parked ask would eat the
+    user's next message as its yes/no and leave that run with no terminal. The
+    backlog is capped, and an overflow drops only the oldest *body* events
+    (`TEXT_MESSAGE_CONTENT`, `TOOL_CALL_ARGS`), never a `START` or an `END`: one
+    long report is most of the backlog, so trimming by position would take its
+    `START` and orphan everything after it. A frontend tool call from an injected
+    turn is rejected
     (`app_not_attached`) rather than parked — the device isn't listening and no
-    resume can ever answer it; `open_run` then prunes that slot so a later
-    identical call can't claim its error instead of the device's real result.
+    resume can ever answer it. That slot is marked `rejected`, so `claim_call`
+    prefers any real on-device result over it, and `open_run` prunes it one run
+    later — not immediately, since its own handler may not be scheduled until
+    after the next run opens.
   - The **next user turn is fed into the same live client** (`_continue_live_turn`)
     instead of retiring it for a fresh child. `_cannot_continue_live` declines
-    when the turn advertises tools the frozen in-process server can't expose, the
+    when the turn's frontend tool surface differs at all from the frozen
+    in-process server's (a dropped tool matters as much as an added one), the
     permission-relevant state changed (`_gate_state`), the model or thinking level
-    changed, or a frontend call / permission ask is still parked; it then starts
+    changed, or a frontend call is still parked; it then starts
     fresh, logs the tasks that orphans, and the replacement session **inherits
     the deferred backlog** so the background report is still delivered. The
     ambient context normally refreshes in the system prompt of each fresh client;
     a continued turn has no fresh client, so a changed `input.context` is
     re-delivered at the head of the query instead.
+  - A **gate-unlock continuation** replaces the CLI child, so it clears the
+    tracker: those tasks died with the old child, and counting them against the
+    new one would park every later turn on work nobody is doing.
   - A **resume POST** never lands on a session held only for background work: no
     handler is parked, so attaching would block on a queue the idle pump won't
     feed. It gets the same stale-session `RunError` as before the hold existed.

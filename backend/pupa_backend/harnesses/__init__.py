@@ -92,7 +92,7 @@ class AgentHarness(Protocol):
     def register(self, app: Any, path: str, deps: HarnessDeps) -> None: ...
     def models(self) -> list[dict]: ...
     # Optional: reap sessions this harness is holding open. Called periodically by
-    # the app lifespan (see `app.sweep_harnesses`) and read via getattr, so a
+    # the app lifespan (see `sweep_harnesses` below) and read via getattr, so a
     # harness that holds nothing may omit it. A harness whose loop can keep an
     # external process alive between turns MUST implement it — otherwise its
     # retention wall is only enforced when the next request happens to arrive.

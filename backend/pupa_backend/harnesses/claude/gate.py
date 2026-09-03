@@ -324,6 +324,25 @@ async def _ask_user(session: Any, tool_name: str, tool_input: dict[str, Any]) ->
     on a per-session future the endpoint resolves from the user's next message.
     Returns True if the user approved.
     """
+    if not getattr(session, "run_open", True):
+        # No run is open, so this is a turn nobody requested — a background task
+        # reporting in. There is no SSE to carry the question and no reply to
+        # wait for: parking the future here would silently consume the user's
+        # next message as the answer (the endpoint's permission-reply branch
+        # runs before the new-turn branch) and leave that run with no terminal.
+        # Deny, fail-closed, and leave a note that surfaces on the next run.
+        logger.info(
+            "claude_code loop: denying %s — permission asked with no run open "
+            "(thread=%s)", tool_name, getattr(session, "thread_id", "?"),
+        )
+        _emit_prompt(
+            session,
+            f"A background task wanted to {_describe(tool_name, tool_input)}, but "
+            "I could not ask you at the time, so I did not run it. Tell me to go "
+            "ahead if you still want it.",
+        )
+        return False
+
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     session.pending_decision = fut
@@ -334,11 +353,7 @@ async def _ask_user(session: Any, tool_name: str, tool_input: dict[str, Any]) ->
         "Reply **yes** to allow, **no** to deny, or **always** to run everything "
         "this session without asking again.",
     )
-    # Only a run that is actually open has an SSE to end. Asking during a turn
-    # nobody requested (a background task reporting in) just parks the future:
-    # the prompt text is deferred, and the user's next message answers it.
-    if session.run_open:
-        session.emit(cl_events.run_finished(session.thread_id, session.current_run_id or ""))
-        session.mark_interrupt()
+    session.emit(cl_events.run_finished(session.thread_id, session.current_run_id or ""))
+    session.mark_interrupt()
 
     return bool(await fut)

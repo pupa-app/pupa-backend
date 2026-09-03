@@ -412,14 +412,15 @@ async def test_task_updated_patch_status_is_terminal(loop_app) -> None:
 # Regressions from the first review round
 # --------------------------------------------------------------------------- #
 
-async def test_permission_prompt_between_runs_is_deferred_not_queued(
+async def test_permission_ask_with_no_run_open_denies_instead_of_parking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The gate must route like the pump does.
+    """Nobody can answer a question asked between runs.
 
-    Emitting straight onto the queue with no run open puts the prompt — and an
-    `INTERRUPT` sentinel — ahead of the next run's `RunStarted`, so that run's
-    SSE starts mid-message and ends on the previous run's id.
+    Parking the future would silently consume the user's next message as the
+    answer (the endpoint checks `pending_decision` before the new-turn branch)
+    and leave that run with no terminal event. Deny, and leave a note that
+    surfaces on the next run.
     """
     from pupa_backend.harnesses.claude import gate
 
@@ -430,15 +431,44 @@ async def test_permission_prompt_between_runs_is_deferred_not_queued(
     session.current_run_id = "r1"
     session.run_open = False  # held open for background work, no SSE attached
     hook = gate.make_pre_tool_use_hook({}, session)
-    task = asyncio.ensure_future(
-        hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None)
-    )
-    await _settle(lambda: session.pending_decision is not None)
 
-    assert session.queue.qsize() == 0, "the prompt jumped ahead of the next RunStarted"
-    assert len(session.deferred) == 3  # start / content / end
-    session.pending_decision.set_result(False)
-    await asyncio.wait_for(task, timeout=1)
+    decision = await asyncio.wait_for(
+        hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None),
+        timeout=2,
+    )
+
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert session.pending_decision is None, "armed a future nobody can resolve"
+    assert session.queue.qsize() == 0, "the note jumped ahead of the next RunStarted"
+    assert len(session.deferred) == 3  # start / content / end, held for the next run
+
+
+async def test_a_deferred_permission_note_does_not_eat_the_next_message(loop_app) -> None:
+    """End to end: the user's next message must reach the model, not be read as
+    a yes/no to a question they never saw."""
+    _FakeSDKClient.script = [
+        [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
+        [_assistant("answering", "m-2"), _result()],
+    ]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/", json=_body("run-1", "go"))
+        session = registry.get(THREAD)
+        assert session is not None
+
+        from pupa_backend.harnesses.claude import gate
+
+        assert await gate._ask_user(session, "Bash", {"command": "ls"}) is False
+        assert session.pending_decision is None
+
+        events = await asyncio.wait_for(
+            client.post("/", json=_body("run-2", "what is the weather?")), timeout=5
+        )
+
+    types = [e["type"] for e in _sse(events.text)]
+    assert types[0] == "RUN_STARTED"
+    assert types[-1] == "RUN_FINISHED"
+    assert _FakeSDKClient.instances[0].queries[-1] == "what is the weather?"
 
 
 def test_a_status_less_patch_does_not_resurrect_a_finished_task() -> None:
@@ -545,19 +575,19 @@ async def test_resume_post_on_a_background_held_session_does_not_hang(loop_app) 
     assert registry.get(THREAD) is not None  # the hold survives the stray resume
 
 
-async def test_pruned_rejects_do_not_poison_a_later_identical_call() -> None:
-    """A rejected between-runs call keeps an `app_not_attached` result nobody
-    consumed; `claim_call` matches on (name, args), so the next real call would
-    take it and the device's answer would never be seen."""
+async def test_a_stale_reject_never_wins_over_a_real_device_result() -> None:
+    """A call rejected between runs lingers for one run so its own handler can
+    still take it. `claim_call` matches on (name, args), so a later real call
+    would otherwise be handed that `app_not_attached` error and the device's
+    answer would never be consumed."""
     session = registry.LiveSession(thread_id="t-prune")
     await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
     await session.reject_pending(["call-bg"], "app_not_attached")
 
     session.open_run("run-2", object())
-    assert "call-bg" not in session.pending
-
     await session.register_pending("call-user", "renderTracker", {}, run_id="run-2")
     await session.resolve_results([{"toolCallId": "call-user", "content": "real result"}])
+
     got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
     assert got["content"][0]["text"] == "real result"
 
@@ -605,3 +635,86 @@ async def test_harness_sweep_evicts_an_expired_hold() -> None:
         await _settle(lambda: registry.get("thread-expired") is None, timeout=3.0)
     finally:
         task.cancel()
+
+
+async def test_a_continuation_stops_counting_the_child_it_replaced(loop_app) -> None:
+    """A gate unlock disconnects the child that owned the background tasks, so
+    they die with it — keeping them tracked would park every later turn."""
+    session = registry.create("t-cont")
+    session.background.start("bg-1", "long job")
+    session.background.hold()
+    old = _FakeSDKClient()
+    session.client = old
+    session.turn_input = None
+
+    async def _fake_options(*a, **k):
+        raise AssertionError("not reached")
+
+    monkey_options = cl_endpoint._options_for
+    cl_endpoint._options_for = lambda *a, **k: None  # type: ignore[assignment]
+    try:
+        await cl_endpoint._start_continuation(session, [])
+    finally:
+        cl_endpoint._options_for = monkey_options  # type: ignore[assignment]
+
+    assert old.disconnected is True
+    assert not session.background.active, "tracking tasks the dead child owned"
+    assert not session.background.holding
+    if session.pump_task is not None:
+        session.pump_task.cancel()
+
+
+async def test_a_shrunken_tool_surface_also_starts_fresh(loop_app) -> None:
+    """A turn that drops a tool must not run on a client still exposing it — the
+    model could call something the app isn't offering, and no resume answers."""
+    _FakeSDKClient.script = [
+        [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
+        [_assistant("fresh", "m-2"), _result()],
+    ]
+    tools = [{"name": "renderTracker", "description": "r", "parameters": {"type": "object"}}]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/", json=_body("run-1", "go", tools=tools))
+        await client.post("/", json=_body("run-2", "again", tools=[]))
+
+    assert len(_FakeSDKClient.instances) == 2
+    assert _FakeSDKClient.instances[0].disconnected is True
+
+
+def test_trimming_one_long_message_keeps_its_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A background report is one long streamed message, so a positional trim
+    takes its `START` and orphans everything after — the whole report is lost and
+    the backlog head becomes a `CONTENT` with no `START`."""
+    from ag_ui.core import EventType
+    from ag_ui.core.events import TextMessageContentEvent, TextMessageStartEvent
+
+    monkeypatch.setattr(registry, "_MAX_DEFERRED", 20)
+    session = registry.LiveSession(thread_id="t-long")
+    session.defer(TextMessageStartEvent(
+        type=EventType.TEXT_MESSAGE_START, message_id="m-1", role="assistant"))
+    for i in range(60):
+        session.defer(TextMessageContentEvent(
+            type=EventType.TEXT_MESSAGE_CONTENT, message_id="m-1", delta=str(i)))
+
+    assert session.deferred, "the whole report was dropped"
+    assert session.deferred[0].type == EventType.TEXT_MESSAGE_START
+    assert len(session.deferred) <= registry._MAX_DEFERRED + 1
+    # The text that survived is the newest, not a random middle slice.
+    assert session.deferred[-1].delta == "59"
+
+
+async def test_a_rejected_slot_survives_the_run_that_follows_it() -> None:
+    """The handler for a between-runs rejection may not be scheduled until after
+    the next run opens; pruning it there would block that handler for the whole
+    park wall."""
+    session = registry.LiveSession(thread_id="t-prune-race")
+    await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
+    await session.reject_pending(["call-bg"], "app_not_attached")
+
+    session.open_run("run-2", object())
+    assert "call-bg" in session.pending, "pruned out from under its handler"
+    got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
+    assert "app_not_attached" in got["content"][0]["text"]
+
+    session.open_run("run-3", object())
+    assert "call-bg" not in session.pending  # gone by the run after

@@ -143,18 +143,20 @@ _DEFAULT_IDLE_TIMEOUT = 900.0
 # session that keeps reporting while nobody ever sends another message.
 _MAX_DEFERRED = 2000
 
-# Event types that only make sense *after* the frame they belong to opened. When
-# the deferred backlog is trimmed, leading events of these types are dropped too
-# — a backlog that starts with a `TEXT_MESSAGE_CONTENT` whose `START` was trimmed
-# away is a protocol violation, not merely a lossy one.
-_CONTINUATION_EVENTS = frozenset({
+# The only events the backlog trim may drop: the *body* of a frame. Dropping a
+# `START` orphans every delta after it, and dropping an `END` leaves the client's
+# message open forever — either is a protocol violation, not merely lossy. So an
+# overflowing backlog loses its oldest text, never the structure around it.
+_TRIMMABLE_EVENTS = frozenset({
     EventType.TEXT_MESSAGE_CONTENT,
-    EventType.TEXT_MESSAGE_END,
     EventType.THINKING_TEXT_MESSAGE_CONTENT,
-    EventType.THINKING_TEXT_MESSAGE_END,
     EventType.TOOL_CALL_ARGS,
-    EventType.TOOL_CALL_END,
 })
+
+# Failsafe for a backlog that is somehow all structure and no body: nothing is
+# trimmable, so the cap above can't bite. Dropping it loses the report but keeps
+# the process bounded, which is what a cap is for.
+_HARD_MAX_DEFERRED_FACTOR = 4
 
 # How long a new `attach()` waits for the consumer it displaced to hand the
 # queue over. Bounded: a generator nobody is iterating (client gone, close not
@@ -206,6 +208,8 @@ class PendingCall:
     result: Any = _UNSET
     consumed: bool = False
     run_id: str | None = None  # HTTP run that emitted this call — scopes synth
+    seq: int = 0  # the session's run counter when registered — see `prune_pending`
+    rejected: bool = False  # synthesised failure, not an on-device result
 
 
 @dataclass
@@ -267,6 +271,9 @@ class LiveSession:
     # produces on its own (a background task's injected turn) is held in
     # `deferred` until the next run opens. See `emit` / `open_run`.
     run_open: bool = False
+    # Runs opened on this session, so a pending call can be aged in runs rather
+    # than wall-clock. See `prune_pending`.
+    run_seq: int = 0
     deferred: list = field(default_factory=list)
     # Model + thinking level the live client was built with. Both are frozen at
     # `connect()`, so a turn wanting different ones needs a fresh client.
@@ -308,15 +315,23 @@ class LiveSession:
         if len(self.deferred) <= _MAX_DEFERRED:
             return
         before = len(self.deferred)
-        del self.deferred[: before - _MAX_DEFERRED]
-        # Keep trimming until the backlog opens on a frame boundary: releasing a
-        # `TEXT_MESSAGE_CONTENT` whose `START` was just dropped would break the
-        # client's message assembly, not merely lose text.
-        while self.deferred and getattr(self.deferred[0], "type", None) in _CONTINUATION_EVENTS:
-            self.deferred.pop(0)
+        # Drop the oldest *body* events only. One long message can be most of the
+        # backlog, so trimming by position would take its `START` with it and
+        # orphan everything after — losing the whole report and leaving the next
+        # delta at the head of a backlog with no `START`.
+        budget = before - _MAX_DEFERRED
+        survivors = []
+        for held in self.deferred:
+            if budget > 0 and getattr(held, "type", None) in _TRIMMABLE_EVENTS:
+                budget -= 1
+                continue
+            survivors.append(held)
+        self.deferred = survivors
+        if len(self.deferred) > _MAX_DEFERRED * _HARD_MAX_DEFERRED_FACTOR:
+            self.deferred = []
         logger.warning(
             "claude_code loop: deferred backlog full thread_id=%s — dropped %d "
-            "oldest event(s)", self.thread_id, before - len(self.deferred),
+            "of the oldest event(s)", self.thread_id, before - len(self.deferred),
         )
 
     def route(self, event: Any) -> None:
@@ -350,6 +365,7 @@ class LiveSession:
         """
         self.current_run_id = run_id
         self.run_open = True
+        self.run_seq += 1
         self.background.release()  # a live run is in flight; re-armed at the next park
         self.prune_pending()
         self.queue.put_nowait(started)
@@ -386,7 +402,7 @@ class LiveSession:
         """Record a frontend call from the model and wake any waiting handler."""
         async with self.cond:
             self.pending[call_id] = PendingCall(
-                call_id=call_id, name=name, args=args, run_id=run_id
+                call_id=call_id, name=name, args=args, run_id=run_id, seq=self.run_seq
             )
             self.cond.notify_all()
 
@@ -407,15 +423,23 @@ class LiveSession:
         grace = liveness_grace()
         async with self.cond:
             while True:
-                for pc in self.pending.values():
-                    if (
-                        not pc.consumed
-                        and pc.result is not _UNSET
-                        and pc.name == name
-                        and _args_key(pc.args) == _args_key(args)
-                    ):
-                        pc.consumed = True
-                        return _mcp_tool_result(pc.result)
+                matches = [
+                    pc for pc in self.pending.values()
+                    if not pc.consumed
+                    and pc.result is not _UNSET
+                    and pc.name == name
+                    and _args_key(pc.args) == _args_key(args)
+                ]
+                # A real on-device result always wins over a synthesised
+                # rejection: a call rejected between runs lingers for one run so
+                # its own handler can still take it, and insertion order would
+                # otherwise hand that error to an unrelated later call.
+                pick = next((pc for pc in matches if not pc.rejected), None) or (
+                    matches[0] if matches else None
+                )
+                if pick is not None:
+                    pick.consumed = True
+                    return _mcp_tool_result(pick.result)
                 # Effective deadline: once the client has pinged, wait
                 # only `grace` past its last ping — a dead app fails fast no
                 # matter how long the tool budget is. A backgrounded client
@@ -494,12 +518,17 @@ class LiveSession:
         for the session's whole life. Worse, a call rejected between runs
         (`reject_pending`) keeps an `app_not_attached` result nobody consumed: a
         later identical `(name, args)` call would claim *that* slot and never see
-        the device's real answer. Both are cleared when a new run opens — by then
-        the handler that could have taken them has had its whole turn.
+        the device's real answer.
+
+        A rejected slot survives one whole run before it goes, though. The
+        handler that should take it may not have been scheduled yet when the run
+        opens — `_continue_live_turn` awaits the query first, so a rejection can
+        land in that window — and pruning it out from under that handler would
+        block the handler for the full park wall.
         """
         stale = [
             call_id for call_id, pc in self.pending.items()
-            if pc.consumed or pc.run_id is None
+            if pc.consumed or (pc.run_id is None and pc.seq <= self.run_seq - 2)
         ]
         for call_id in stale:
             self.pending.pop(call_id, None)
@@ -520,6 +549,7 @@ class LiveSession:
                 pc = self.pending.get(call_id)
                 if pc is not None and pc.result is _UNSET:
                     pc.result = json.dumps({"ok": False, "error": error})
+                    pc.rejected = True
             self.cond.notify_all()
 
     # -- teardown -------------------------------------------------------------
@@ -771,6 +801,9 @@ def _evictable(session: LiveSession, now: float, timeout: float) -> bool:
     (`PUPA_BACKGROUND_HOLD`), whatever the idle clock says.
     """
     if session.background.holding:
+        pump = session.pump_task
+        if pump is not None and pump.done():
+            return True  # nothing is left to receive the work it is held for
         return session.background.hold_expired(now)
     return now - session.last_activity > timeout
 

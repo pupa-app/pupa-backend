@@ -267,6 +267,10 @@ async def lifespan(app: FastAPI):
                 yield
             finally:
                 sweeper.cancel()
+                # Await the cancellation: a task merely asked to stop can be
+                # garbage-collected while pending, and any error it raised
+                # outside its own guard would surface only at GC.
+                await asyncio.gather(sweeper, return_exceptions=True)
                 if screenshare_enabled():
                     from pupa_backend.screenshare.sidecar_token import revoke as _revoke_sidecar_token
                     _revoke_sidecar_token()

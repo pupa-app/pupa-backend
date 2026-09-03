@@ -117,6 +117,16 @@ class BackgroundWork:
 
     # -- the harness asks --------------------------------------------------
 
+    def reset(self) -> None:
+        """Forget everything: the process that owned this work is gone.
+
+        A harness that replaces its child mid-session must call this — the
+        tasks died with the old process, and counting them against the new one
+        would hold the session open forever for work nobody is doing.
+        """
+        self.tasks.clear()
+        self.release()
+
     @property
     def active(self) -> bool:
         return bool(self.tasks)

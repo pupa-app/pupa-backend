@@ -565,6 +565,15 @@ async def _start_continuation(session: registry.LiveSession, descriptors: list[A
         resume_id, len(session.frontend_qualified), session.thread_id,
     )
     await new_client.query(_CONTINUATION_PROMPT)
+    if session.background.active:
+        # The old child owned those tasks and is about to be disconnected: they
+        # die with it. Counting them against the new child would park every
+        # later turn on work nobody is doing, pinning the session indefinitely.
+        logger.info(
+            "claude_code loop: continuation replaces the child — orphaning %s "
+            "(thread=%s)", session.background.summary(), session.thread_id,
+        )
+        session.background.reset()
     if old_client is not None:
         try:
             await old_client.disconnect()
@@ -647,8 +656,12 @@ def _cannot_continue_live(session: registry.LiveSession, input: RunAgentInput) -
         return "a frontend tool call is still parked"
     if session.pending_decision is not None and not session.pending_decision.done():
         return "a permission request is still parked"
-    if frontend_qualified_names(list(input.tools or [])) - session.frontend_qualified:
-        return "the turn advertises tools the live client can't expose"
+    advertised = frontend_qualified_names(list(input.tools or []))
+    if advertised != session.frontend_qualified:
+        # Not just widening: a turn that drops a tool would still run on a client
+        # exposing it, and the model could then call something the app is not
+        # offering this round — a call no resume will ever answer.
+        return "the turn's frontend tool surface differs from the live client's"
     gate_state = _gate_state(input.state)
     if session.gate_state is not None and gate_state != session.gate_state:
         return f"permission state changed {session.gate_state} -> {gate_state}"
