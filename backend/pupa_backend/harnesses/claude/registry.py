@@ -154,9 +154,31 @@ _TRIMMABLE_EVENTS = frozenset({
 })
 
 # Failsafe for a backlog that is somehow all structure and no body: nothing is
-# trimmable, so the cap above can't bite. Dropping it loses the report but keeps
-# the process bounded, which is what a cap is for.
+# trimmable, so the cap above can't bite. Then whole frames go, oldest first.
 _HARD_MAX_DEFERRED_FACTOR = 4
+
+# How far over the cap the backlog may run before a trim. Trimming on every
+# `defer` would rebuild the list per streamed delta (and log a line per event);
+# a batch keeps it amortised.
+_TRIM_SLACK = 200
+
+# Events that open and close a frame. A body event whose `START` was dropped is
+# unrenderable, so the trim drops frames whole rather than by position.
+_FRAME_START_EVENTS = frozenset({
+    EventType.TEXT_MESSAGE_START,
+    EventType.THINKING_TEXT_MESSAGE_START,
+    EventType.TOOL_CALL_START,
+})
+_FRAME_END_EVENTS = frozenset({
+    EventType.TEXT_MESSAGE_END,
+    EventType.THINKING_TEXT_MESSAGE_END,
+    EventType.TOOL_CALL_END,
+})
+
+
+def _frame_id(event: Any) -> str | None:
+    """The id tying one frame's events together, or None for a standalone event."""
+    return getattr(event, "message_id", None) or getattr(event, "tool_call_id", None)
 
 # How long a new `attach()` waits for the consumer it displaced to hand the
 # queue over. Bounded: a generator nobody is iterating (client gone, close not
@@ -275,6 +297,10 @@ class LiveSession:
     # than wall-clock. See `prune_pending`.
     run_seq: int = 0
     deferred: list = field(default_factory=list)
+    # Frames the backlog trim dropped the `START` of. Their remaining deltas are
+    # dropped too — a body event with no `START` is unrenderable. An id leaves the
+    # set when its `END` goes by.
+    dropped_frames: set = field(default_factory=set)
     # Model + thinking level the live client was built with. Both are frozen at
     # `connect()`, so a turn wanting different ones needs a fresh client.
     client_shape: tuple | None = None
@@ -311,8 +337,17 @@ class LiveSession:
         SSE is attached to carry it. Held here and released by the next
         `open_run`, so it reaches the user on their next message.
         """
+        if _frame_id(event) is not None and _frame_id(event) in self.dropped_frames:
+            # This frame's `START` is already gone; its body would be orphaned.
+            # The `END` closes the frame out of the drop set.
+            if getattr(event, "type", None) in _FRAME_END_EVENTS:
+                self.dropped_frames.discard(_frame_id(event))
+            return
         self.deferred.append(event)
-        if len(self.deferred) <= _MAX_DEFERRED:
+        # Trim in batches, not on every event: `defer` is called one event at a
+        # time, so trimming at the cap would rebuild the whole list per delta and
+        # log a line each time.
+        if len(self.deferred) <= _MAX_DEFERRED + _TRIM_SLACK:
             return
         before = len(self.deferred)
         # Drop the oldest *body* events only. One long message can be most of the
@@ -328,11 +363,39 @@ class LiveSession:
             survivors.append(held)
         self.deferred = survivors
         if len(self.deferred) > _MAX_DEFERRED * _HARD_MAX_DEFERRED_FACTOR:
-            self.deferred = []
-        logger.warning(
-            "claude_code loop: deferred backlog full thread_id=%s — dropped %d "
-            "of the oldest event(s)", self.thread_id, before - len(self.deferred),
-        )
+            # All structure and no body, so the trim above could not bite. Drop
+            # the oldest events and then every event orphaned by that — a frame
+            # whose `START` is gone is dropped whole, here and (via
+            # `dropped_frames`) for the rest of its deltas.
+            self._drop_oldest_frames(len(self.deferred) - _MAX_DEFERRED)
+        if before != len(self.deferred):
+            logger.warning(
+                "claude_code loop: deferred backlog full thread_id=%s — dropped %d "
+                "of the oldest event(s)", self.thread_id, before - len(self.deferred),
+            )
+
+    def _drop_oldest_frames(self, count: int) -> None:
+        """Drop `count` oldest events, then everything they orphaned.
+
+        Keeps the backlog's invariant: it never starts on — or contains — a body
+        event whose `START` is missing.
+        """
+        for held in self.deferred[:count]:
+            frame = _frame_id(held)
+            # `None` must never enter the set — it would swallow every standalone
+            # event (a `CustomEvent`, a terminal) from then on.
+            if frame is not None and getattr(held, "type", None) in _FRAME_START_EVENTS:
+                self.dropped_frames.add(frame)
+        del self.deferred[:count]
+        kept = []
+        for held in self.deferred:
+            frame = _frame_id(held)
+            if frame in self.dropped_frames:
+                if getattr(held, "type", None) in _FRAME_END_EVENTS:
+                    self.dropped_frames.discard(frame)
+                continue
+            kept.append(held)
+        self.deferred = kept
 
     def route(self, event: Any) -> None:
         """Emit onto the open run's SSE, or hold it for the next one.
@@ -426,17 +489,23 @@ class LiveSession:
                 matches = [
                     pc for pc in self.pending.values()
                     if not pc.consumed
-                    and pc.result is not _UNSET
                     and pc.name == name
                     and _args_key(pc.args) == _args_key(args)
                 ]
-                # A real on-device result always wins over a synthesised
-                # rejection: a call rejected between runs lingers for one run so
-                # its own handler can still take it, and insertion order would
-                # otherwise hand that error to an unrelated later call.
-                pick = next((pc for pc in matches if not pc.rejected), None) or (
-                    matches[0] if matches else None
+                pick = next(
+                    (pc for pc in matches if pc.result is not _UNSET and not pc.rejected),
+                    None,
                 )
+                if pick is None:
+                    # Only fall back to a synthesised rejection when no genuine
+                    # call of this shape is still outstanding. A rejected slot
+                    # lingers for a run so its *own* handler can take it — but a
+                    # handler that is waiting for the device (or the model's
+                    # retry of the same call) must block for the real answer, not
+                    # be handed a stale `app_not_attached`.
+                    outstanding = any(pc.result is _UNSET for pc in matches)
+                    if not outstanding:
+                        pick = next((pc for pc in matches if pc.result is not _UNSET), None)
                 if pick is not None:
                     pick.consumed = True
                     return _mcp_tool_result(pick.result)

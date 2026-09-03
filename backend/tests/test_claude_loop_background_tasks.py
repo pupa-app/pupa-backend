@@ -429,7 +429,9 @@ async def test_permission_ask_with_no_run_open_denies_instead_of_parking(
     monkeypatch.delenv("PUPA_CLAUDE_LOOP_AUTO_APPROVE", raising=False)
     session = registry.LiveSession(thread_id="t-perm-bg")
     session.current_run_id = "r1"
-    session.run_open = False  # held open for background work, no SSE attached
+    session.run_open = False  # no SSE attached...
+    session.background.start("bg-1", "long job")
+    session.background.hold()  # ...because the session is held for background work
     hook = gate.make_pre_tool_use_hook({}, session)
 
     decision = await asyncio.wait_for(
@@ -575,26 +577,107 @@ async def test_resume_post_on_a_background_held_session_does_not_hang(loop_app) 
     assert registry.get(THREAD) is not None  # the hold survives the stray resume
 
 
-async def test_a_stale_reject_never_wins_over_a_real_device_result() -> None:
+async def test_a_stale_reject_never_wins_over_a_real_device_call() -> None:
     """A call rejected between runs lingers for one run so its own handler can
     still take it. `claim_call` matches on (name, args), so a later real call
-    would otherwise be handed that `app_not_attached` error and the device's
-    answer would never be consumed."""
+    must not be handed that `app_not_attached` error.
+
+    The handler blocks *before* the device's resume lands — the ordering the code
+    actually lives in — so preferring a non-rejected slot that already has a
+    result is not enough: with a genuine call outstanding, the wait must continue.
+    """
     session = registry.LiveSession(thread_id="t-prune")
     await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
     await session.reject_pending(["call-bg"], "app_not_attached")
 
     session.open_run("run-2", object())
     await session.register_pending("call-user", "renderTracker", {}, run_id="run-2")
-    await session.resolve_results([{"toolCallId": "call-user", "content": "real result"}])
 
-    got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
+    claim = asyncio.ensure_future(session.claim_call("renderTracker", {}, timeout=5))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not claim.done(), "handed the stale rejection to a call still awaiting the device"
+
+    await session.resolve_results([{"toolCallId": "call-user", "content": "real result"}])
+    got = await asyncio.wait_for(claim, timeout=2)
     assert got["content"][0]["text"] == "real result"
 
 
-def test_deferred_trim_keeps_a_frame_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Dropping the oldest events must not leave the backlog starting on a
-    `TEXT_MESSAGE_CONTENT` whose `START` was trimmed away."""
+async def test_a_rejected_slot_is_still_claimable_by_its_own_handler() -> None:
+    """The rejection exists so the injected turn's handler returns instead of
+    blocking on the park wall — that must keep working."""
+    session = registry.LiveSession(thread_id="t-reject-own")
+    await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
+    await session.reject_pending(["call-bg"], "app_not_attached")
+
+    got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
+    assert "app_not_attached" in got["content"][0]["text"]
+
+
+def test_trimming_one_long_message_keeps_its_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A background report is one long streamed message, so a positional trim
+    takes its `START` and orphans everything after — the whole report is lost and
+    the backlog head becomes a `CONTENT` with no `START`."""
+    from ag_ui.core import EventType
+    from ag_ui.core.events import TextMessageContentEvent, TextMessageStartEvent
+
+    monkeypatch.setattr(registry, "_MAX_DEFERRED", 20)
+    monkeypatch.setattr(registry, "_TRIM_SLACK", 0)
+    session = registry.LiveSession(thread_id="t-long")
+    session.defer(TextMessageStartEvent(
+        type=EventType.TEXT_MESSAGE_START, message_id="m-1", role="assistant"))
+    for i in range(60):
+        session.defer(TextMessageContentEvent(
+            type=EventType.TEXT_MESSAGE_CONTENT, message_id="m-1", delta=str(i)))
+
+    assert session.deferred, "the whole report was dropped"
+    assert session.deferred[0].type == EventType.TEXT_MESSAGE_START
+    assert len(session.deferred) <= registry._MAX_DEFERRED + 1
+    assert not session.dropped_frames  # the frame survived whole
+    # The text that survived is the newest, not a random middle slice.
+    assert session.deferred[-1].delta == "59"
+
+
+async def test_a_rejected_slot_survives_the_run_that_follows_it() -> None:
+    """The handler for a between-runs rejection may not be scheduled until after
+    the next run opens; pruning it there would block that handler for the whole
+    park wall."""
+    session = registry.LiveSession(thread_id="t-prune-race")
+    await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
+    await session.reject_pending(["call-bg"], "app_not_attached")
+
+    session.open_run("run-2", object())
+    assert "call-bg" in session.pending, "pruned out from under its handler"
+    got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
+    assert "app_not_attached" in got["content"][0]["text"]
+
+    session.open_run("run-3", object())
+    assert "call-bg" not in session.pending  # gone by the run after
+
+
+async def test_a_parked_frontend_call_still_gets_a_permission_prompt() -> None:
+    """`run_open` is False while a frontend tool is parked too — but the user is
+    right there with a resume POST in flight. Denying there would silently drop
+    commands they would have approved, and blame a background task for it."""
+    from pupa_backend.harnesses.claude import gate
+
+    session = registry.LiveSession(thread_id="t-parked-ask")
+    session.current_run_id = "r1"
+    session.run_open = False          # the pump emitted an interrupt for a device call
+    assert not session.background.holding  # ...not held for background work
+
+    task = asyncio.ensure_future(gate._ask_user(session, "Bash", {"command": "ls"}))
+    await _settle(lambda: session.pending_decision is not None)
+
+    assert session.pending_decision is not None, "denied an ask the user could answer"
+    session.pending_decision.set_result(True)
+    assert await asyncio.wait_for(task, timeout=1) is True
+
+
+def test_the_failsafe_trim_never_orphans_a_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The failsafe fires when nothing is trimmable. Wiping the list would drop
+    `START`s and leave the next delta orphaned — the very defect the trim exists
+    to prevent."""
     from ag_ui.core import EventType
     from ag_ui.core.events import (
         TextMessageContentEvent,
@@ -603,38 +686,51 @@ def test_deferred_trim_keeps_a_frame_boundary(monkeypatch: pytest.MonkeyPatch) -
     )
 
     monkeypatch.setattr(registry, "_MAX_DEFERRED", 4)
-    session = registry.LiveSession(thread_id="t-trim")
-    for i in range(3):
+    monkeypatch.setattr(registry, "_TRIM_SLACK", 0)
+    session = registry.LiveSession(thread_id="t-failsafe")
+    # START/END pairs only: nothing is trimmable, so the failsafe has to act.
+    for i in range(40):
         session.defer(TextMessageStartEvent(
             type=EventType.TEXT_MESSAGE_START, message_id=f"m{i}", role="assistant"))
-        session.defer(TextMessageContentEvent(
-            type=EventType.TEXT_MESSAGE_CONTENT, message_id=f"m{i}", delta="x"))
         session.defer(TextMessageEndEvent(
             type=EventType.TEXT_MESSAGE_END, message_id=f"m{i}"))
 
-    assert session.deferred, "everything was trimmed away"
-    assert session.deferred[0].type == EventType.TEXT_MESSAGE_START
+    open_frames = set()
+    for e in session.deferred:
+        if e.type == EventType.TEXT_MESSAGE_START:
+            open_frames.add(e.message_id)
+        else:
+            assert e.message_id in open_frames, f"orphaned {e.type} for {e.message_id}"
+
+    # A later delta of a frame whose START was dropped is dropped too, rather
+    # than heading a backlog with no START.
+    session.deferred.clear()
+    session.defer(TextMessageContentEvent(
+        type=EventType.TEXT_MESSAGE_CONTENT, message_id="m0", delta="late"))
+    assert session.deferred == []
 
 
-async def test_harness_sweep_evicts_an_expired_hold() -> None:
-    """`sweep_idle` runs on a timer, not only when the next turn happens to
-    arrive — otherwise the hold is not a bound at all."""
-    from pupa_backend.harnesses import ClaudeCodeHarness, sweep_harnesses
+def test_trimming_does_not_log_or_rebuild_on_every_event(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """`defer` is called once per streamed delta; trimming at the cap logged a
+    line and rebuilt the whole list for each one."""
+    from ag_ui.core import EventType
+    from ag_ui.core.events import TextMessageContentEvent, TextMessageStartEvent
 
-    registry._REGISTRY.clear()
-    session = registry.create("thread-expired")
-    session.background.start("t1", "job")
-    session.background.hold_until = 0.0
+    monkeypatch.setattr(registry, "_MAX_DEFERRED", 50)
+    monkeypatch.setattr(registry, "_TRIM_SLACK", 20)
+    session = registry.LiveSession(thread_id="t-spam")
+    session.defer(TextMessageStartEvent(
+        type=EventType.TEXT_MESSAGE_START, message_id="m-1", role="assistant"))
+    with caplog.at_level("WARNING", logger="uvicorn.error"):
+        for i in range(300):
+            session.defer(TextMessageContentEvent(
+                type=EventType.TEXT_MESSAGE_CONTENT, message_id="m-1", delta=str(i)))
 
-    class _Registry:
-        def enabled(self):
-            return [ClaudeCodeHarness()]
-
-    task = asyncio.ensure_future(sweep_harnesses(_Registry(), interval=0.01))
-    try:
-        await _settle(lambda: registry.get("thread-expired") is None, timeout=3.0)
-    finally:
-        task.cancel()
+    warnings = [r for r in caplog.records if "deferred backlog full" in r.message]
+    assert 0 < len(warnings) <= 300 / registry._TRIM_SLACK + 1, len(warnings)
+    assert all("dropped 0 " not in r.getMessage() for r in warnings)
 
 
 async def test_a_continuation_stops_counting_the_child_it_replaced(loop_app) -> None:
@@ -646,9 +742,6 @@ async def test_a_continuation_stops_counting_the_child_it_replaced(loop_app) -> 
     old = _FakeSDKClient()
     session.client = old
     session.turn_input = None
-
-    async def _fake_options(*a, **k):
-        raise AssertionError("not reached")
 
     monkey_options = cl_endpoint._options_for
     cl_endpoint._options_for = lambda *a, **k: None  # type: ignore[assignment]
@@ -681,40 +774,47 @@ async def test_a_shrunken_tool_surface_also_starts_fresh(loop_app) -> None:
     assert _FakeSDKClient.instances[0].disconnected is True
 
 
-def test_trimming_one_long_message_keeps_its_start(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A background report is one long streamed message, so a positional trim
-    takes its `START` and orphans everything after — the whole report is lost and
-    the backlog head becomes a `CONTENT` with no `START`."""
+def test_deferred_trim_keeps_a_frame_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dropping the oldest events must not leave the backlog starting on a
+    `TEXT_MESSAGE_CONTENT` whose `START` was trimmed away."""
     from ag_ui.core import EventType
-    from ag_ui.core.events import TextMessageContentEvent, TextMessageStartEvent
+    from ag_ui.core.events import (
+        TextMessageContentEvent,
+        TextMessageEndEvent,
+        TextMessageStartEvent,
+    )
 
-    monkeypatch.setattr(registry, "_MAX_DEFERRED", 20)
-    session = registry.LiveSession(thread_id="t-long")
-    session.defer(TextMessageStartEvent(
-        type=EventType.TEXT_MESSAGE_START, message_id="m-1", role="assistant"))
-    for i in range(60):
+    monkeypatch.setattr(registry, "_MAX_DEFERRED", 4)
+    monkeypatch.setattr(registry, "_TRIM_SLACK", 0)
+    session = registry.LiveSession(thread_id="t-trim")
+    for i in range(3):
+        session.defer(TextMessageStartEvent(
+            type=EventType.TEXT_MESSAGE_START, message_id=f"m{i}", role="assistant"))
         session.defer(TextMessageContentEvent(
-            type=EventType.TEXT_MESSAGE_CONTENT, message_id="m-1", delta=str(i)))
+            type=EventType.TEXT_MESSAGE_CONTENT, message_id=f"m{i}", delta="x"))
+        session.defer(TextMessageEndEvent(
+            type=EventType.TEXT_MESSAGE_END, message_id=f"m{i}"))
 
-    assert session.deferred, "the whole report was dropped"
+    assert session.deferred, "everything was trimmed away"
     assert session.deferred[0].type == EventType.TEXT_MESSAGE_START
-    assert len(session.deferred) <= registry._MAX_DEFERRED + 1
-    # The text that survived is the newest, not a random middle slice.
-    assert session.deferred[-1].delta == "59"
 
 
-async def test_a_rejected_slot_survives_the_run_that_follows_it() -> None:
-    """The handler for a between-runs rejection may not be scheduled until after
-    the next run opens; pruning it there would block that handler for the whole
-    park wall."""
-    session = registry.LiveSession(thread_id="t-prune-race")
-    await session.register_pending("call-bg", "renderTracker", {}, run_id=None)
-    await session.reject_pending(["call-bg"], "app_not_attached")
+async def test_harness_sweep_evicts_an_expired_hold() -> None:
+    """`sweep_idle` runs on a timer, not only when the next turn happens to
+    arrive — otherwise the hold is not a bound at all."""
+    from pupa_backend.harnesses import ClaudeCodeHarness, sweep_harnesses
 
-    session.open_run("run-2", object())
-    assert "call-bg" in session.pending, "pruned out from under its handler"
-    got = await asyncio.wait_for(session.claim_call("renderTracker", {}, timeout=1), timeout=2)
-    assert "app_not_attached" in got["content"][0]["text"]
+    registry._REGISTRY.clear()
+    session = registry.create("thread-expired")
+    session.background.start("t1", "job")
+    session.background.hold_until = 0.0
 
-    session.open_run("run-3", object())
-    assert "call-bg" not in session.pending  # gone by the run after
+    class _Registry:
+        def enabled(self):
+            return [ClaudeCodeHarness()]
+
+    task = asyncio.ensure_future(sweep_harnesses(_Registry(), interval=0.01))
+    try:
+        await _settle(lambda: registry.get("thread-expired") is None, timeout=3.0)
+    finally:
+        task.cancel()

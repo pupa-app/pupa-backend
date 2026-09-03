@@ -324,16 +324,21 @@ async def _ask_user(session: Any, tool_name: str, tool_input: dict[str, Any]) ->
     on a per-session future the endpoint resolves from the user's next message.
     Returns True if the user approved.
     """
-    if not getattr(session, "run_open", True):
-        # No run is open, so this is a turn nobody requested — a background task
-        # reporting in. There is no SSE to carry the question and no reply to
-        # wait for: parking the future here would silently consume the user's
-        # next message as the answer (the endpoint's permission-reply branch
-        # runs before the new-turn branch) and leave that run with no terminal.
+    # "Nobody can answer" is *not* the same as "no run is open": a turn parked on
+    # a frontend tool call also has `run_open` False, and there the user is right
+    # there with a resume POST in flight — that ask must still happen. The one
+    # state with no consumer is a session held open only for background work,
+    # where the CLI is running a turn nobody requested. Parking a future there
+    # would silently consume the user's next message as the answer (the
+    # endpoint's permission-reply branch runs before the new-turn branch) and
+    # leave that run with no terminal event.
+    background = getattr(session, "background", None)
+    if getattr(background, "holding", False) and not getattr(session, "run_open", True):
         # Deny, fail-closed, and leave a note that surfaces on the next run.
         logger.info(
-            "claude_code loop: denying %s — permission asked with no run open "
-            "(thread=%s)", tool_name, getattr(session, "thread_id", "?"),
+            "claude_code loop: denying %s — permission asked while the session is "
+            "held only for background work (thread=%s)",
+            tool_name, getattr(session, "thread_id", "?"),
         )
         _emit_prompt(
             session,

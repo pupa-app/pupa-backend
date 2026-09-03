@@ -559,12 +559,24 @@ async def _start_continuation(session: registry.LiveSession, descriptors: list[A
     options = _options_for(session.turn_input, session, session.turn_mcp, descriptors, resume_id)
     new_client = ClaudeSDKClient(options)
     await new_client.connect()
-    session.client = new_client
     logger.info(
         "claude_code loop: continuation turn (resume=%s, tools=%d) thread=%s",
         resume_id, len(session.frontend_qualified), session.thread_id,
     )
-    await new_client.query(_CONTINUATION_PROMPT)
+    # Swap only once the new child has actually taken the query. Swapping first
+    # and failing here would leave `session.client` pointing at a child nobody
+    # pumps while the old one stays connected — and, now that a session with
+    # background work parks instead of finishing, that broken session would
+    # survive and swallow the next turn.
+    try:
+        await new_client.query(_CONTINUATION_PROMPT)
+    except Exception:
+        try:
+            await new_client.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort teardown of the unused client
+            logger.debug("claude_code loop: new client disconnect failed", exc_info=True)
+        raise
+    session.client = new_client
     if session.background.active:
         # The old child owned those tasks and is about to be disconnected: they
         # die with it. Counting them against the new child would park every

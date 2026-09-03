@@ -385,26 +385,32 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
     `RunStarted`. So the background result reaches the user on their next
     message, in the correct frame order. The permission gate routes the same way
     (its prompt would otherwise land ahead of the next `RunStarted`, and its
-    `INTERRUPT` would end that SSE before it began) — and with no run open it
-    *denies* rather than parking a question nobody can answer: the endpoint reads
-    `pending_decision` before the new-turn branch, so a parked ask would eat the
-    user's next message as its yes/no and leave that run with no terminal. The
-    backlog is capped, and an overflow drops only the oldest *body* events
+    `INTERRUPT` would end that SSE before it began). While the session is held
+    *only* for background work it denies instead of asking: the endpoint reads
+    `pending_decision` before the new-turn branch, so a question nobody can see
+    would eat the user's next message as its yes/no and leave that run with no
+    terminal. Note the predicate — a turn parked on a frontend tool call also has
+    no run open, and there the user *is* waiting, so that ask still happens.
+    The backlog is capped, and an overflow drops only the oldest *body* events
     (`TEXT_MESSAGE_CONTENT`, `TOOL_CALL_ARGS`), never a `START` or an `END`: one
     long report is most of the backlog, so trimming by position would take its
-    `START` and orphan everything after it. A frontend tool call from an injected
-    turn is rejected
+    `START` and orphan everything after it. If a backlog is somehow all structure
+    and nothing is trimmable, whole frames go instead, oldest first, and the rest
+    of a dropped frame's deltas are dropped with it. A frontend tool call from an
+    injected turn is rejected
     (`app_not_attached`) rather than parked — the device isn't listening and no
-    resume can ever answer it. That slot is marked `rejected`, so `claim_call`
-    prefers any real on-device result over it, and `open_run` prunes it one run
-    later — not immediately, since its own handler may not be scheduled until
-    after the next run opens.
+    resume can ever answer it. That slot is marked `rejected`: `claim_call` takes
+    it only when no genuine call of the same `(name, args)` is still outstanding,
+    so the handler it was made for can return while a real device call still
+    blocks for the device's answer. `open_run` prunes it one run later — not
+    immediately, since its own handler may not be scheduled until after the next
+    run opens.
   - The **next user turn is fed into the same live client** (`_continue_live_turn`)
     instead of retiring it for a fresh child. `_cannot_continue_live` declines
     when the turn's frontend tool surface differs at all from the frozen
     in-process server's (a dropped tool matters as much as an added one), the
     permission-relevant state changed (`_gate_state`), the model or thinking level
-    changed, or a frontend call is still parked; it then starts
+    changed, or a frontend call or permission ask is still parked; it then starts
     fresh, logs the tasks that orphans, and the replacement session **inherits
     the deferred backlog** so the background report is still delivered. The
     ambient context normally refreshes in the system prompt of each fresh client;
