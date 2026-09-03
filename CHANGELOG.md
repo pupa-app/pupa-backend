@@ -4,6 +4,33 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.96] — 2026-09-03
+
+### Fixed
+
+- **Claude Code background subagents no longer die at the end of the turn that
+  started them.** The harness ran the `claude` CLI as a per-turn subprocess and
+  tore it down at the turn's `ResultMessage`, so anything launched with
+  `run_in_background` was killed mid-flight; the next message started a fresh
+  child, which could only report `No completion record was found for background
+  agent …`. A turn that ends cleanly with background work still running now
+  **parks** instead: the run's SSE closes with its `RunFinished` as before, but
+  the child stays connected, its tasks keep running, and the next message on that
+  thread is fed into the *same* session rather than a new one.
+
+  The completion turn the CLI injects when a task reports in has no HTTP run
+  waiting on it, so its output is held and delivered at the top of the user's
+  next run. Held sessions are bounded by `PUPA_BACKGROUND_HOLD` (default 1800s;
+  `0` restores the old tear-down-immediately behaviour), and a turn that *errored*
+  never parks. A turn that needs tools the live client can't expose, or a
+  different host-tool scope, still starts fresh — and logs that the background
+  tasks are being orphaned.
+
+### Changed
+
+- `claude-agent-sdk` floor raised to `0.2.143` for the task-lifecycle message
+  types (`TaskStartedMessage`, `TaskUpdatedMessage`, …) the fix reads.
+
 ## [0.0.95] — 2026-08-29
 
 ### Changed

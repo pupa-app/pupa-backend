@@ -363,8 +363,40 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   to reach its terminal, then dispose. Every step is best-effort — the thread
   always ends up free for the newcomer. Matters most on app wake, where the
   returning app sends a fresh message on a thread parked mid-tool.
+- **Background work outlives the turn that started it.** Claude Code background
+  subagents (`Agent` with `run_in_background`) and background shell jobs keep
+  running inside the CLI child after the turn's `ResultMessage`, and report
+  completion later as a turn the session *injects on its own*
+  (`ResultMessage.origin == {"kind": "task-notification"}`). Disposing at turn
+  end kills them — the next turn is a fresh child and can only report
+  `No completion record was found for background agent …`. So the pump tracks
+  every `task_started` / `task_progress` / `task_notification` / `task_updated`
+  message in a harness-neutral tracker
+  ([`agui/background.py`](../backend/pupa_backend/agui/background.py)) and, when
+  a turn ends cleanly with tasks still in flight, **parks** (`PARK`) instead of
+  finishing: the run's SSE closes with its `RunFinished`, the child stays
+  connected, and the pump keeps draining. Three consequences:
+  - The pump reads `receive_messages()` (the session's whole stream), not
+    `receive_response()` (one turn) — one pump serves every turn a live client
+    runs.
+  - Events produced with **no run open** (an injected turn) go to
+    `LiveSession.deferred` and are released by the next run's `open_run`, right
+    after its `RunStarted`, so the background result reaches the user on their
+    next message in the correct frame order. A frontend tool call from such a
+    turn is rejected (`app_not_attached`) rather than parked — the device isn't
+    listening and no resume can ever answer it.
+  - The **next user turn is fed into the same live client** (`_continue_live_turn`)
+    instead of retiring it for a fresh child. `_cannot_continue_live` declines
+    when the turn advertises tools the frozen in-process server can't expose, the
+    host-tool scope changed, or a frontend call / permission ask is still parked;
+    it then starts fresh and logs that the tasks are orphaned.
+  - Bounded by `PUPA_BACKGROUND_HOLD` (default 1800s, `0` disables parking
+    entirely): the hold is re-armed at each park, and `sweep_idle` exempts a
+    held session from the idle wall but evicts it once the hold expires. An
+    errored turn never parks — a wedged child must not be kept alive on the
+    strength of tasks it may never report.
 - **Assistant text streams token-by-token.** `ClaudeAgentOptions` sets
-  `include_partial_messages=True`, so `receive_response()` yields partial
+  `include_partial_messages=True`, so the message stream carries partial
   `StreamEvent`s alongside the whole messages. `_pump` maps each text delta to an
   incremental `TextMessageContent` (`events.translate_stream_event`); the trailing
   whole `AssistantMessage` is translated with `skip_text` so the text isn't

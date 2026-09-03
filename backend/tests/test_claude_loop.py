@@ -480,7 +480,7 @@ async def test_registry_resolve_synthesises_missing_results() -> None:
 class _FakeSDKClient:
     """Stand-in for `ClaudeSDKClient` that drives one frontend-tool round-trip.
 
-    `receive_response()` yields an assistant message calling a frontend tool, then
+    `receive_messages()` yields an assistant message calling a frontend tool, then
     blocks on the registered pending future(s) (as the real SDK blocks waiting for
     the tool result) until the resume POST resolves them, then yields the terminal
     `ResultMessage`.
@@ -499,7 +499,7 @@ class _FakeSDKClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         yield AssistantMessage(
             content=[
                 ToolUseBlock(
@@ -723,7 +723,7 @@ class _CapturingSDKClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         yield ResultMessage(
             subtype="success",
             duration_ms=1,

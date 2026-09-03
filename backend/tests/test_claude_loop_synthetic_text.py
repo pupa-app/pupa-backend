@@ -138,7 +138,7 @@ class _SyntheticOnlySDKClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         yield _synthetic(_LIMIT_NOTICE, "msg-synth")
         yield ResultMessage(
             subtype="success",
@@ -165,7 +165,7 @@ class _MixedSDKClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         def ev(payload):
             return StreamEvent(uuid="x", session_id="sdk-s", event=payload)
 

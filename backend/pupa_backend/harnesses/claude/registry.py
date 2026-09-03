@@ -38,6 +38,17 @@ resolve.
 `attach()` returns an async generator that drains the queue, yielding AG-UI
 events until an interrupt boundary or run finish/error, then returns — ending the
 SSE response while the pump (and SDK client) stay parked for the resume POST.
+
+## Two reasons a session stays parked
+
+1. A **frontend tool call** is out on the device (INTERRUPT) — the resume POST
+   brings its result back into the same live turn.
+2. **Background work** the loop started outlives the turn (PARK) — Claude Code
+   background subagents keep running in the CLI child and report completion
+   later through an injected turn. Disposing at turn end kills them, so the
+   session stays connected and the *next* user turn is fed into it rather than
+   into a fresh subprocess. Bounded by `PUPA_BACKGROUND_HOLD`; see
+   `pupa_backend.agui.background`.
 """
 
 from __future__ import annotations
@@ -49,6 +60,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from pupa_backend.agui.background import BackgroundWork
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -116,9 +129,17 @@ def liveness_grace() -> float:
 INTERRUPT = object()  # batch of frontend calls emitted; park for the resume POST
 FINISH = object()  # run completed; session is disposable
 ERROR = object()  # run errored; a RunErrorEvent precedes this on the queue
+# Run completed but the session must stay alive: background work the loop
+# started is still in flight and will report through this same live session.
+# Ends the SSE exactly like INTERRUPT, without evicting the session.
+PARK = object()
 
 # Default idle timeout before the sweeper evicts a parked session (seconds).
 _DEFAULT_IDLE_TIMEOUT = 900.0
+
+# Cap on events held between runs (a background task's injected turn). Bounds a
+# session that keeps reporting while nobody ever sends another message.
+_MAX_DEFERRED = 2000
 
 # How long a new `attach()` waits for the consumer it displaced to hand the
 # queue over. Bounded: a generator nobody is iterating (client gone, close not
@@ -221,6 +242,21 @@ class LiveSession:
     # The client told us it is backgrounded (iOS suspends its timers): suspend
     # the liveness grace and fall back to the absolute per-tool wall.
     client_backgrounded: bool = False
+    # Out-of-band work this session started that outlives the turn (Claude Code
+    # background subagents / background shell tasks). While it is `active` the
+    # turn parks instead of disposing, and the next turn on this thread is routed
+    # into this same live session. See `pupa_backend.agui.background`.
+    background: BackgroundWork = field(default_factory=BackgroundWork)
+    # True between an HTTP run's `run_started` and its terminal event. While it
+    # is False nothing is listening: the loop is between turns, and anything it
+    # produces on its own (a background task's injected turn) is held in
+    # `deferred` until the next run opens. See `emit` / `open_run`.
+    run_open: bool = False
+    deferred: list = field(default_factory=list)
+    # The permission-relevant slice of the state the live client was built with
+    # (`endpoint._gate_state`). A turn wanting a different one can't reuse this
+    # client — the gate's hooks closed over the old state — so it starts fresh.
+    gate_state: tuple | None = None
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -239,13 +275,59 @@ class LiveSession:
     def emit(self, event: Any) -> None:
         self.queue.put_nowait(event)
 
+    def defer(self, event: Any) -> None:
+        """Hold an event the loop produced with no run open.
+
+        A background task reporting in makes the CLI run a turn nobody asked
+        for: its output belongs to the conversation but to no HTTP run, and no
+        SSE is attached to carry it. Held here and released by the next
+        `open_run`, so it reaches the user on their next message.
+        """
+        self.deferred.append(event)
+        if len(self.deferred) > _MAX_DEFERRED:
+            dropped = len(self.deferred) - _MAX_DEFERRED
+            del self.deferred[:dropped]
+            logger.warning(
+                "claude_code loop: deferred backlog full thread_id=%s — dropped "
+                "%d oldest event(s)", self.thread_id, dropped,
+            )
+
+    def open_run(self, run_id: str, started: Any) -> None:
+        """Start an HTTP run: emit `started`, then release the deferred backlog.
+
+        Ordering is the point — `run_started` must be the first frame of the SSE,
+        and anything the loop produced between turns follows it as part of this
+        run.
+        """
+        self.current_run_id = run_id
+        self.run_open = True
+        self.background.release()  # a live run is in flight; re-armed at the next park
+        self.queue.put_nowait(started)
+        for event in self.deferred:
+            self.queue.put_nowait(event)
+        if self.deferred:
+            logger.info(
+                "claude_code loop: released %d deferred event(s) from background "
+                "work thread_id=%s", len(self.deferred), self.thread_id,
+            )
+            self.deferred.clear()
+        self.touch()
+
     def mark_interrupt(self) -> None:
+        self.run_open = False
         self.queue.put_nowait(INTERRUPT)
 
     def mark_finish(self) -> None:
+        self.run_open = False
         self.queue.put_nowait(FINISH)
 
+    def mark_park(self) -> None:
+        """End the run's SSE but keep the session registered and connected."""
+        self.run_open = False
+        self.queue.put_nowait(PARK)
+
     def mark_error(self) -> None:
+        self.run_open = False
         self.queue.put_nowait(ERROR)
 
     async def register_pending(
@@ -354,6 +436,24 @@ class LiveSession:
                     pc.result = json.dumps({"ok": False, "error": "missing_tool_result"})
             self.cond.notify_all()
         self.touch()
+
+    def has_unresolved_pending(self) -> bool:
+        """True while any frontend call is still waiting for its on-device result."""
+        return any(pc.result is _UNSET for pc in self.pending.values())
+
+    async def reject_pending(self, call_ids: list[str], error: str) -> None:
+        """Fail exactly these calls' result slots.
+
+        Used when the loop calls a frontend tool with no run open — an injected
+        background-task turn, say. The device isn't listening, so the handler
+        must be given an error now rather than blocking on the park wall.
+        """
+        async with self.cond:
+            for call_id in call_ids:
+                pc = self.pending.get(call_id)
+                if pc is not None and pc.result is _UNSET:
+                    pc.result = json.dumps({"ok": False, "error": error})
+            self.cond.notify_all()
 
     # -- teardown -------------------------------------------------------------
 
@@ -578,7 +678,7 @@ async def attach(session: LiveSession):
                     return
                 displaced.cancel()
                 item = get.result()
-            if item is INTERRUPT:
+            if item is INTERRUPT or item is PARK:
                 session.touch()
                 return
             if item is FINISH or item is ERROR:
@@ -596,11 +696,30 @@ async def attach(session: LiveSession):
             session.attachment = None
 
 
+def _evictable(session: LiveSession, now: float, timeout: float) -> bool:
+    """Idle past the wall — unless it is held open for background work.
+
+    A session parked on in-flight background work keeps its subprocess so the
+    work can report; it is evicted only once the hold expires
+    (`PUPA_BACKGROUND_HOLD`), whatever the idle clock says.
+    """
+    if session.background.holding:
+        return session.background.hold_expired(now)
+    return now - session.last_activity > timeout
+
+
 async def sweep_idle(timeout: float = _DEFAULT_IDLE_TIMEOUT) -> int:
     """Evict sessions idle longer than `timeout`. Returns the number evicted."""
     now = time.monotonic()
-    stale = [tid for tid, s in _REGISTRY.items() if now - s.last_activity > timeout]
+    stale = [tid for tid, s in _REGISTRY.items() if _evictable(s, now, timeout)]
     for tid in stale:
-        logger.info("claude_code loop: evicting idle session thread_id=%s", tid)
+        session = _REGISTRY.get(tid)
+        if session is not None and session.background.holding:
+            logger.info(
+                "claude_code loop: background hold expired thread_id=%s — dropping %s",
+                tid, session.background.summary(),
+            )
+        else:
+            logger.info("claude_code loop: evicting idle session thread_id=%s", tid)
         await remove(tid)
     return len(stale)

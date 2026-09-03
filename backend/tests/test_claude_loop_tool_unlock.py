@@ -89,7 +89,7 @@ class _FakeSDKClient:
     async def disconnect(self):
         self.disconnected = True
 
-    async def receive_response(self):
+    async def receive_messages(self):
         if self._is_continuation:
             yield AssistantMessage(
                 content=[TextBlock(text="Tracker ready — added your rows.")],
@@ -250,7 +250,7 @@ async def test_session_id_remembered_when_turn_errors_before_result() -> None:
     registry._SESSION_IDS.clear()
 
     class _ErroringClient:
-        async def receive_response(self):
+        async def receive_messages(self):
             yield AssistantMessage(
                 content=[TextBlock(text="working…")],
                 model="fake", message_id="m1", session_id="sdk-err-1",
