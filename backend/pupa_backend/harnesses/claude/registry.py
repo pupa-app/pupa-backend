@@ -163,9 +163,14 @@ _MAX_DROPPED_FRAMES = 256
 # a batch keeps it amortised.
 _TRIM_SLACK = 200
 
-# Runs after which an unclaimed pending call is assumed abandoned: its handler
-# can only have hit `wait_timeout_for` and raised.
-_STALE_PENDING_RUNS = 3
+
+def _stale_pending_after() -> float:
+    """How long an unclaimed pending call is kept before it is assumed abandoned.
+
+    A margin past the longest park wall: once that has elapsed its handler has
+    raised `TimeoutError`, so nobody can still be waiting on the slot.
+    """
+    return max(wait_timeout_for(None), wait_timeout_for("invoke_agent")) + 60.0
 
 # Events that open and close a frame. A body event whose `START` was dropped is
 # unrenderable, so the trim drops frames whole rather than by position.
@@ -236,6 +241,7 @@ class PendingCall:
     consumed: bool = False
     run_id: str | None = None  # HTTP run that emitted this call — scopes synth
     seq: int = 0  # the session's run counter when registered — see `prune_pending`
+    registered_at: float = field(default_factory=time.monotonic)
     rejected: bool = False  # synthesised failure, not an on-device result
 
 
@@ -453,6 +459,7 @@ class LiveSession:
         self.run_seq += 1
         self.background.release()  # a live run is in flight; re-armed at the next park
         self.prune_pending()
+        self._drop_stale_sentinels()
         self.queue.put_nowait(started)
         for event in self.deferred:
             self.queue.put_nowait(event)
@@ -470,6 +477,31 @@ class LiveSession:
             # parked here is one the user is about to see.)
             self.pending_decision_delivered = True
         self.touch()
+
+    def _drop_stale_sentinels(self) -> None:
+        """Discard terminal sentinels queued while nothing was attached.
+
+        A sentinel belongs to the run that produced it. One left on the queue —
+        a turn that parked or finished with no SSE attached — would be the first
+        thing the *next* `attach` sees, so that run's response would end on it
+        having delivered nothing, not even its `RunStarted`. Every empty-SSE bug
+        this loop has had reached the user through that gap, so close the gap
+        rather than relying on nothing ever queueing a stray sentinel again.
+        """
+        kept, dropped = [], 0
+        while not self.queue.empty():
+            item = self.queue.get_nowait()
+            if item is INTERRUPT or item is PARK or item is FINISH or item is ERROR:
+                dropped += 1
+                continue
+            kept.append(item)
+        for item in kept:
+            self.queue.put_nowait(item)
+        if dropped:
+            logger.info(
+                "claude_code loop: dropped %d terminal sentinel(s) left by an "
+                "unattached run thread_id=%s", dropped, self.thread_id,
+            )
 
     def mark_interrupt(self) -> None:
         self.run_open = False
@@ -624,16 +656,20 @@ class LiveSession:
         land in that window — and pruning it out from under that handler would
         block the handler for the full park wall.
 
-        A slot older than `_STALE_PENDING_RUNS` goes regardless: its handler can
-        only have hit the park wall and raised, so nobody is waiting on it, and
-        leaving it makes `_cannot_continue_live` decline for a reason that is no
-        longer true.
+        A slot past the park wall goes regardless: its handler can only have
+        raised `TimeoutError` by then, so nobody is waiting on it, and leaving it
+        makes `_cannot_continue_live` decline for a reason that is no longer true.
+        That age is measured in **wall-clock, not runs** — runs can be opened
+        milliseconds apart (a permission reply, a resume), so counting them would
+        prune a slot whose handler is still inside `claim_call`, and the device's
+        real answer would then have no slot to land in.
         """
+        now = time.monotonic()
         stale = [
             call_id for call_id, pc in self.pending.items()
             if pc.consumed
             or (pc.run_id is None and pc.seq <= self.run_seq - 2)
-            or pc.seq <= self.run_seq - _STALE_PENDING_RUNS
+            or now - pc.registered_at > _stale_pending_after()
         ]
         for call_id in stale:
             self.pending.pop(call_id, None)

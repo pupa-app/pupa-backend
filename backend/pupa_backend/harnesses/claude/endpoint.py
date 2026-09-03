@@ -76,9 +76,18 @@ from .gate import (
 
 logger = logging.getLogger("uvicorn.error")
 
-# `ResultMessage.origin["kind"]` values that mean "the session ran this turn on
-# its own". See `_is_injected_turn` for why this is an allow-list.
-_INJECTED_TURN_KINDS = frozenset({"task-notification"})
+# `ResultMessage.origin["kind"]` values that mean "this backend submitted the
+# turn". The SDK's own documented test — everything else the session injected on
+# its own. `None` is what a plain `client.query()` gets back.
+_OWN_TURN_KINDS = frozenset({None, "human"})
+
+# The injected kinds the SDK declares today. Not load-bearing — `_is_injected_turn`
+# treats anything outside `_OWN_TURN_KINDS` as injected — but an unrecognised kind
+# is worth a log line, and this is what "recognised" means.
+_INJECTED_TURN_KINDS = frozenset({
+    "channel", "peer", "task-notification", "coordinator", "unclassified",
+    "observer", "auto-continuation", "observer-activity",
+})
 
 # Task lifecycle messages the CLI emits for subagents and background shell jobs.
 # Folded into the session's background tracker; see `_track_task`.
@@ -639,30 +648,30 @@ def _gate_state(state: Any) -> tuple:
 def _is_injected_turn(msg: ResultMessage) -> bool:
     """True when this result answers a turn the CLI ran on its own.
 
-    `ResultMessage.origin` is absent (or `{"kind": "human"}`) for a prompt this
-    backend sent, and carries `{"kind": "task-notification"}` for a turn the
-    session injected when a background task reported in. Those have no HTTP run
-    waiting on them, so they must not emit a terminal AG-UI event.
+    This is the SDK's own test, inverted: `origin is None or kind == "human"`
+    identifies a turn the application submitted (`claude_agent_sdk.types`,
+    `MessageOrigin`). Everything else is a turn the session ran on its own, and
+    those have no HTTP run waiting on them, so they must not emit a terminal
+    AG-UI event.
 
-    An **allow-list**, deliberately. The SDK's `kind` vocabulary is open and the
-    dependency is floored rather than pinned, so "anything that is not human is
-    injected" fails open: a new kind on a turn this backend prompted would emit no
-    terminal at all and hang the user's request until the idle sweep. Misreading
-    an injected turn as ours costs a terminal event on a run that has already
-    ended — which is routed to the backlog, not the wire.
+    Deliberately **not** an allow-list of known injected kinds. `task-notification`
+    is only one of nine the SDK declares, and `peer` / `observer` are documented as
+    carrying `senderTaskId` — *"task id of the in-process background subagent that
+    sent this message"* — i.e. exactly the turns this harness exists to keep alive.
+    Treating one of those as our own turn either parks a sentinel behind an
+    unattached queue (the next run's SSE then starts on it and delivers nothing) or
+    finishes the run and lets the held session be evicted, which is issue #29 again.
     """
     origin = getattr(msg, "origin", None)
     if not isinstance(origin, dict):
         return False
     kind = origin.get("kind")
-    if kind in _INJECTED_TURN_KINDS:
-        return True
-    if kind not in (None, "human"):
+    if kind not in _OWN_TURN_KINDS and kind not in _INJECTED_TURN_KINDS:
         logger.info(
-            "claude_code loop: treating unrecognised ResultMessage origin %r as this "
-            "backend's own turn", kind,
+            "claude_code loop: ResultMessage origin %r is not a kind this loop "
+            "knows; treating it as a turn the session injected", kind,
         )
-    return False
+    return kind not in _OWN_TURN_KINDS
 
 
 def _track_task(session: registry.LiveSession, msg: Any) -> None:
@@ -1108,6 +1117,11 @@ def register_claude_loop_endpoint(
         # request (see `_cannot_continue_live`).
         inherited: list = []
         live = registry.get(thread_id)
+        if live is not None and not live.disposed and not live.background.holding:
+            # Not held for background work, so this session is about to be
+            # retired — but it may still be holding text the user has not seen
+            # (the auto-denied permission ask above, most of all). Carry it.
+            inherited = live.take_deferred()
         if live is not None and not live.disposed and live.background.holding:
             declined = _cannot_continue_live(live, input)
             if declined is None:

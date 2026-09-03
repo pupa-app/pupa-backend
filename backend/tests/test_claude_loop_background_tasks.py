@@ -445,7 +445,8 @@ async def test_an_ask_the_user_cannot_see_is_recorded_as_undelivered(
     assert session.pending_decision_delivered is True
 
     session.pending_decision.set_result(False)
-    await asyncio.wait_for(task, timeout=1)
+    out = await asyncio.wait_for(task, timeout=1)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 async def test_an_undelivered_ask_does_not_eat_the_next_message(loop_app) -> None:
@@ -867,3 +868,130 @@ def test_the_trim_converges_on_a_tool_call_backlog(monkeypatch: pytest.MonkeyPat
 
     assert peak <= registry._MAX_DEFERRED + registry._TRIM_SLACK + 1, peak
     assert len(session.dropped_frames) <= registry._MAX_DROPPED_FRAMES
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from the fifth review round
+# --------------------------------------------------------------------------- #
+
+# Every non-human kind the SDK declares. `peer` and `observer` in particular are
+# documented as carrying `senderTaskId` — "task id of the in-process background
+# subagent that sent this message" — so they are exactly the turns this harness
+# exists to keep alive, and treating any of them as our own turn is issue #29.
+_INJECTED_KINDS = [
+    "channel", "peer", "task-notification", "coordinator", "unclassified",
+    "observer", "auto-continuation", "observer-activity",
+]
+
+
+@pytest.mark.parametrize("kind", _INJECTED_KINDS)
+def test_every_non_human_origin_counts_as_injected(kind: str) -> None:
+    assert cl_endpoint._is_injected_turn(_result(origin={"kind": kind})) is True
+
+
+@pytest.mark.parametrize("origin", [None, {"kind": "human"}])
+def test_our_own_turns_are_never_injected(origin) -> None:
+    assert cl_endpoint._is_injected_turn(_result(origin=origin)) is False
+
+
+def test_an_unknown_origin_kind_counts_as_injected() -> None:
+    """Fail toward "the session ran this on its own": treating an injected turn
+    as ours parks a sentinel behind an unattached queue, and the next run's SSE
+    then ends on it having delivered nothing."""
+    assert cl_endpoint._is_injected_turn(_result(origin={"kind": "some-new-kind"})) is True
+
+
+@pytest.mark.parametrize("kind", [k for k in _INJECTED_KINDS if k != "task-notification"])
+async def test_a_subagent_message_does_not_kill_the_held_session(loop_app, kind: str) -> None:
+    """A background subagent messaging its parent arrives as `peer`/`observer`,
+    not `task-notification`. Reading that as our own turn finishes the run, the
+    pump dies, the held session is evicted, and the next message spawns a fresh
+    child — issue #29 again."""
+    _FakeSDKClient.script = [
+        [_task_started("bg-1", "long job"), _assistant("launched", "m-1"), _result()],
+        [_assistant("answering", "m-3"), _result()],
+    ]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/", json=_body("run-1", "go"))
+        session = registry.get(THREAD)
+        assert session is not None
+        _FakeSDKClient.instances[0].inject(
+            _assistant("THE BACKGROUND REPORT", "m-2"),
+            _result(origin={"kind": kind}),
+        )
+        await _settle(lambda: bool(session.deferred))
+        assert session.pump_task is not None and not session.pump_task.done()
+
+        events = _sse((await client.post("/", json=_body("run-2", "and?"))).text)
+
+    types = [e["type"] for e in events]
+    assert types[0] == "RUN_STARTED"
+    assert types[-1] == "RUN_FINISHED"
+    text = "".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT")
+    assert "THE BACKGROUND REPORT" in text
+    assert len(_FakeSDKClient.instances) == 1, "spawned a fresh child; the tasks died"
+
+
+def test_a_stray_sentinel_cannot_empty_the_next_runs_sse() -> None:
+    """A terminal sentinel queued while nothing was attached belongs to the run
+    that produced it. Left in place it is the first thing the next `attach` sees,
+    so that run's response ends on it having delivered nothing — not even its
+    `RunStarted`. Every empty-SSE bug in this loop reached the user that way."""
+    session = registry.LiveSession(thread_id="t-stray")
+    session.mark_park()  # a park with no SSE attached
+    assert session.queue.qsize() == 1
+
+    started = object()
+    session.open_run("run-2", started)
+
+    drained = list(session.queue._queue)
+    assert drained[0] is started
+    assert registry.PARK not in drained
+
+
+async def test_a_denied_ask_still_reaches_the_user_without_a_background_hold(
+    loop_app,
+) -> None:
+    """The auto-deny only helps if the user is told. On a session that is *not*
+    held for background work the old code retired it and the ask text died with
+    the backlog."""
+    _FakeSDKClient.script = [
+        [_assistant("hi", "m-1"), _result()],
+        [_assistant("answering", "m-2"), _result()],
+    ]
+    transport = httpx.ASGITransport(app=loop_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/", json=_body("run-1", "hello"))
+        # A session parked mid-turn (a frontend call out on the device), so no
+        # background hold — then the loop asks for permission nobody can see.
+        session = registry.create(THREAD)
+        session.run_open = False
+        from pupa_backend.harnesses.claude import gate
+
+        ask = asyncio.ensure_future(gate._ask_user(session, "Bash", {"command": "ls"}))
+        await _settle(lambda: session.pending_decision is not None)
+        assert session.pending_decision_delivered is False
+
+        events = _sse((await client.post("/", json=_body("run-2", "new request"))).text)
+
+    assert await asyncio.wait_for(ask, timeout=1) is False
+    text = "".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT")
+    assert "I need your permission" in text, "the user was never told a command was denied"
+
+
+def test_pending_is_aged_in_wall_clock_not_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runs can open milliseconds apart (a permission reply, a resume), so
+    counting them would prune a slot whose handler is still inside `claim_call`
+    and leave the device's real answer nowhere to land."""
+    session = registry.LiveSession(thread_id="t-age")
+    session.pending["c1"] = registry.PendingCall(
+        call_id="c1", name="renderTracker", args={}, run_id="run-1",
+    )
+    for i in range(6):
+        session.open_run(f"run-{i}", object())
+    assert "c1" in session.pending, "pruned a live handler's slot after a few runs"
+
+    monkeypatch.setattr(registry, "_stale_pending_after", lambda: 0.0)
+    session.open_run("run-late", object())
+    assert "c1" not in session.pending

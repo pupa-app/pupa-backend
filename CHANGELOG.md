@@ -33,7 +33,8 @@ bumps (`0.0.X` → `0.0.X+1`).
   ask, so a question raised while no run was open — a background task's injected
   turn — silently consumed a message the user meant as a new request. Whether the
   question was delivered is now recorded rather than inferred; an undelivered one
-  is denied (fail-closed) and its text reaches the user on the next run.
+  is denied (fail-closed) and its text is carried over to the next run so the user
+  is told what was asked.
 - Enabled harnesses are now swept on a timer (`PUPA_SESSION_SWEEP_INTERVAL`,
   default 60s) rather than only when the next request arrives, so a retention
   wall is a real bound even for a user who closed the app. Harnesses opt in with

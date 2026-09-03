@@ -367,9 +367,11 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   subagents (`Agent` with `run_in_background`) and background shell jobs keep
   running inside the CLI child after the turn's `ResultMessage`, and report
   completion later as a turn the session *injects on its own*
-  (`ResultMessage.origin == {"kind": "task-notification"}` — matched as an
-  **allow-list**, since the SDK's `kind` vocabulary is open and reading "not
-  human" as "injected" would hang a real turn on an unrecognised kind).
+  (`ResultMessage.origin`, whose `kind` is `None`/`human` only for a turn this
+  backend submitted — the SDK's own documented test. Everything else counts as
+  injected: `task-notification` is one of nine kinds, and `peer`/`observer` carry
+  the `senderTaskId` of the subagent that sent them, so an allow-list of one kind
+  would drop exactly the turns this harness exists to keep).
   Disposing at turn
   end kills them — the next turn is a fresh child and can only report
   `No completion record was found for background agent …`. So the pump tracks
@@ -395,8 +397,9 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
     identifies "nobody can answer" on its own — a turn parked on a frontend tool
     call has no open run either, and its ask *is* delivered, on the resume's SSE.
     A new-turn POST denies an undelivered ask (fail-closed) and treats the message
-    as a new turn; `open_run` marks a still-parked ask delivered once the backlog
-    it sits in has been released.
+    as a new turn — carrying the backlog over to the replacement session, so the
+    user is still told what was asked and denied; `open_run` marks a still-parked
+    ask delivered once the backlog it sits in has been released.
     The backlog is capped. An overflow drops the oldest *body* events first
     (`TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_CONTENT`, `TOOL_CALL_ARGS`) —
     one long report is most of the backlog, so trimming by position would take its
@@ -412,7 +415,9 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
     so the handler it was made for can return while a real device call still
     blocks for the device's answer. `open_run` prunes it one run later — not
     immediately, since its own handler may not be scheduled until after the next
-    run opens.
+    run opens. An unclaimed slot is aged out in **wall-clock**, past the park
+    wall — never in runs, which can open milliseconds apart and would prune a slot
+    whose handler is still inside `claim_call`.
   - The **next user turn is fed into the same live client** (`_continue_live_turn`)
     instead of retiring it for a fresh child. `_cannot_continue_live` declines
     when the turn's frontend tool surface differs at all from the frozen
@@ -427,6 +432,11 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   - A **gate-unlock continuation** replaces the CLI child, so it clears the
     tracker: those tasks died with the old child, and counting them against the
     new one would park every later turn on work nobody is doing.
+  - `open_run` also **drops terminal sentinels left by an unattached run**. A
+    sentinel belongs to the run that queued it; left in place it is the first
+    thing the next `attach` sees, so that run's SSE would end on it having
+    delivered nothing — not even its `RunStarted`. Structural, so the empty-SSE
+    class does not depend on the pump classifying every turn correctly.
   - A **resume POST** never lands on a session held only for background work: no
     handler is parked, so attaching would block on a queue the idle pump won't
     feed. It gets the same stale-session `RunError` as before the hold existed.
