@@ -38,6 +38,17 @@ resolve.
 `attach()` returns an async generator that drains the queue, yielding AG-UI
 events until an interrupt boundary or run finish/error, then returns — ending the
 SSE response while the pump (and SDK client) stay parked for the resume POST.
+
+## Two reasons a session stays parked
+
+1. A **frontend tool call** is out on the device (INTERRUPT) — the resume POST
+   brings its result back into the same live turn.
+2. **Background work** the loop started outlives the turn (PARK) — Claude Code
+   background subagents keep running in the CLI child and report completion
+   later through an injected turn. Disposing at turn end kills them, so the
+   session stays connected and the *next* user turn is fed into it rather than
+   into a fresh subprocess. Bounded by `PUPA_BACKGROUND_HOLD`; see
+   `pupa_backend.agui.background`.
 """
 
 from __future__ import annotations
@@ -49,6 +60,10 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from ag_ui.core import EventType
+
+from pupa_backend.agui.background import BackgroundWork
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -116,9 +131,64 @@ def liveness_grace() -> float:
 INTERRUPT = object()  # batch of frontend calls emitted; park for the resume POST
 FINISH = object()  # run completed; session is disposable
 ERROR = object()  # run errored; a RunErrorEvent precedes this on the queue
+# Run completed but the session must stay alive: background work the loop
+# started is still in flight and will report through this same live session.
+# Ends the SSE exactly like INTERRUPT, without evicting the session.
+PARK = object()
 
 # Default idle timeout before the sweeper evicts a parked session (seconds).
 _DEFAULT_IDLE_TIMEOUT = 900.0
+
+# Cap on events held between runs (a background task's injected turn). Bounds a
+# session that keeps reporting while nobody ever sends another message.
+_MAX_DEFERRED = 2000
+
+# The only events the backlog trim may drop: the *body* of a frame. Dropping a
+# `START` orphans every delta after it, and dropping an `END` leaves the client's
+# message open forever — either is a protocol violation, not merely lossy. So an
+# overflowing backlog loses its oldest text, never the structure around it.
+_TRIMMABLE_EVENTS = frozenset({
+    EventType.TEXT_MESSAGE_CONTENT,
+    EventType.THINKING_TEXT_MESSAGE_CONTENT,
+    EventType.TOOL_CALL_ARGS,
+})
+
+# Frame ids the trim dropped the `START` of, remembered so the rest of their
+# deltas go too. Bounded: a frame whose `END` never arrives would otherwise stay
+# forever.
+_MAX_DROPPED_FRAMES = 256
+
+# How far over the cap the backlog may run before a trim. Trimming on every
+# `defer` would rebuild the list per streamed delta (and log a line per event);
+# a batch keeps it amortised.
+_TRIM_SLACK = 200
+
+
+def _stale_pending_after() -> float:
+    """How long an unclaimed pending call is kept before it is assumed abandoned.
+
+    A margin past the longest park wall: once that has elapsed its handler has
+    raised `TimeoutError`, so nobody can still be waiting on the slot.
+    """
+    return max(wait_timeout_for(None), wait_timeout_for("invoke_agent")) + 60.0
+
+# Events that open and close a frame. A body event whose `START` was dropped is
+# unrenderable, so the trim drops frames whole rather than by position.
+_FRAME_START_EVENTS = frozenset({
+    EventType.TEXT_MESSAGE_START,
+    EventType.THINKING_TEXT_MESSAGE_START,
+    EventType.TOOL_CALL_START,
+})
+_FRAME_END_EVENTS = frozenset({
+    EventType.TEXT_MESSAGE_END,
+    EventType.THINKING_TEXT_MESSAGE_END,
+    EventType.TOOL_CALL_END,
+})
+
+
+def _frame_id(event: Any) -> str | None:
+    """The id tying one frame's events together, or None for a standalone event."""
+    return getattr(event, "message_id", None) or getattr(event, "tool_call_id", None)
 
 # How long a new `attach()` waits for the consumer it displaced to hand the
 # queue over. Bounded: a generator nobody is iterating (client gone, close not
@@ -170,6 +240,9 @@ class PendingCall:
     result: Any = _UNSET
     consumed: bool = False
     run_id: str | None = None  # HTTP run that emitted this call — scopes synth
+    seq: int = 0  # the session's run counter when registered — see `prune_pending`
+    registered_at: float = field(default_factory=time.monotonic)
+    rejected: bool = False  # synthesised failure, not an on-device result
 
 
 @dataclass
@@ -204,6 +277,10 @@ class LiveSession:
     # A native-command permission request the gate parked, awaiting the user's
     # next chat message (yes/no). Resolved by the endpoint; see gate.py.
     pending_decision: asyncio.Future | None = None
+    # Whether that question actually went out on a live run. The endpoint reads
+    # the user's next message as the answer, so an ask still sitting in the
+    # backlog must be denied rather than answered blind. See `gate._ask_user`.
+    pending_decision_delivered: bool = False
     # Once the user approves with "always", every later command in this thread
     # runs without a prompt (set by the endpoint from the approval reply).
     auto_approve: bool = False
@@ -221,6 +298,34 @@ class LiveSession:
     # The client told us it is backgrounded (iOS suspends its timers): suspend
     # the liveness grace and fall back to the absolute per-tool wall.
     client_backgrounded: bool = False
+    # Out-of-band work this session started that outlives the turn (Claude Code
+    # background subagents / background shell tasks). While it is `active` the
+    # turn parks instead of disposing, and the next turn on this thread is routed
+    # into this same live session. See `pupa_backend.agui.background`.
+    background: BackgroundWork = field(default_factory=BackgroundWork)
+    # True between an HTTP run's `run_started` and its terminal event. While it
+    # is False nothing is listening: the loop is between turns, and anything it
+    # produces on its own (a background task's injected turn) is held in
+    # `deferred` until the next run opens. See `emit` / `open_run`.
+    run_open: bool = False
+    # Runs opened on this session, so a pending call can be aged in runs rather
+    # than wall-clock. See `prune_pending`.
+    run_seq: int = 0
+    deferred: list = field(default_factory=list)
+    # Frames the backlog trim dropped the `START` of. Their remaining deltas are
+    # dropped too — a body event with no `START` is unrenderable. An id leaves the
+    # set when its `END` goes by.
+    dropped_frames: dict = field(default_factory=dict)
+    # Model + thinking level the live client was built with. Both are frozen at
+    # `connect()`, so a turn wanting different ones needs a fresh client.
+    client_shape: tuple | None = None
+    # Ambient context (`input.context`) the live client's system prompt carries.
+    # A continued turn re-delivers it in the query when it has changed.
+    context_pairs: list | None = None
+    # The permission-relevant slice of the state the live client was built with
+    # (`endpoint._gate_state`). A turn wanting a different one can't reuse this
+    # client — the gate's hooks closed over the old state — so it starts fresh.
+    gate_state: tuple | None = None
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -239,13 +344,180 @@ class LiveSession:
     def emit(self, event: Any) -> None:
         self.queue.put_nowait(event)
 
+    def defer(self, event: Any) -> None:
+        """Hold an event the loop produced with no run open.
+
+        A background task reporting in makes the CLI run a turn nobody asked
+        for: its output belongs to the conversation but to no HTTP run, and no
+        SSE is attached to carry it. Held here and released by the next
+        `open_run`, so it reaches the user on their next message.
+        """
+        self.deferred.append(event)
+        # Trim in batches, not on every event: `defer` is called one event at a
+        # time, so trimming at the cap would rebuild the whole list per delta and
+        # log a line each time.
+        if len(self.deferred) <= _MAX_DEFERRED + _TRIM_SLACK:
+            return
+        before = len(self.deferred)
+        # Drop the oldest *body* events only. One long message can be most of the
+        # backlog, so trimming by position would take its `START` with it and
+        # orphan everything after — losing the whole report and leaving the next
+        # delta at the head of a backlog with no `START`.
+        budget = before - _MAX_DEFERRED
+        survivors = []
+        for held in self.deferred:
+            if budget > 0 and getattr(held, "type", None) in _TRIMMABLE_EVENTS:
+                budget -= 1
+                continue
+            survivors.append(held)
+        self.deferred = survivors
+        if len(self.deferred) > _MAX_DEFERRED:
+            # Not enough body to give: a tool-call loop is `START`/`ARGS`/`END`,
+            # only a third of it trimmable, so body-trimming alone would fall
+            # further behind on every batch and never converge. Give up whole
+            # frames instead, oldest first — the backlog is back under the cap
+            # when this returns, so the trim always converges.
+            self._drop_oldest_frames(len(self.deferred) - _MAX_DEFERRED)
+        if before != len(self.deferred):
+            logger.warning(
+                "claude_code loop: deferred backlog full thread_id=%s — dropped %d "
+                "of the oldest event(s)", self.thread_id, before - len(self.deferred),
+            )
+
+    def _drop_oldest_frames(self, count: int) -> None:
+        """Drop `count` oldest events, then everything they orphaned.
+
+        Keeps the backlog's invariant: it never starts on — or contains — a body
+        event whose `START` is missing.
+        """
+        for held in self.deferred[:count]:
+            frame = _frame_id(held)
+            # `None` must never enter the set — it would swallow every standalone
+            # event (a `CustomEvent`, a terminal) from then on.
+            if frame is not None and getattr(held, "type", None) in _FRAME_START_EVENTS:
+                self.dropped_frames[frame] = None
+        del self.deferred[:count]
+        self.deferred = [held for held in self.deferred if not self._is_orphan(held)]
+        while len(self.dropped_frames) > _MAX_DROPPED_FRAMES:
+            self.dropped_frames.pop(next(iter(self.dropped_frames)), None)
+
+    def _is_orphan(self, event: Any) -> bool:
+        """True for an event whose frame lost its `START` to a trim.
+
+        Its `END` closes the frame out of the drop set — the id can be reused
+        after that, and a later frame carrying it must not be swallowed too.
+        """
+        frame = _frame_id(event)
+        # `None` must never match — it would swallow every standalone event (a
+        # `CustomEvent`, a terminal) from then on.
+        if frame is None or frame not in self.dropped_frames:
+            return False
+        if getattr(event, "type", None) in _FRAME_END_EVENTS:
+            self.dropped_frames.pop(frame, None)
+        return True
+
+    def route(self, event: Any) -> bool:
+        """Emit onto the open run's SSE, or hold it for the next one.
+
+        The single chokepoint for anything produced *by the loop* (the pump, the
+        permission gate): between runs there is no drain and no run the event can
+        belong to. Teardown events bypass this deliberately — they exist to
+        unblock a drain that may be attached right now.
+
+        Returns whether the event went out live. The permission gate needs that
+        answer: an ask the user cannot have seen must not be answered by their
+        next message. Events orphaned by a backlog trim are dropped here rather
+        than in `defer`, so a trimmed frame's later deltas can't reach a live SSE
+        either once a run opens.
+        """
+        if self._is_orphan(event):
+            return False
+        if self.run_open:
+            self.emit(event)
+            return True
+        self.defer(event)
+        return False
+
+    def take_deferred(self) -> list:
+        """Hand the backlog to whoever will deliver it, and forget it here.
+
+        Used when this session is being torn down but its held background output
+        should still reach the user — the replacement session inherits it.
+        """
+        held, self.deferred = self.deferred, []
+        return held
+
+    def open_run(self, run_id: str, started: Any) -> None:
+        """Start an HTTP run: emit `started`, then release the deferred backlog.
+
+        Ordering is the point — `run_started` must be the first frame of the SSE,
+        and anything the loop produced between turns follows it as part of this
+        run.
+        """
+        self.current_run_id = run_id
+        self.run_open = True
+        self.run_seq += 1
+        self.background.release()  # a live run is in flight; re-armed at the next park
+        self.prune_pending()
+        self._drop_stale_sentinels()
+        self.queue.put_nowait(started)
+        for event in self.deferred:
+            self.queue.put_nowait(event)
+        if self.deferred:
+            logger.info(
+                "claude_code loop: released %d deferred event(s) from background "
+                "work thread_id=%s", len(self.deferred), self.thread_id,
+            )
+            self.deferred.clear()
+        if self.pending_decision is not None and not self.pending_decision.done():
+            # Its text has now reached the client — either live when it was
+            # asked, or in the backlog this run just released. From here the
+            # user's next message really is the answer. (The endpoint denies an
+            # ask it could not deliver *before* opening a run, so anything still
+            # parked here is one the user is about to see.)
+            self.pending_decision_delivered = True
+        self.touch()
+
+    def _drop_stale_sentinels(self) -> None:
+        """Discard terminal sentinels queued while nothing was attached.
+
+        A sentinel belongs to the run that produced it. One left on the queue —
+        a turn that parked or finished with no SSE attached — would be the first
+        thing the *next* `attach` sees, so that run's response would end on it
+        having delivered nothing, not even its `RunStarted`. Every empty-SSE bug
+        this loop has had reached the user through that gap, so close the gap
+        rather than relying on nothing ever queueing a stray sentinel again.
+        """
+        kept, dropped = [], 0
+        while not self.queue.empty():
+            item = self.queue.get_nowait()
+            if item is INTERRUPT or item is PARK or item is FINISH or item is ERROR:
+                dropped += 1
+                continue
+            kept.append(item)
+        for item in kept:
+            self.queue.put_nowait(item)
+        if dropped:
+            logger.info(
+                "claude_code loop: dropped %d terminal sentinel(s) left by an "
+                "unattached run thread_id=%s", dropped, self.thread_id,
+            )
+
     def mark_interrupt(self) -> None:
+        self.run_open = False
         self.queue.put_nowait(INTERRUPT)
 
     def mark_finish(self) -> None:
+        self.run_open = False
         self.queue.put_nowait(FINISH)
 
+    def mark_park(self) -> None:
+        """End the run's SSE but keep the session registered and connected."""
+        self.run_open = False
+        self.queue.put_nowait(PARK)
+
     def mark_error(self) -> None:
+        self.run_open = False
         self.queue.put_nowait(ERROR)
 
     async def register_pending(
@@ -254,7 +526,7 @@ class LiveSession:
         """Record a frontend call from the model and wake any waiting handler."""
         async with self.cond:
             self.pending[call_id] = PendingCall(
-                call_id=call_id, name=name, args=args, run_id=run_id
+                call_id=call_id, name=name, args=args, run_id=run_id, seq=self.run_seq
             )
             self.cond.notify_all()
 
@@ -275,15 +547,29 @@ class LiveSession:
         grace = liveness_grace()
         async with self.cond:
             while True:
-                for pc in self.pending.values():
-                    if (
-                        not pc.consumed
-                        and pc.result is not _UNSET
-                        and pc.name == name
-                        and _args_key(pc.args) == _args_key(args)
-                    ):
-                        pc.consumed = True
-                        return _mcp_tool_result(pc.result)
+                matches = [
+                    pc for pc in self.pending.values()
+                    if not pc.consumed
+                    and pc.name == name
+                    and _args_key(pc.args) == _args_key(args)
+                ]
+                pick = next(
+                    (pc for pc in matches if pc.result is not _UNSET and not pc.rejected),
+                    None,
+                )
+                if pick is None:
+                    # Only fall back to a synthesised rejection when no genuine
+                    # call of this shape is still outstanding. A rejected slot
+                    # lingers for a run so its *own* handler can take it — but a
+                    # handler that is waiting for the device (or the model's
+                    # retry of the same call) must block for the real answer, not
+                    # be handed a stale `app_not_attached`.
+                    outstanding = any(pc.result is _UNSET for pc in matches)
+                    if not outstanding:
+                        pick = next((pc for pc in matches if pc.result is not _UNSET), None)
+                if pick is not None:
+                    pick.consumed = True
+                    return _mcp_tool_result(pick.result)
                 # Effective deadline: once the client has pinged, wait
                 # only `grace` past its last ping — a dead app fails fast no
                 # matter how long the tool budget is. A backgrounded client
@@ -354,6 +640,58 @@ class LiveSession:
                     pc.result = json.dumps({"ok": False, "error": "missing_tool_result"})
             self.cond.notify_all()
         self.touch()
+
+    def prune_pending(self) -> None:
+        """Drop pending calls no handler can still legitimately claim.
+
+        One pump now spans every turn of a live session, so `pending` would grow
+        for the session's whole life. Worse, a call rejected between runs
+        (`reject_pending`) keeps an `app_not_attached` result nobody consumed: a
+        later identical `(name, args)` call would claim *that* slot and never see
+        the device's real answer.
+
+        A rejected slot survives one whole run before it goes, though. The
+        handler that should take it may not have been scheduled yet when the run
+        opens — `_continue_live_turn` awaits the query first, so a rejection can
+        land in that window — and pruning it out from under that handler would
+        block the handler for the full park wall.
+
+        A slot past the park wall goes regardless: its handler can only have
+        raised `TimeoutError` by then, so nobody is waiting on it, and leaving it
+        makes `_cannot_continue_live` decline for a reason that is no longer true.
+        That age is measured in **wall-clock, not runs** — runs can be opened
+        milliseconds apart (a permission reply, a resume), so counting them would
+        prune a slot whose handler is still inside `claim_call`, and the device's
+        real answer would then have no slot to land in.
+        """
+        now = time.monotonic()
+        stale = [
+            call_id for call_id, pc in self.pending.items()
+            if pc.consumed
+            or (pc.run_id is None and pc.seq <= self.run_seq - 2)
+            or now - pc.registered_at > _stale_pending_after()
+        ]
+        for call_id in stale:
+            self.pending.pop(call_id, None)
+
+    def has_unresolved_pending(self) -> bool:
+        """True while any frontend call is still waiting for its on-device result."""
+        return any(pc.result is _UNSET for pc in self.pending.values())
+
+    async def reject_pending(self, call_ids: list[str], error: str) -> None:
+        """Fail exactly these calls' result slots.
+
+        Used when the loop calls a frontend tool with no run open — an injected
+        background-task turn, say. The device isn't listening, so the handler
+        must be given an error now rather than blocking on the park wall.
+        """
+        async with self.cond:
+            for call_id in call_ids:
+                pc = self.pending.get(call_id)
+                if pc is not None and pc.result is _UNSET:
+                    pc.result = json.dumps({"ok": False, "error": error})
+                    pc.rejected = True
+            self.cond.notify_all()
 
     # -- teardown -------------------------------------------------------------
 
@@ -578,7 +916,7 @@ async def attach(session: LiveSession):
                     return
                 displaced.cancel()
                 item = get.result()
-            if item is INTERRUPT:
+            if item is INTERRUPT or item is PARK:
                 session.touch()
                 return
             if item is FINISH or item is ERROR:
@@ -596,11 +934,33 @@ async def attach(session: LiveSession):
             session.attachment = None
 
 
+def _evictable(session: LiveSession, now: float, timeout: float) -> bool:
+    """Idle past the wall — unless it is held open for background work.
+
+    A session parked on in-flight background work keeps its subprocess so the
+    work can report; it is evicted only once the hold expires
+    (`PUPA_BACKGROUND_HOLD`), whatever the idle clock says.
+    """
+    if session.background.holding:
+        pump = session.pump_task
+        if pump is not None and pump.done():
+            return True  # nothing is left to receive the work it is held for
+        return session.background.hold_expired(now)
+    return now - session.last_activity > timeout
+
+
 async def sweep_idle(timeout: float = _DEFAULT_IDLE_TIMEOUT) -> int:
     """Evict sessions idle longer than `timeout`. Returns the number evicted."""
     now = time.monotonic()
-    stale = [tid for tid, s in _REGISTRY.items() if now - s.last_activity > timeout]
+    stale = [tid for tid, s in _REGISTRY.items() if _evictable(s, now, timeout)]
     for tid in stale:
-        logger.info("claude_code loop: evicting idle session thread_id=%s", tid)
+        session = _REGISTRY.get(tid)
+        if session is not None and session.background.holding:
+            logger.info(
+                "claude_code loop: background hold expired thread_id=%s — dropping %s",
+                tid, session.background.summary(),
+            )
+        else:
+            logger.info("claude_code loop: evicting idle session thread_id=%s", tid)
         await remove(tid)
     return len(stale)

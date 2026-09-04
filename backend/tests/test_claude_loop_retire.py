@@ -241,7 +241,7 @@ class _RecordingSDKClient:
     # arrived, whether or not one did.
     park_timeout = 0.3
 
-    async def receive_response(self):
+    async def receive_messages(self):
         from claude_agent_sdk import ResultMessage
 
         try:

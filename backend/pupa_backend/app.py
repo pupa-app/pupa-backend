@@ -5,6 +5,7 @@ local SQLite when unset) and backs both the agent graph and the `/db` REST
 routes with them.
 """
 
+import asyncio
 import logging
 import ipaddress
 import os
@@ -36,6 +37,7 @@ from pupa_backend.harnesses import (
     build_registry,
     claude_harness_enabled,
     deepagents_harness_enabled,
+    sweep_harnesses,
 )
 from pupa_backend.mcp_servers import mcp_servers_lifecycle
 from pupa_backend.auth import (
@@ -260,9 +262,15 @@ async def lifespan(app: FastAPI):
                 from pupa_backend.screenshare.sidecar_token import generate as _gen_sidecar_token
                 _gen_sidecar_token()
                 logger.info("screenshare sidecar token → %s", TOKEN_PATH)
+            sweeper = asyncio.ensure_future(sweep_harnesses(registry))
             try:
                 yield
             finally:
+                sweeper.cancel()
+                # Await the cancellation: a task merely asked to stop can be
+                # garbage-collected while pending, and any error it raised
+                # outside its own guard would surface only at GC.
+                await asyncio.gather(sweeper, return_exceptions=True)
                 if screenshare_enabled():
                     from pupa_backend.screenshare.sidecar_token import revoke as _revoke_sidecar_token
                     _revoke_sidecar_token()

@@ -187,6 +187,7 @@ async def test_hook_edit_tool_parks_for_user_then_allows(monkeypatch: pytest.Mon
     monkeypatch.delenv("PUPA_CLAUDE_LOOP_AUTO_APPROVE", raising=False)
     session = registry.LiveSession(thread_id="t-perm")
     session.current_run_id = "r1"
+    session.run_open = True  # the endpoint has a run in flight (see `open_run`)
     hook = gate.make_pre_tool_use_hook({}, session)
     task = asyncio.ensure_future(hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, "tid", None))
     await asyncio.sleep(0.02)
@@ -205,6 +206,7 @@ async def test_hook_edit_tool_denied_by_user(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("PUPA_CLAUDE_LOOP_REQUIRE_APPROVAL", "1")
     monkeypatch.delenv("PUPA_CLAUDE_LOOP_AUTO_APPROVE", raising=False)
     session = registry.LiveSession(thread_id="t-perm2")
+    session.run_open = True  # the endpoint has a run in flight (see `open_run`)
     hook = gate.make_pre_tool_use_hook({}, session)
     task = asyncio.ensure_future(hook({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}, "tid", None))
     await asyncio.sleep(0.02)
@@ -480,7 +482,7 @@ async def test_registry_resolve_synthesises_missing_results() -> None:
 class _FakeSDKClient:
     """Stand-in for `ClaudeSDKClient` that drives one frontend-tool round-trip.
 
-    `receive_response()` yields an assistant message calling a frontend tool, then
+    `receive_messages()` yields an assistant message calling a frontend tool, then
     blocks on the registered pending future(s) (as the real SDK blocks waiting for
     the tool result) until the resume POST resolves them, then yields the terminal
     `ResultMessage`.
@@ -499,7 +501,7 @@ class _FakeSDKClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         yield AssistantMessage(
             content=[
                 ToolUseBlock(
@@ -610,6 +612,7 @@ async def test_endpoint_permission_reply_resolves_parked_decision(monkeypatch: p
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     session.pending_decision = fut
+    session.pending_decision_delivered = True  # the user saw the question
     session.current_run_id = "r0"
 
     async def _fake_pump():
@@ -650,6 +653,7 @@ async def test_endpoint_permission_always_sets_auto_approve(monkeypatch: pytest.
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     session.pending_decision = fut
+    session.pending_decision_delivered = True  # the user saw the question
     session.current_run_id = "r0"
 
     async def _fake_pump():
@@ -723,7 +727,7 @@ class _CapturingSDKClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         yield ResultMessage(
             subtype="success",
             duration_ms=1,

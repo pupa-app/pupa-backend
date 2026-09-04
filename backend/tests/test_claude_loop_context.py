@@ -43,7 +43,7 @@ class _FinishingClient:
     async def disconnect(self):
         return None
 
-    async def receive_response(self):
+    async def receive_messages(self):
         yield ResultMessage(
             subtype="success", duration_ms=1, duration_api_ms=1,
             is_error=False, num_turns=1, session_id="sdk-sess-ctx",

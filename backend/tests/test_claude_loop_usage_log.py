@@ -104,7 +104,7 @@ from pupa_backend.harnesses.claude import registry
 
 async def test_pump_logs_per_call_and_turn_totals(caplog) -> None:
     class _Client:
-        async def receive_response(self):
+        async def receive_messages(self):
             yield AssistantMessage(
                 content=[TextBlock(text="hi")],
                 model="fake",
@@ -151,7 +151,7 @@ async def test_pump_logs_one_token_line_per_message_not_per_block(caplog) -> Non
         )
 
     class _Client:
-        async def receive_response(self):
+        async def receive_messages(self):
             yield _block("part one")
             yield _block("part two")
             yield _block("part three")

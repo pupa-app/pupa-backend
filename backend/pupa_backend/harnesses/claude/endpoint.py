@@ -36,6 +36,10 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     StreamEvent,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
 )
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
@@ -71,6 +75,28 @@ from .gate import (
 )
 
 logger = logging.getLogger("uvicorn.error")
+
+# `ResultMessage.origin["kind"]` values that mean "this backend submitted the
+# turn". The SDK's own documented test — everything else the session injected on
+# its own. `None` is what a plain `client.query()` gets back.
+_OWN_TURN_KINDS = frozenset({None, "human"})
+
+# The injected kinds the SDK declares today. Not load-bearing — `_is_injected_turn`
+# treats anything outside `_OWN_TURN_KINDS` as injected — but an unrecognised kind
+# is worth a log line, and this is what "recognised" means.
+_INJECTED_TURN_KINDS = frozenset({
+    "channel", "peer", "task-notification", "coordinator", "unclassified",
+    "observer", "auto-continuation", "observer-activity",
+})
+
+# Task lifecycle messages the CLI emits for subagents and background shell jobs.
+# Folded into the session's background tracker; see `_track_task`.
+_TASK_MESSAGES = (
+    TaskStartedMessage,
+    TaskProgressMessage,
+    TaskNotificationMessage,
+    TaskUpdatedMessage,
+)
 
 
 def _default_loop_model() -> str:
@@ -389,6 +415,9 @@ def _options_for(
     config_server, config_qualified = build_config_mcp(mcp)
     state = input.state
     scope = resolve_native_scope(state)
+    # The gate's hooks close over `state`, so a later turn may only reuse this
+    # client while everything they read is unchanged. See `_cannot_continue_live`.
+    session.gate_state = _gate_state(state)
     # Frontend + config MCP tools + read-class native tools are pre-approved.
     # Mutating/command native tools are intentionally NOT here so the gate's
     # PreToolUse hook runs (listing a tool in allowed_tools bypasses the prompt).
@@ -403,6 +432,11 @@ def _options_for(
     system = _compose_system_prompt(base_system, input.context)
     thinking = resolve_thinking(input) or {}
     model = _resolve_loop_model(input)
+    # What this client is frozen with. A later turn may reuse it only if it wants
+    # the same model and thinking level; the ambient context is re-delivered in
+    # the query instead (see `_continue_live_turn`).
+    session.client_shape = (model, tuple(sorted(thinking.items())))
+    session.context_pairs = _context_pairs(input.context)
     skills = loop_skills()
     cwd = os.getenv("CLAUDE_CODE_WORKSPACE") or None
     # Anthropic caches on an exact `tools` → `system` → `messages` prefix and the
@@ -535,15 +569,54 @@ async def _start_continuation(session: registry.LiveSession, descriptors: list[A
     """
     old_client = session.client
     resume_id = session.sdk_session_id
+    # `_options_for` writes what the *new* client will be shaped like onto the
+    # session. If the swap never happens, those fields describe a client the
+    # session does not have — and `_cannot_continue_live` would then compare the
+    # next turn against the wrong tool surface and never notice the drift.
+    shape_before = (
+        session.frontend_qualified, session.gate_state,
+        session.client_shape, session.context_pairs,
+    )
+
+    def _restore_shape() -> None:
+        (session.frontend_qualified, session.gate_state,
+         session.client_shape, session.context_pairs) = shape_before
+
     options = _options_for(session.turn_input, session, session.turn_mcp, descriptors, resume_id)
-    new_client = ClaudeSDKClient(options)
-    await new_client.connect()
-    session.client = new_client
+    try:
+        new_client = ClaudeSDKClient(options)
+        await new_client.connect()
+    except Exception:
+        _restore_shape()
+        raise
     logger.info(
         "claude_code loop: continuation turn (resume=%s, tools=%d) thread=%s",
         resume_id, len(session.frontend_qualified), session.thread_id,
     )
-    await new_client.query(_CONTINUATION_PROMPT)
+    # Swap only once the new child has actually taken the query. Swapping first
+    # and failing here would leave `session.client` pointing at a child nobody
+    # pumps while the old one stays connected — and, now that a session with
+    # background work parks instead of finishing, that broken session would
+    # survive and swallow the next turn.
+    try:
+        await new_client.query(_CONTINUATION_PROMPT)
+    except Exception:
+        _restore_shape()
+        try:
+            await new_client.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort teardown of the unused client
+            logger.debug("claude_code loop: new client disconnect failed", exc_info=True)
+        raise
+    session.client = new_client
+    if session.background.active:
+        # The old child owned those tasks and is about to be disconnected: they
+        # die with it. Counting them against the new child would park every
+        # later turn on work nobody is doing, pinning the session indefinitely.
+        logger.info(
+            "claude_code loop: continuation replaces the child — orphaning %s "
+            "(thread=%s)", session.background.summary(), session.thread_id,
+        )
+        session.background.reset()
     if old_client is not None:
         try:
             await old_client.disconnect()
@@ -554,23 +627,181 @@ async def _start_continuation(session: registry.LiveSession, descriptors: list[A
     session.pump_task = asyncio.ensure_future(_pump(session))
 
 
+def _gate_state(state: Any) -> tuple:
+    """The parts of `RunAgentInput.state` the permission gate reads.
+
+    A live client's `can_use_tool` / PreToolUse hook and its `allowed_tools` were
+    built from one turn's state; a later turn that changes any of these needs a
+    fresh client, not the parked one. Everything else in `state` is app data the
+    gate never looks at, so it must not force a rebuild — that would orphan the
+    session's background work on every turn.
+    """
+    if not isinstance(state, dict):
+        return ()
+    return (
+        resolve_native_scope(state),
+        bool(state.get("claude_loop_auto_approve") or state.get("autoApprove")),
+        tuple(sorted(str(t) for t in (state.get("disabled_tools") or []))),
+    )
+
+
+def _is_injected_turn(msg: ResultMessage) -> bool:
+    """True when this result answers a turn the CLI ran on its own.
+
+    This is the SDK's own test, inverted: `origin is None or kind == "human"`
+    identifies a turn the application submitted (`claude_agent_sdk.types`,
+    `MessageOrigin`). Everything else is a turn the session ran on its own, and
+    those have no HTTP run waiting on them, so they must not emit a terminal
+    AG-UI event.
+
+    Deliberately **not** an allow-list of known injected kinds. `task-notification`
+    is only one of nine the SDK declares, and `peer` / `observer` are documented as
+    carrying `senderTaskId` — *"task id of the in-process background subagent that
+    sent this message"* — i.e. exactly the turns this harness exists to keep alive.
+    Treating one of those as our own turn either parks a sentinel behind an
+    unattached queue (the next run's SSE then starts on it and delivers nothing) or
+    finishes the run and lets the held session be evicted, which is issue #29 again.
+    """
+    origin = getattr(msg, "origin", None)
+    if not isinstance(origin, dict):
+        return False
+    kind = origin.get("kind")
+    if kind not in _OWN_TURN_KINDS and kind not in _INJECTED_TURN_KINDS:
+        logger.info(
+            "claude_code loop: ResultMessage origin %r is not a kind this loop "
+            "knows; treating it as a turn the session injected", kind,
+        )
+    return kind not in _OWN_TURN_KINDS
+
+
+def _track_task(session: registry.LiveSession, msg: Any) -> None:
+    """Fold one CLI task lifecycle message into the session's background tracker.
+
+    `task_started` / `task_progress` mean the task is running. The two status
+    messages are the only evidence a task *ended*, and a `task_updated` patch
+    carrying only `end_time` / `result` parses to `status=None` — absence of a
+    status is not evidence of anything, so it is dropped rather than read as a
+    start (which would resurrect a finished task and pin the session open).
+    """
+    task_id = getattr(msg, "task_id", None)
+    if isinstance(msg, (TaskStartedMessage, TaskProgressMessage)):
+        session.background.start(task_id, getattr(msg, "description", "") or "")
+        return
+    status = getattr(msg, "status", None)
+    if status is None and isinstance(getattr(msg, "patch", None), dict):
+        status = msg.patch.get("status")
+    if status is None:
+        return
+    if session.background.update(task_id, status):
+        logger.info(
+            "claude_code loop: background task %s -> %s (thread=%s, remaining=%s)",
+            task_id, status, session.thread_id, session.background.summary(),
+        )
+
+
+def _cannot_continue_live(session: registry.LiveSession, input: RunAgentInput) -> str | None:
+    """Why this turn can't run on the parked live session, or None if it can.
+
+    Reusing the client is what keeps background work alive across turns, but it
+    is only correct when the turn asks for nothing the live client was not built
+    with: its in-process tool server is frozen at `connect()` and its permission
+    hook closed over the previous turn's state.
+    """
+    if session.client is None:
+        return "no client"
+    pump = session.pump_task
+    if pump is None or pump.done():
+        return "pump not running"
+    if session.has_unresolved_pending():
+        return "a frontend tool call is still parked"
+    if session.pending_decision is not None and not session.pending_decision.done():
+        return "a permission request is still parked"
+    advertised = frontend_qualified_names(list(input.tools or []))
+    if advertised != session.frontend_qualified:
+        # Not just widening: a turn that drops a tool would still run on a client
+        # exposing it, and the model could then call something the app is not
+        # offering this round — a call no resume will ever answer.
+        return "the turn's frontend tool surface differs from the live client's"
+    gate_state = _gate_state(input.state)
+    if session.gate_state is not None and gate_state != session.gate_state:
+        return f"permission state changed {session.gate_state} -> {gate_state}"
+    shape = (_resolve_loop_model(input), tuple(sorted((resolve_thinking(input) or {}).items())))
+    if session.client_shape is not None and shape != session.client_shape:
+        return f"model/thinking changed {session.client_shape} -> {shape}"
+    return None
+
+
+async def _continue_live_turn(
+    session: registry.LiveSession, input: RunAgentInput, run_id: str, mcp: Any
+) -> StreamingResponse | None:
+    """Run this turn on the already-connected client, keeping its background work.
+
+    The SDK session already holds the whole conversation, so only the newest user
+    message is sent — same as any resumed turn. The existing pump is still
+    draining this client's stream and picks the turn up. Returns None if the
+    query could not be sent, so the caller falls back to a fresh session.
+    """
+    session.turn_input = input
+    session.turn_mcp = mcp
+    latest_user = _latest_user_message(input.messages)
+    text = _coerce_content(_msg_content(latest_user))
+    image_blocks = _image_blocks(_msg_content(latest_user))
+    # The ambient context normally refreshes in the system prompt on every fresh
+    # client. This turn has no fresh client, so hand the model the new context in
+    # the query — otherwise it answers on a snapshot from the previous turn.
+    pairs = _context_pairs(input.context)
+    if pairs != session.context_pairs:
+        session.context_pairs = pairs
+        block = _render_context(input.context)
+        if block:
+            text = f"{_CONTEXT_HEADER}\n\n{block}\n\n{text}"
+    # Send before opening the run: a failure then costs nothing (the deferred
+    # backlog is still intact for the fresh session to inherit), and anything the
+    # pump produces in between is deferred and released by `open_run` in order.
+    try:
+        await _send_query(session.client, _query_content(text, image_blocks))
+    except Exception:  # noqa: BLE001 — fall back to a fresh session
+        logger.exception(
+            "claude_code loop: continuing the live session failed; starting fresh"
+        )
+        return None
+    session.open_run(run_id, events.run_started(input.thread_id, run_id))
+    logger.info(
+        "claude_code loop: continuing the live session (background: %s) thread=%s",
+        session.background.summary(), session.thread_id,
+    )
+    return _stream(session)
+
+
 async def _pump(session: registry.LiveSession) -> None:
     """Drain the SDK message stream into AG-UI events on the session queue.
 
-    Spans the whole Claude turn — including frontend tool round-trips — because a
-    single `receive_response()` iterates until the `ResultMessage`. At each
-    frontend batch it emits `on_interrupt` + `RunFinished` and parks (the iterator
-    blocks until the resume POST resolves the tool futures). When a gate unlock
-    armed `pending_widen_descriptors`, the endpoint interrupts this turn; the pump
-    then converts the resulting `ResultMessage` into a continuation turn that
-    exposes the widened tools instead of finishing (see `_start_continuation`).
+    Spans the whole Claude turn — including frontend tool round-trips — and then
+    keeps going: `receive_messages()` is the session's *whole* stream, so one pump
+    serves every turn this live client runs. At each frontend batch it emits
+    `on_interrupt` + `RunFinished` and parks (the iterator blocks until the resume
+    POST resolves the tool futures). When a gate unlock armed
+    `pending_widen_descriptors`, the endpoint interrupts this turn; the pump then
+    converts the resulting `ResultMessage` into a continuation turn that exposes
+    the widened tools instead of finishing (see `_start_continuation`).
+
+    **Background work.** A turn that ends with background tasks still running
+    parks (`mark_park`) instead of finishing: the run's SSE closes but the CLI
+    child stays alive, so its tasks keep running and the injected turn they
+    trigger on completion is received here. Those events are held in the
+    session's deferred backlog and delivered on the next run. Without this the
+    child is killed at the `ResultMessage` and every background subagent dies —
+    see `pupa_backend.agui.background`.
     """
     client = session.client
     thread_id = session.thread_id
     # Per-turn text-streaming cursor for partial `StreamEvent`s (see below).
     stream_state = events.new_stream_state()
+
+    out = session.route  # onto the open run's SSE, else into the backlog
+
     try:
-        async for msg in client.receive_response():
+        async for msg in client.receive_messages():
             # Remember the SDK session id from the EARLIEST message that carries it
             # (SystemMessage init / AssistantMessage), not just the final
             # ResultMessage — so a turn that errors or is interrupted before the
@@ -582,12 +813,16 @@ async def _pump(session: registry.LiveSession) -> None:
                 session.sdk_session_id = sid
                 registry.remember_session_id(thread_id, sid)
 
+            if isinstance(msg, _TASK_MESSAGES):
+                _track_task(session, msg)
+                continue
+
             if isinstance(msg, StreamEvent):
                 # Partial message: stream assistant text as incremental deltas. The
                 # whole `AssistantMessage` still follows (handled below with
                 # skip_text so the text isn't re-sent).
                 for e in events.translate_stream_event(msg.event, stream_state):
-                    session.emit(e)
+                    out(e)
                 continue
 
             if isinstance(msg, AssistantMessage):
@@ -612,7 +847,7 @@ async def _pump(session: registry.LiveSession) -> None:
                     msg, skip_text=events.text_already_streamed(msg, stream_state)
                 )
                 for e in evs:
-                    session.emit(e)
+                    out(e)
                 if frontend_calls and session.pending_widen_descriptors is not None:
                     # A gate unlock is pending: the endpoint has already sent an
                     # interrupt to stop this (still-narrow) turn. Any tool call it
@@ -623,13 +858,30 @@ async def _pump(session: registry.LiveSession) -> None:
                         "claude_code loop: dropping %d pre-continuation tool call(s) %s",
                         len(frontend_calls), [c["name"] for c in frontend_calls],
                     )
+                elif frontend_calls and not session.run_open:
+                    # An injected turn (a background task reporting in) reaching
+                    # for an on-device tool. No run is open, so no SSE can carry
+                    # the interrupt and no resume will ever answer it — fail the
+                    # calls now instead of blocking the loop on the park wall.
+                    logger.info(
+                        "claude_code loop: rejecting %d frontend call(s) %s from a "
+                        "turn with no open run (thread=%s)",
+                        len(frontend_calls), [c["name"] for c in frontend_calls], thread_id,
+                    )
+                    for c in frontend_calls:
+                        await session.register_pending(
+                            c["id"], c["name"], c["args"], run_id=None
+                        )
+                    await session.reject_pending(
+                        [c["id"] for c in frontend_calls], "app_not_attached"
+                    )
                 elif frontend_calls:
                     for c in frontend_calls:
                         await session.register_pending(
                             c["id"], c["name"], c["args"], run_id=session.current_run_id
                         )
-                    session.emit(events.on_interrupt(frontend_calls))
-                    session.emit(events.run_finished(thread_id, session.current_run_id or ""))
+                    out(events.on_interrupt(frontend_calls))
+                    out(events.run_finished(thread_id, session.current_run_id or ""))
                     session.mark_interrupt()
             elif isinstance(msg, ResultMessage):
                 # Turn totals + cost (yellow). Logged before the continuation
@@ -651,18 +903,47 @@ async def _pump(session: registry.LiveSession) -> None:
                     except Exception:  # noqa: BLE001 — never strand the turn on a failed continuation
                         logger.exception("claude_code loop: continuation failed; finishing turn")
                 session.pending_widen_descriptors = None
+                if _is_injected_turn(msg):
+                    # A turn the session ran on its own (a background task
+                    # reporting in). Nothing is waiting on it, so emit no
+                    # terminal event — its output is already in the deferred
+                    # backlog and rides the next run.
+                    logger.info(
+                        "claude_code loop: injected turn finished (origin=%s, "
+                        "background=%s) thread=%s",
+                        (msg.origin or {}).get("kind"), session.background.summary(), thread_id,
+                    )
+                    stream_state = events.new_stream_state()
+                    continue
+                if session.run_open:
+                    out(
+                        events.run_error(str(msg.result or "claude reported an error"))
+                        if msg.is_error
+                        else events.run_finished(thread_id, session.current_run_id or "")
+                    )
+                # A clean turn end with background work still running parks
+                # instead of finishing: the run's SSE closes, the CLI child stays
+                # alive, and the work reports through this same session. An
+                # *errored* turn tears down as before — a wedged child must not
+                # be kept on the strength of tasks it may never report.
+                if not msg.is_error and session.background.active and session.background.hold():
+                    logger.info(
+                        "claude_code loop: parking for background work (%s) thread=%s",
+                        session.background.summary(), thread_id,
+                    )
+                    session.mark_park()
+                    stream_state = events.new_stream_state()
+                    continue
                 if msg.is_error:
-                    session.emit(events.run_error(str(msg.result or "claude reported an error")))
                     session.mark_error()
                 else:
-                    session.emit(events.run_finished(thread_id, session.current_run_id or ""))
                     session.mark_finish()
                 return
             # SystemMessage / RateLimitEvent: nothing else to surface.
             # (StreamEvent is handled above.)
     except Exception as exc:  # noqa: BLE001 — surface any SDK failure to the client
         logger.exception("claude_code loop: pump failed")
-        session.emit(events.run_error(f"claude_code loop error: {exc}"))
+        out(events.run_error(f"claude_code loop error: {exc}"))
         session.mark_error()
 
 
@@ -752,13 +1033,26 @@ def register_claude_loop_endpoint(
         # --- Resume POST: deliver on-device tool results to the parked session ---
         if resume_payload is not None:
             session = registry.get(thread_id)
+            # A session held open for background work is NOT parked on a tool
+            # call: no handler is waiting, so attaching would hang the request on
+            # a queue nothing will feed. Answer it like the stale-session case.
+            if (
+                session is not None
+                and not session.disposed
+                and session.background.holding
+                and not session.has_unresolved_pending()
+            ):
+                logger.info(
+                    "claude_code loop: resume POST for a thread with no parked tool "
+                    "call (session held for background work) thread_id=%s", thread_id,
+                )
+                session = None
             if session is None or session.disposed:
                 return _error_stream(
                     "no parked Claude Code session for this thread — the turn may have "
                     "timed out or the backend restarted. Start a new message."
                 )
-            session.current_run_id = run_id
-            session.emit(events.run_started(thread_id, run_id))
+            session.open_run(run_id, events.run_started(thread_id, run_id))
             # Detect a gate unlock: this resume advertises frontend tools the live
             # (frozen) in-process client can't expose. The SDK freezes an in-process
             # server's tool list at connect() and the CLI refuses to hot-swap SDK
@@ -782,15 +1076,27 @@ def register_claude_loop_endpoint(
             return _stream(session)
 
         # --- Permission reply: the user is answering a parked approval -----
+        # Only when the question actually reached them. An ask raised while the
+        # session was held for background work sits in the backlog unseen, and
+        # reading the next message as its yes/no would consume a message the user
+        # meant as a new request — see `gate._ask_user`.
         parked = registry.get(thread_id)
+        if parked is not None and not parked.disposed and parked.pending_decision is not None \
+                and not parked.pending_decision.done() and not parked.pending_decision_delivered:
+            logger.info(
+                "claude_code loop: denying an approval the user never saw — their "
+                "message starts a new turn instead (thread=%s)", thread_id,
+            )
+            undelivered = parked.pending_decision
+            parked.pending_decision = None
+            undelivered.set_result(False)  # fail-closed; the ask text rides this run
         if parked is not None and not parked.disposed and parked.pending_decision is not None \
                 and not parked.pending_decision.done():
             reply = _latest_user_text(input.messages)
             allow = interpret_approval(reply)
             if allow and interpret_always(reply):
                 parked.auto_approve = True  # run freely for the rest of this thread
-            parked.current_run_id = run_id
-            parked.emit(events.run_started(thread_id, run_id))
+            parked.open_run(run_id, events.run_started(thread_id, run_id))
             fut = parked.pending_decision
             parked.pending_decision = None
             fut.set_result(allow)
@@ -805,6 +1111,34 @@ def register_claude_loop_endpoint(
         # so anything this old is genuinely gone.
         await registry.sweep_idle()
 
+        # A session parked on in-flight background work must not be retired: its
+        # CLI child owns those tasks, so a fresh subprocess would orphan them.
+        # Feed this turn into the live client instead, when it can serve the
+        # request (see `_cannot_continue_live`).
+        inherited: list = []
+        live = registry.get(thread_id)
+        if live is not None and not live.disposed and not live.background.holding:
+            # Not held for background work, so this session is about to be
+            # retired — but it may still be holding text the user has not seen
+            # (the auto-denied permission ask above, most of all). Carry it.
+            inherited = live.take_deferred()
+        if live is not None and not live.disposed and live.background.holding:
+            declined = _cannot_continue_live(live, input)
+            if declined is None:
+                continued = await _continue_live_turn(live, input, run_id, mcp)
+                if continued is not None:
+                    return continued
+                declined = "the query could not be sent"
+            logger.info(
+                "claude_code loop: cannot continue the live session (%s) — "
+                "starting fresh; %s will be orphaned (thread=%s)",
+                declined, live.background.summary(), thread_id,
+            )
+            # The background output already collected is the whole point of
+            # holding the session; hand it to the replacement rather than
+            # dropping it with the session that gathered it.
+            inherited = live.take_deferred()
+
         # Any session still on this thread is parked mid-tool-call (the app went
         # away and came back with something new). Wind it down cleanly first —
         # closing its transport from under an in-flight hook leaves the SDK
@@ -812,12 +1146,12 @@ def register_claude_loop_endpoint(
         # instead of this prompt. Bounded; see `registry.retire`.
         await registry.retire(thread_id)
         session = registry.create(thread_id)
-        session.current_run_id = run_id
         # Stash the turn's request + shared MCP so the pump can rebuild options for
         # a continuation turn (gate unlock) without this request in scope.
         session.turn_input = input
         session.turn_mcp = mcp
-        session.emit(events.run_started(thread_id, run_id))
+        session.deferred.extend(inherited)
+        session.open_run(run_id, events.run_started(thread_id, run_id))
         try:
             options = _options_for(
                 input, session, mcp, list(input.tools or []),
