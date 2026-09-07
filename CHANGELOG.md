@@ -4,6 +4,27 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.97] — 2026-09-07
+
+### Fixed
+
+- **The cloudflared quick tunnel no longer 404s every request on a machine that
+  has a named tunnel configured.** `cloudflared tunnel --url` reads
+  `~/.cloudflared/config.yml` by default, and the file `pupa-backend setup`
+  writes for a named tunnel ends — as cloudflared requires — with a
+  `http_status:404` catch-all. The quick tunnel's random `*.trycloudflare.com`
+  Host matches no `hostname:` rule, so cloudflared answered every request itself
+  with a bodiless 404 and nothing ever reached uvicorn. The backend log stayed
+  silent (no request arrived) and the iOS client reported the 404 on
+  `POST /auth/pair` as "pairing code unknown or expired", so the failure looked
+  like a pairing bug from both ends.
+
+  The quick tunnel now runs against its own `--config`
+  (`~/.pupa-backend/cloudflared-quick.yml`), and startup warns when
+  `~/.cloudflared/config.yml` exists, pointing at `cloudflared.hostname` +
+  `cloudflared.tunnel` for operators who meant to serve their own domain. The
+  named tunnel still uses the global config — it needs those ingress rules.
+
 ## [0.0.96] — 2026-09-03
 
 ### Fixed

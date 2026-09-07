@@ -1054,6 +1054,15 @@ at startup. Shell env always wins. The schema covers:
   phone reaches the backend (→ `PUPA_CONNECTIVITY`). With `cloudflared`,
   `app.py` starts a tunnel at boot as a managed child process (terminated
   on shutdown): a **named** tunnel if one is configured, else a quick tunnel.
+  The quick tunnel runs with its own `--config`
+  (`~/.pupa-backend/cloudflared-quick.yml`, comment-only — cloudflared rejects
+  an empty file) so it can't inherit `~/.cloudflared/config.yml`. On a machine
+  that has been through the named-tunnel setup, that global config's mandatory
+  catch-all is `http_status:404`, and the quick tunnel's random
+  `*.trycloudflare.com` Host matches no `hostname:` rule — cloudflared would
+  answer every request itself with a bodiless 404, nothing would reach uvicorn,
+  and nothing would appear in the backend log. Startup warns when that global
+  config exists, naming the `cloudflared.*` keys that serve the hostname instead.
   With `tailscale`, `app.py` binds **`127.0.0.1`** and registers a
   `tailscale serve` forward at boot
   ([`tailscale_proxy.py`](../backend/pupa_backend/tailscale_proxy.py)),
