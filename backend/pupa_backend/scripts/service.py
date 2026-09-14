@@ -50,20 +50,20 @@ def _service_path(env_dict: dict[str, str]) -> str:
     """PATH for the service process.
 
     systemd/launchd start a service with a minimal PATH that excludes
-    ~/.local/bin, Homebrew, nvm, etc. The claude_code agent loop shells
-    out to `claude`, and MCP servers to `uvx`/`node`, so carry the
-    installing user's PATH (plus the dir the `claude` binary resolves to
-    on PATH) into the unit — otherwise startup aborts with
-    `claude not found on PATH`.
+    ~/.local/bin, Homebrew, nvm, etc. CLI harnesses shell out to their
+    binaries, and MCP servers to `uvx`/`node`, so carry the installing
+    user's PATH plus the directories containing known harness CLIs.
     """
     path = env_dict.get("PATH") or os.environ.get("PATH", "")
     parts = path.split(os.pathsep) if path else []
-    claude = shutil.which("claude")
-    if claude:
-        cdir = str(Path(claude).parent)  # dir on PATH, not the symlink target
-        if cdir not in parts:
-            parts.insert(0, cdir)
-    return os.pathsep.join(parts)
+    resolved_dirs: list[str] = []
+    for binary_name in ("claude", "codex"):
+        binary = shutil.which(binary_name)
+        if binary:
+            directory = str(Path(binary).parent)  # preserve PATH symlink location
+            if directory not in resolved_dirs:
+                resolved_dirs.append(directory)
+    return os.pathsep.join(resolved_dirs + [part for part in parts if part not in resolved_dirs])
 
 
 def _unit_env() -> dict[str, str]:

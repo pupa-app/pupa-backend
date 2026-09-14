@@ -27,75 +27,28 @@ else, which reads as a dropped connection.
 
 from __future__ import annotations
 
-import json
 import uuid
 from typing import Any
 
 from ag_ui.core import EventType
 from ag_ui.core.events import (
-    CustomEvent,
-    RunErrorEvent,
-    RunFinishedEvent,
-    RunStartedEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
-    ToolCallArgsEvent,
-    ToolCallEndEvent,
-    ToolCallStartEvent,
 )
 from claude_agent_sdk import ServerToolUseBlock, TextBlock, ToolUseBlock
 
+from pupa_backend.agui.events import (
+    ON_INTERRUPT,
+    on_interrupt,
+    run_error,
+    run_finished,
+    run_started,
+    text_events as _text_events,
+    tool_call_events as _tool_call_events,
+)
+
 from .frontend_tools import TOOL_PREFIX, bare_name
-
-ON_INTERRUPT = "on_interrupt"
-
-
-def run_started(thread_id: str, run_id: str) -> RunStartedEvent:
-    return RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id)
-
-
-def run_finished(thread_id: str, run_id: str) -> RunFinishedEvent:
-    return RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id)
-
-
-def run_error(message: str, code: str | None = None) -> RunErrorEvent:
-    return RunErrorEvent(type=EventType.RUN_ERROR, message=message, code=code)
-
-
-def on_interrupt(frontend_calls: list[dict[str, Any]]) -> CustomEvent:
-    """Build the batched `on_interrupt` event the iOS client dispatches locally."""
-    return CustomEvent(
-        type=EventType.CUSTOM,
-        name=ON_INTERRUPT,
-        value={"frontend_tool_calls": frontend_calls},
-    )
-
-
-def _text_events(message_id: str, text: str) -> list[Any]:
-    return [
-        TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=message_id, role="assistant"),
-        TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=message_id, delta=text),
-        TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=message_id),
-    ]
-
-
-def _tool_call_events(call_id: str, name: str, args: Any, parent_message_id: str | None) -> list[Any]:
-    try:
-        delta = json.dumps(args or {}, default=str)
-    except (TypeError, ValueError):
-        delta = "{}"
-    return [
-        ToolCallStartEvent(
-            type=EventType.TOOL_CALL_START,
-            tool_call_id=call_id,
-            tool_call_name=name,
-            parent_message_id=parent_message_id,
-        ),
-        ToolCallArgsEvent(type=EventType.TOOL_CALL_ARGS, tool_call_id=call_id, delta=delta),
-        ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=call_id),
-    ]
-
 
 def new_stream_state() -> dict[str, Any]:
     """Fresh per-turn cursor for `translate_stream_event` / `text_already_streamed`.

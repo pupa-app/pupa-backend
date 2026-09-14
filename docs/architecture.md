@@ -20,7 +20,7 @@ Dockerfile, Railway `startCommand`, and the generated launchd/systemd unit in
 [`service.py`](../backend/pupa_backend/scripts/service.py)); `pupa-backend run`
 calls the same `pupa_backend.app:main`.
 
-The two differ in **environment**. `run` is a child of your shell and inherits
+The launch methods differ in **environment**. `run` is a child of your shell and inherits
 its exports; the service inherits nothing and reads `~/.pupa-backend/config.yml`
 itself (`app.py` calls `load_pupa_config()` at import). The generated unit
 therefore carries **only `PATH`** — launchd/systemd start with a minimal one and
@@ -59,8 +59,8 @@ single lifespan that:
    [`db.open_persistence`](../backend/pupa_backend/harnesses/langgraph/db/connection.py)
    from `DATABASE_URL` (or local SQLite when unset) and yields the
    checkpointer + store to the graph — **only when the deepagents harness is
-   enabled**. A Claude-only deploy opens no database and mounts no `/db`;
-   that loop keeps sessions in-process and the SDK owns its history.
+   enabled**. A CLI-harness-only deploy opens no database and mounts no `/db`;
+   those loops keep sessions in-process and their CLIs own history.
 3. Pre-builds the env-default agent graph and registers it under the
    `(None, None)` cache key via
    [`agent.register_graph_deps`](../backend/pupa_backend/harnesses/langgraph/agent.py).
@@ -70,7 +70,7 @@ Routers mounted on the app:
 | Prefix              | Module                                                          | Purpose                                                            |
 | ------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ |
 | `POST /`               | default [harness](#agent-harnesses-multiple-mounted-together)   | AG-UI SSE stream — the only protocol the client speaks. Alias for the default harness (un-migrated clients). |
-| `POST /harnesses/{id}` | the harness with that id                                        | AG-UI SSE stream for a specific harness (`deepagents`, `claude_code`). |
+| `POST /harnesses/{id}` | the harness with that id                                        | AG-UI SSE stream for a specific harness (`deepagents`, `claude_code`, `codex`). |
 | `GET /harnesses`       | [`backend/pupa_backend/harnesses/routes.py`](../backend/pupa_backend/harnesses/routes.py) | Discovery: each enabled harness's models, tools, and permission-control schema. Replaces `/models` + `/backend-tools`. |
 | `/auth/*`           | [`backend/pupa_backend/auth/routes.py`](../backend/pupa_backend/auth/routes.py)           | Pair-once flow: `/auth/pair/begin`, `/auth/pair/complete`, `/auth/devices`, `/auth/config`. |
 | `/db/*`             | [`backend/pupa_backend/harnesses/langgraph/db/routes.py`](../backend/pupa_backend/harnesses/langgraph/db/routes.py) | Transcript loader, per-thread usage, thread deletion. Mounted only when the deepagents harness is enabled. |
@@ -160,14 +160,10 @@ the model:
 
   Each frontend call pauses the graph via `langgraph.interrupt()`
   ([`frontend_interrupt.py`](../backend/pupa_backend/harnesses/langgraph/frontend_interrupt.py)); the client
-  runs it and resumes with `Command(resume=…)`. **Known upstream bug:**
-  `ag-ui-langgraph` (pinned `0.0.42`) emits `on_interrupt` from
-  `state.tasks[0]` only, so a multi-task turn (batched `render*`, or `render*`
-  + a backend tool) whose interrupt parks on a later task drops it in-run —
-  the run looks like a clean finish and the chat stalls until the next POST,
-  whose recovery path collects all tasks. Fixed on upstream `main`, unreleased.
-  The iOS client self-heals by re-POSTing on this signal; a canary
-  (`tests/test_ag_ui_langgraph_emit_interrupt_bug.py`) fails when the fix ships.
+  runs it and resumes with `Command(resume=…)`. `ag-ui-langgraph` 0.0.43
+  collects interrupts from every state task, including a later task in a
+  batched `render*` or mixed frontend/backend turn. The dependency-level canary
+  (`tests/test_ag_ui_langgraph_emit_interrupt_bug.py`) pins that behavior.
 - **Backend tools** — `tavily_search` (when `TAVILY_API_KEY` is
   set; see [`backend/pupa_backend/harnesses/langgraph/backend_tools.py`](../backend/pupa_backend/harnesses/langgraph/backend_tools.py))
   and the optional local `shell` tool (gated on `SHELL_TOOL_ENABLED=1`)
@@ -261,18 +257,22 @@ different proxy.
 ## Agent harnesses (multiple, mounted together)
 
 An **agent harness** is a self-contained agent loop that owns an AG-UI SSE
-handler. Two ship today — the **deepagents** graph and the **Claude Code** loop
-([`backend/pupa_backend/harnesses/claude/`](../backend/pupa_backend/harnesses/claude/)) — and *every enabled harness
+handler. Three ship today — the **deepagents** graph, **Claude Code**, and
+**Codex** loops — and *every enabled harness
 is mounted at once* at `POST /harnesses/{id}` (the default one is also aliased at
 `POST /` for un-migrated clients). The iOS app picks the harness per backend
 connection; the server no longer runs one loop per process.
 
 The registry lives in [`harnesses/__init__.py`](../backend/pupa_backend/harnesses/__init__.py) (`AgentHarness`
-protocol + `DeepAgentsHarness` / `ClaudeCodeHarness` adapters), built from the
+protocol plus `DeepAgentsHarness`, `ClaudeCodeHarness`, and `CodexHarness` adapters), built from the
 `PUPA_HARNESSES` env JSON that `pupa_config` emits from the config.yml
 `harnesses:` block. `app.py`'s lifespan loops over `registry.enabled()` and calls
-`harness.register(app, path, deps)`. Adding a harness = adding an adapter (a
+optional `prepare`, `register(app, path, deps)`, and optional `close` lifecycle hooks. Adding a harness = adding an adapter (a
 public plugin entry point is deferred until the package is published).
+`GET /harnesses` applies the backend-wide `default_model` preference after
+each adapter returns its catalog, putting `gpt-5.6-sol` first by default
+without coupling that policy to the Codex adapter. `PUPA_DEFAULT_MODEL`
+overrides the preference.
 
 **Coexistence of deepagents + Claude Code.** The Claude loop drives the `claude`
 CLI, which inherits `os.environ`; its billing guard is subscription-only and
@@ -664,6 +664,51 @@ sticky routing). Subscription ToS for automated/server use is the operator's
 responsibility (same surface as the `claude_code` tool). Cloud
 ([`deploy/cloud-config.yml`](../deploy/cloud-config.yml)) stays on deepagents and
 pins `claude_loop_native: "off"`.
+
+### Codex App Server harness
+
+The `codex` harness (`backend/pupa_backend/harnesses/codex/`) embeds the local
+Codex CLI over newline-delimited JSON-RPC using `codex app-server`. A short-lived
+startup probe initializes the experimental API, requires `account/read` to
+report `type: chatgpt`, verifies dynamic-tool thread creation, and caches the
+visible `model/list` result for `GET /harnesses`.
+
+Each live Pupa thread owns one App Server child. Its Codex thread id and dynamic
+tool-surface fingerprint survive idle child eviction, so a later turn resumes
+the Codex thread only while that surface still matches. After a backend restart,
+or when tools change between turns, the complete Pupa transcript seeds a fresh
+Codex thread instead. If App Server can no longer resume a remembered thread,
+the harness forgets that stale id, starts fresh, and seeds the full transcript
+rather than leaving the Pupa thread stuck retrying the failed resume.
+
+`RunAgentInput.tools` and the shared configured MCP tools become experimental
+App Server `dynamicTools` in separate `pupa_frontend` and `pupa_mcp` namespaces.
+Frontend calls emit the standard tool frames plus batched `on_interrupt`, park
+the App Server request, and are answered by the matching AG-UI resume payload.
+Configured MCP calls execute directly against the lifespan-managed Pupa MCP
+connection. App Server fixes dynamic tools at `thread/start`; if a frontend
+round changes the advertised surface, Pupa interrupts the narrow turn, starts a
+fresh Codex thread with the wider surface, and continues with the original
+conversation transcript, current images, and completed frontend-tool results.
+No completed call is repeated solely because the surface changed.
+
+App Server agent-message deltas map to AG-UI text frames. Native command, file,
+MCP, web, and collaboration items are display-only tool frames. Full-scope
+command and file approval requests become plain-chat yes/no/always questions;
+concurrent asks serialize, and `codex_loop_auto_approve` accepts later requests
+in that thread. The selected native scope remains a hard ceiling: `read` maps to
+`readOnly`, `workspace` (default) maps to `workspaceWrite` rooted at
+`PUPA_CODEX_WORKSPACE` with network off, and `full` maps to
+`dangerFullAccess`. Requests to escape the read/workspace sandbox and explicit
+permission expansion are denied even when auto-approval is enabled.
+
+The child receives a small allowlist of process variables needed for local CLI
+operation and explicitly never receives `OPENAI_API_KEY` or `CODEX_API_KEY`.
+There is no API-billing or in-app login fallback: run `codex login` first. Model
+and reasoning menus come from the authenticated account; per-turn
+`forwardedProps.llm.model` and `.thinking` are validated against that catalog.
+The harness is self-hosted/single-instance, and the packaged Docker/cloud config
+does not install or enable Codex.
 
 ## Tracing (Langfuse)
 
@@ -1094,10 +1139,10 @@ at startup. Shell env always wins. The schema covers:
 - `claude_code_disabled` (opt-out), `claude_code_model`,
   `claude_code_workspace` — the `claude_code` tool's gate and config.
 - `harnesses` — nested block of enabled [agent harnesses](#agent-harnesses-multiple-mounted-together),
-  e.g. `{deepagents: {enabled: true, default: true}, claude_code: {enabled: true,
-  native: "full"}}`. Serialised to `PUPA_HARNESSES` (JSON); the Claude harness's
-  nested knobs (`native`/`skills`/`auto_approve`/…) also flatten onto the legacy
-  `PUPA_CLAUDE_LOOP_*` env vars. Replaces the retired single `agent_loop:` switch.
+  e.g. `{deepagents: {enabled: true, default: true}, claude_code: {enabled: true},
+  codex: {enabled: true, native: "workspace"}}`. Serialised to `PUPA_HARNESSES`
+  (JSON); nested Claude and Codex knobs flatten to their `PUPA_*` environment
+  variables. Replaces the retired single `agent_loop:` switch.
   String values → quote them in YAML.
 - `mcp_servers` — structured block of named MCP servers attached to the
   agent ([`backend/pupa_backend/mcp_servers.py`](../backend/pupa_backend/mcp_servers.py)); serialised
@@ -1108,8 +1153,9 @@ The setup wizard ([`backend/pupa_backend/scripts/setup.py`](../backend/pupa_back
 `pupa-backend setup`) writes this YAML interactively. Its first questions
 **enable each harness** and pick the default: enabling `deepagents` prompts for
 the LLM providers as usual; enabling `claude_code` runs a soft `claude auth
-status` preflight (warning if no first-party subscription login is found). Both
-can be enabled together — the credential stash keeps them compatible. The **connectivity** question offers a full-auto
+status` preflight, and enabling `codex` checks `codex login status` for a ChatGPT
+login. Any combination can be enabled together; the Claude credential stash and
+the Codex child environment keep subscription and API-provider credentials isolated. The **connectivity** question offers a full-auto
 Cloudflare *named* tunnel: pick `cloudflared` + "I have a domain" and the wizard
 creates the tunnel, routes DNS, and writes `~/.cloudflared/config.yml` for a
 stable URL on the operator's domain (falling back to the quick tunnel if

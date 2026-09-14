@@ -385,6 +385,29 @@ def _check_claude_subscription() -> tuple[bool, str]:
     )
 
 
+def _check_codex_subscription() -> tuple[bool, str]:
+    """Soft preflight for a ChatGPT-authenticated Codex CLI."""
+    binary = os.getenv("PUPA_CODEX_BIN") or shutil.which("codex") or "codex"
+    env = os.environ.copy()
+    # The harness deliberately prevents API-key billing in its child process.
+    env.pop("OPENAI_API_KEY", None)
+    env.pop("CODEX_API_KEY", None)
+    try:
+        proc = subprocess.run(
+            [binary, "login", "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, "could not run `codex login status` (CLI missing or not logged in)"
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode == 0 and "chatgpt" in output.lower():
+        return True, "ChatGPT subscription login confirmed"
+    return False, "Codex CLI is not logged in with ChatGPT"
+
+
 # Apple's cap for TLS server certs is 398 days; stay a day under it.
 CERT_VALIDITY_DAYS = 397
 
@@ -513,6 +536,11 @@ def main() -> None:
     # config dict that will be written as YAML
     config: dict = {}
 
+    # Preserve the harness-independent initial model preference. Sol is
+    # the built-in default, so setup only needs to carry an explicit override.
+    if preferred_model := str(existing_yaml.get("default_model") or "").strip():
+        config["default_model"] = preferred_model
+
     # ---- Backend agent harnesses ----
     # Several harnesses run at once, each mounted at POST /harnesses/{id} (the
     # default one also at POST /); the app picks which to talk to per backend
@@ -538,28 +566,45 @@ def main() -> None:
         "Enable the Claude Code harness (subscription-only, Claude Pro/Max)?",
         default=_was_enabled("claude_code", False),
     )
-    if not (deepagents_enabled or claude_enabled):
+    codex_enabled = _yesno(
+        "Enable the Codex harness (subscription-only, ChatGPT)?",
+        default=_was_enabled("codex", False),
+    )
+    if not (deepagents_enabled or claude_enabled or codex_enabled):
         print(f"  {_D}At least one harness is required — enabling Deep Agents.{_X}")
         deepagents_enabled = True
     print()
 
     enabled_ids = [
-        hid for hid, on in (("deepagents", deepagents_enabled), ("claude_code", claude_enabled)) if on
+        hid
+        for hid, enabled in (
+            ("deepagents", deepagents_enabled),
+            ("claude_code", claude_enabled),
+            ("codex", codex_enabled),
+        )
+        if enabled
     ]
     if len(enabled_ids) == 1:
         default_harness = enabled_ids[0]
     else:
         default_harness = _choose(
             "Default harness (served at POST / for un-migrated clients):",
-            [("deepagents", "Deep Agents"), ("claude_code", "Claude Code")],
+            [
+                (harness_id, label)
+                for harness_id, label in (
+                    ("deepagents", "Deep Agents"),
+                    ("claude_code", "Claude Code"),
+                    ("codex", "Codex"),
+                )
+                if harness_id in enabled_ids
+            ],
             default=enabled_ids[0],
         )
         print()
 
     # ---- LLM providers ----
-    # Collected only when the deepagents harness is enabled — the Claude Code
-    # harness authenticates via the `claude` CLI subscription and ignores
-    # LLM-provider config.
+    # Collected only for Deep Agents. CLI harnesses authenticate through
+    # their own subscription login and ignore LLM-provider API configuration.
     providers_config: dict = {}
     default_provider: str = ""
     if deepagents_enabled:
@@ -613,6 +658,18 @@ def main() -> None:
             print(f"  {_D}    from `claude setup-token` before starting.{_X}")
         print()
 
+    if codex_enabled:
+        print(f"  {_D}Codex harness — authenticates via the `codex` CLI and ChatGPT.")
+        print(f"  API billing keys are removed from its child process.{_X}")
+        print()
+        ok, msg = _check_codex_subscription()
+        if ok:
+            print(f"  {_G}✓ {msg}.{_X}")
+        else:
+            print(f"  {_R}[!] {msg}.{_X}")
+            print(f"  {_D}    Install the Codex CLI and run `codex login` before starting.{_X}")
+        print()
+
     # ---- Assemble the harnesses block ----
     harnesses_cfg: dict = {}
     if deepagents_enabled:
@@ -637,6 +694,14 @@ def main() -> None:
             elif flat_key in existing_yaml:
                 cc[nested_key] = existing_yaml[flat_key]
         harnesses_cfg["claude_code"] = cc
+    if codex_enabled:
+        codex_cfg: dict = {"enabled": True, "default": default_harness == "codex"}
+        previous = existing_harnesses.get("codex")
+        previous = previous if isinstance(previous, dict) else {}
+        for key in ("native", "auto_approve", "model", "workspace", "config_dir", "binary"):
+            if key in previous:
+                codex_cfg[key] = previous[key]
+        harnesses_cfg["codex"] = codex_cfg
     config["harnesses"] = harnesses_cfg
 
     # ---- Persistence ----
@@ -828,6 +893,10 @@ def main() -> None:
         print(f"  {_R}├───────────────────────────────────────────────────────┤{_X}")
         print(f"  {_R}│{_X}  Harness: {_Y}claude_code{_X} (subscription-only)             {_R}│{_X}")
         print(f"  {_R}│{_X}  Needs: {_C}claude auth login{_X} (Pro/Max)                  {_R}│{_X}")
+    if codex_enabled:
+        print(f"  {_R}├───────────────────────────────────────────────────────┤{_X}")
+        print(f"  {_R}│{_X}  Harness: {_Y}codex{_X} (subscription-only)                   {_R}│{_X}")
+        print(f"  {_R}│{_X}  Needs: {_C}codex login{_X} (ChatGPT)                       {_R}│{_X}")
     if deepagents_enabled:
         active_cfg = providers_config.get(default_provider, {})
         active_ptype = active_cfg.get("provider", "")

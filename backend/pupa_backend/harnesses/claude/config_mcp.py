@@ -25,6 +25,8 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from pupa_backend.agui.tools import invoke_langchain_tool, langchain_input_schema
+
 logger = logging.getLogger("uvicorn.error")
 
 # In-process MCP server name the config-driven tools live under. The
@@ -38,22 +40,7 @@ def qualified_name(bare: str) -> str:
     return f"{TOOL_PREFIX}{bare}"
 
 
-def _input_schema(lc_tool: Any) -> dict[str, Any]:
-    """Best-effort JSON Schema for a LangChain tool's arguments.
-
-    `langchain-mcp-adapters` sets `args_schema` from the MCP tool's `inputSchema`
-    (a JSON-schema dict in recent versions; a pydantic model in older ones).
-    """
-    schema = getattr(lc_tool, "args_schema", None)
-    if isinstance(schema, dict):
-        return schema
-    model_json_schema = getattr(schema, "model_json_schema", None)
-    if callable(model_json_schema):
-        try:
-            return model_json_schema()
-        except Exception:  # noqa: BLE001 — fall back to a permissive schema
-            pass
-    return {"type": "object", "properties": {}}
+_input_schema = langchain_input_schema
 
 
 def _make_handler(lc_tool: Any):
@@ -66,11 +53,7 @@ def _make_handler(lc_tool: Any):
     """
 
     async def _handler(args: dict[str, Any]) -> dict[str, Any]:
-        try:
-            result = await lc_tool.ainvoke(args or {})
-        except Exception as exc:  # noqa: BLE001 — surface to the model, don't kill the loop
-            return {"content": [{"type": "text", "text": f"Error calling tool: {exc}"}]}
-        text = result if isinstance(result, str) else str(result)
+        _ok, text = await invoke_langchain_tool(lc_tool, args or {})
         return {"content": [{"type": "text", "text": text}]}
 
     return _handler

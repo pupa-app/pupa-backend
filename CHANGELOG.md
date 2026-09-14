@@ -4,6 +4,30 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.98] — 2026-09-14
+
+### Added
+
+- **Codex CLI is now a first-class Pupa agent harness.** Enable `codex` beside
+  `deepagents` and `claude_code` to run ChatGPT-subscription Codex sessions over
+  `codex app-server`, with discovered models/reasoning levels, streaming AG-UI
+  output, frontend and configured-MCP tools, resumable threads, permission
+  prompts, transcript-safe recovery when a saved thread or tool surface cannot
+  be resumed, and read/workspace/full sandbox controls. The child environment
+  excludes API billing keys and startup fails unless Codex reports a ChatGPT login.
+
+### Changed
+
+- Common AG-UI event construction, message/context normalisation, approval
+  parsing, tool schema/execution adapters, and single-consumer stream handoff
+  now live above the harness boundary and are shared by Claude Code and Codex.
+- Harnesses may prepare asynchronously and close resources during the FastAPI
+  lifespan. The setup wizard and generated service PATH now support both CLI
+  harnesses.
+- Harness discovery now puts `gpt-5.6-sol` first when available, so Sol is
+  the model initially shown by Pupa. The harness-independent `default_model`
+  / `PUPA_DEFAULT_MODEL` setting overrides that preference.
+
 ## [0.0.97] — 2026-09-07
 
 ### Fixed

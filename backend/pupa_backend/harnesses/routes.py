@@ -20,12 +20,25 @@ lifespan — this router only serves the GET discovery document.
 
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, Request
 
 from pupa_backend.auth import require_scope
 from pupa_backend.harnesses import build_registry
 
 router = APIRouter()
+
+_DEFAULT_MODEL_ID = "gpt-5.6-sol"
+
+
+def ordered_models(models: list[dict]) -> list[dict]:
+    """Put Pupa's preferred initial model first without changing harness logic."""
+    preferred = (os.getenv("PUPA_DEFAULT_MODEL") or _DEFAULT_MODEL_ID).strip().lower()
+    return sorted(
+        list(models),
+        key=lambda model: str(model.get("modelId") or "").lower() != preferred,
+    )
 
 
 @router.get("", dependencies=[Depends(require_scope("agent"))])
@@ -38,7 +51,7 @@ async def list_harnesses(request: Request) -> list[dict]:
             "id": h.id,
             "label": h.label,
             "isDefault": h.id == default_id,
-            "models": h.models(),
+            "models": ordered_models(h.models()),
             # Optional per-harness capability — deepagents omits it.
             "thinking": getattr(h, "thinking", list)() or [],
             "tools": h.tools(),

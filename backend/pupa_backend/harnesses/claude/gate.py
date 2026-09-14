@@ -41,6 +41,8 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
+from pupa_backend.agui.approval import interpret_always, interpret_approval
+
 from . import events as cl_events
 from .frontend_tools import TOOL_PREFIX, bare_name
 
@@ -55,18 +57,6 @@ _NATIVE_WEB = frozenset({"WebFetch", "WebSearch"})
 _NATIVE_META = frozenset({"Skill", "SlashCommand"})
 # Tools that never need a user prompt: local reads + web reads + skill dispatch.
 _AUTO_NATIVE = _NATIVE_READ | _NATIVE_WEB | _NATIVE_META
-
-# Words in a user's reply that grant a parked permission request. Anything else
-# (including ambiguous text) denies — fail-closed.
-_APPROVE_WORDS = frozenset({
-    "yes", "y", "ok", "okay", "sure", "approve", "approved", "allow", "allowed",
-    "go ahead", "do it", "proceed", "confirm", "confirmed", "yep", "yeah",
-})
-# Replies that approve AND switch the thread to run-freely (no more prompts).
-_ALWAYS_PHRASES = (
-    "always", "auto", "yes to all", "approve all", "allow all", "don't ask",
-    "dont ask", "stop asking", "run freely", "yolo",
-)
 
 CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext],
@@ -169,30 +159,6 @@ def _auto_approve_from_state(state: dict[str, Any] | None) -> bool:
     if val is None:
         val = state.get("autoApprove")
     return bool(val)
-
-
-def interpret_approval(text: str | None) -> bool:
-    """Map a user's free-text reply to allow (True) / deny (False). Ambiguous → deny."""
-    if not text:
-        return False
-    if interpret_always(text):
-        return True
-    t = text.strip().lower()
-    if t in _APPROVE_WORDS:
-        return True
-    # Allow a leading approval word ("yes, go ahead", "ok do it").
-    first = t.split(",")[0].split(".")[0].strip()
-    if first in _APPROVE_WORDS:
-        return True
-    return any(phrase in t for phrase in ("go ahead", "do it", "approve", "allow it", "permission granted"))
-
-
-def interpret_always(text: str | None) -> bool:
-    """True if the reply approves AND asks to stop prompting for the rest of the thread."""
-    if not text:
-        return False
-    t = text.strip().lower()
-    return any(p in t for p in _ALWAYS_PHRASES)
 
 
 def _describe(tool_name: str, tool_input: dict[str, Any]) -> str:
