@@ -33,6 +33,8 @@ _YAML_TO_ENV: dict[str, str] = {
     "auth.api_key":          "PUPA_API_KEY",
     "screenshare":           "PUPA_SCREENSHARE",
     "connectivity":          "PUPA_CONNECTIVITY",
+    # Harness-independent initial model ordering in GET /harnesses.
+    "default_model":         "PUPA_DEFAULT_MODEL",
     # Named Cloudflare tunnel (custom domain). Set only when the operator runs a
     # persistent named tunnel — hostname gives a stable public URL (no random
     # trycloudflare.com), tunnel is the cloudflared tunnel name used by
@@ -160,9 +162,8 @@ def _resolve_mcp_servers(data: dict) -> dict[str, str]:
     return {"PUPA_MCP_SERVERS": json.dumps(block)}
 
 
-# Per-harness config keys that map onto existing flat `PUPA_CLAUDE_LOOP_*` env
-# vars, so `harnesses.claude_code.<key>` and the legacy flat key both work and
-# gate.py/env.py env reads stay untouched.
+# Per-harness nested config -> process environment. The Claude alias stays
+# public because older tests/extensions imported it directly.
 _CLAUDE_HARNESS_KEY_TO_ENV: dict[str, str] = {
     "native":            "PUPA_CLAUDE_LOOP_NATIVE",
     "skills":            "PUPA_CLAUDE_LOOP_SKILLS",
@@ -174,6 +175,18 @@ _CLAUDE_HARNESS_KEY_TO_ENV: dict[str, str] = {
     "workspace":         "CLAUDE_CODE_WORKSPACE",
     "config_dir":        "PUPA_CLAUDE_LOOP_CONFIG_DIR",
 }
+_CODEX_HARNESS_KEY_TO_ENV: dict[str, str] = {
+    "native":       "PUPA_CODEX_LOOP_NATIVE",
+    "auto_approve": "PUPA_CODEX_LOOP_AUTO_APPROVE",
+    "model":        "PUPA_CODEX_MODEL",
+    "workspace":    "PUPA_CODEX_WORKSPACE",
+    "config_dir":   "PUPA_CODEX_CONFIG_DIR",
+    "binary":       "PUPA_CODEX_BIN",
+}
+_HARNESS_KEY_TO_ENV: dict[str, dict[str, str]] = {
+    "claude_code": _CLAUDE_HARNESS_KEY_TO_ENV,
+    "codex": _CODEX_HARNESS_KEY_TO_ENV,
+}
 
 
 def _resolve_harnesses(data: dict) -> dict[str, str]:
@@ -181,25 +194,27 @@ def _resolve_harnesses(data: dict) -> dict[str, str]:
 
     The `harnesses:` block replaces the single `agent_loop:` switch. Each entry is
     `{enabled: bool, default: bool, ...per-harness knobs}`. The block itself is
-    passed through as JSON for `harnesses.build_registry()`; the Claude harness's
-    nested knobs are additionally flattened onto the existing `PUPA_CLAUDE_LOOP_*`
-    env vars so the loop's env reads don't change. Returns `{}` when absent.
+    passed through as JSON for `harnesses.build_registry()`; nested harness
+    knobs are additionally flattened onto their runtime environment variables.
+    Returns `{}` when the block is absent.
     """
     block = data.get("harnesses")
     if not isinstance(block, dict) or not block:
         return {}
     result: dict[str, str] = {"PUPA_HARNESSES": json.dumps(block)}
-    claude_cfg = block.get("claude_code")
-    if isinstance(claude_cfg, dict):
-        for cfg_key, env_var in _CLAUDE_HARNESS_KEY_TO_ENV.items():
-            if cfg_key not in claude_cfg:
+    for harness_id, mapping in _HARNESS_KEY_TO_ENV.items():
+        harness_cfg = block.get(harness_id)
+        if not isinstance(harness_cfg, dict):
+            continue
+        for cfg_key, env_var in mapping.items():
+            if cfg_key not in harness_cfg:
                 continue
-            v = claude_cfg[cfg_key]
-            if isinstance(v, bool):
-                if v:
+            value = harness_cfg[cfg_key]
+            if isinstance(value, bool):
+                if value:
                     result[env_var] = "1"
-            elif str(v).strip():
-                result[env_var] = str(v)
+            elif str(value).strip():
+                result[env_var] = str(value)
     return result
 
 
@@ -258,8 +273,9 @@ def known_env_vars() -> dict[str, str]:
             known[env_var] = f"llm_providers.<name>.{cfg_key}"
     known["PUPA_MCP_SERVERS"] = "mcp_servers"
     known["PUPA_HARNESSES"] = "harnesses"
-    for cfg_key, env_var in _CLAUDE_HARNESS_KEY_TO_ENV.items():
-        known[env_var] = f"harnesses.claude_code.{cfg_key}"
+    for harness_id, mapping in _HARNESS_KEY_TO_ENV.items():
+        for cfg_key, env_var in mapping.items():
+            known[env_var] = f"harnesses.{harness_id}.{cfg_key}"
     return known
 
 

@@ -75,17 +75,20 @@ environment, so renaming any of those three breaks releases.
   descriptions are already forwarded as proper tool definitions, and
   duplicating them causes drift. See
   [`prompts.py`](backend/pupa_backend/prompts.py).
-- **Backend tools are the short list**, all in
+- **Deepagents backend tools are the short list**, all in
   [`harnesses/langgraph/backend_tools.py`](backend/pupa_backend/harnesses/langgraph/backend_tools.py):
   `tavily_search` (needs `TAVILY_API_KEY`), an env-gated `shell` behind an
   approval middleware, `write_todos`, the `claude_code` delegation tool,
   `skill_view`, plus any configured MCP server's tools behind a `get_tools`
-  gate. Everything else is a frontend tool.
+  gate. The subscription CLI harnesses bridge configured MCP tools directly
+  into their own runtime (`claude_code` via its in-process MCP server, `codex`
+  via App Server dynamic tools), as documented in `docs/architecture.md`.
+  Everything else is a frontend tool.
 - **Both harnesses share one system prompt.**
   [`prompts.py`](backend/pupa_backend/prompts.py) is above the harness
   boundary; the Claude loop appends its own suffixes at request time in
   [`claude/env.py`](backend/pupa_backend/harnesses/claude/env.py). Editing the
-  base prompt changes both loops.
+  base prompt changes every harness.
 - **The credential stash is load-bearing.** When the `claude_code` harness is
   enabled, [`credentials.py`](backend/pupa_backend/credentials.py) moves
   `ANTHROPIC_API_KEY` / `AWS_*` out of `os.environ` at import time so the

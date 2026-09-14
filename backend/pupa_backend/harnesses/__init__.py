@@ -10,7 +10,8 @@ Enabled harnesses come from `PUPA_HARNESSES` (JSON, emitted by `pupa_config`
 from the config.yml `harnesses:` block), e.g.::
 
     {"deepagents": {"enabled": true, "default": true},
-     "claude_code": {"enabled": true}}
+     "claude_code": {"enabled": true},
+     "codex": {"enabled": true}}
 
 Adding a harness today means adding an adapter to `_ADAPTERS` (fork-friendly);
 a public plugin entry point is deferred until the backend package is published.
@@ -29,7 +30,7 @@ logger = logging.getLogger("uvicorn.error")
 
 
 # How often the harness sweep runs (seconds). A harness may hold an external
-# process alive between turns — the Claude loop does, while background work is in
+# process alive between turns — both CLI loops do, while work is in
 # flight — and a retention wall checked only on the next request is not a bound
 # at all: an app that never comes back would leave the child running.
 _SWEEP_INTERVAL_DEFAULT = 60.0
@@ -89,6 +90,8 @@ class AgentHarness(Protocol):
     id: str
     label: str
 
+    async def prepare(self, deps: HarnessDeps) -> None: ...
+    async def close(self) -> None: ...
     def register(self, app: Any, path: str, deps: HarnessDeps) -> None: ...
     def models(self) -> list[dict]: ...
     # Optional: reap sessions this harness is holding open. Called periodically by
@@ -116,6 +119,11 @@ class ClaudeCodeHarness:
         # No checkpointer/store: the loop keeps sessions in-process and the
         # Claude Code SDK owns its own history.
         register_claude_loop_endpoint(app, path=path, mcp=deps.mcp)
+
+    async def close(self) -> None:
+        from pupa_backend.harnesses.claude.registry import shutdown_all
+
+        await shutdown_all()
 
     async def sweep(self) -> None:
         """Evict idle sessions and any whose background-work hold has expired.
@@ -163,11 +171,71 @@ class ClaudeCodeHarness:
         ]
 
 
+class CodexHarness:
+    """The Codex CLI subscription loop, embedded through App Server."""
+
+    id = "codex"
+    label = "Codex"
+
+    def __init__(self) -> None:
+        from pupa_backend.harnesses.codex.models import ModelCatalog
+
+        self._catalog = ModelCatalog()
+
+    async def prepare(self, deps: HarnessDeps) -> None:
+        from pupa_backend.harnesses.codex.models import ModelCatalog
+        from pupa_backend.harnesses.codex.registry import probe
+
+        self._catalog = ModelCatalog(await probe())
+
+    async def close(self) -> None:
+        from pupa_backend.harnesses.codex.registry import shutdown_all
+
+        await shutdown_all()
+
+    def register(self, app: Any, path: str, deps: HarnessDeps) -> None:
+        from pupa_backend.harnesses.codex import register_codex_endpoint
+
+        register_codex_endpoint(app, path=path, mcp=deps.mcp, catalog=self._catalog)
+
+    async def sweep(self) -> None:
+        from pupa_backend.harnesses.codex.registry import sweep_idle
+
+        await sweep_idle()
+
+    def models(self) -> list[dict]:
+        return self._catalog.menu()
+
+    def thinking(self) -> list[dict]:
+        return self._catalog.thinking_menu()
+
+    def tools(self) -> list[dict]:
+        return []
+
+    def permission_schema(self) -> list[dict]:
+        return [
+            {
+                "key": "codex_loop_native",
+                "type": "choice",
+                "label": "Host tools",
+                "options": ["read", "workspace", "full"],
+                "default": "workspace",
+            },
+            {
+                "key": "codex_loop_auto_approve",
+                "type": "bool",
+                "label": "Run commands without asking",
+                "default": False,
+            },
+        ]
+
+
 # Built-in adapters, keyed by harness id. Fork-friendly extension point — add an
 # adapter class here. `langgraph` is resolved lazily in `_adapter_for` so
 # importing this module doesn't pull in `agent` (and its heavy deps).
 _ADAPTERS: dict[str, type] = {
     "claude_code": ClaudeCodeHarness,
+    "codex": CodexHarness,
 }
 
 
@@ -178,8 +246,9 @@ def _adapter_for(harness_id: str):
         return DeepAgentsHarness
     adapter = _ADAPTERS.get(harness_id)
     if adapter is None:
+        known = ", ".join(("deepagents", *_ADAPTERS))
         raise ValueError(
-            f"Unknown harness {harness_id!r}. Known: deepagents, claude_code. "
+            f"Unknown harness {harness_id!r}. Known: {known}. "
             "Fix the `harnesses:` block in ~/.pupa-backend/config.yml (or "
             "PUPA_HARNESSES) to name one of those."
         )

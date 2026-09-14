@@ -44,6 +44,16 @@ from claude_agent_sdk import (
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
+from pupa_backend.agui.input import (
+    canonical_json as _canonical_json,
+    coerce_content as _coerce_content,
+    context_pairs as _context_pairs,
+    latest_user_message as _latest_user_message,
+    latest_user_text as _latest_user_text,
+    message_content as _msg_content,
+    render_context as _render_context,
+    render_transcript as _render_transcript,
+)
 from pupa_backend.agui.tool_results import parse_tool_results
 from pupa_backend.sse_replay import register_reattach_observer
 
@@ -156,67 +166,6 @@ def _advertised_tools(input: RunAgentInput, resume_payload: Any) -> list[Any]:
     return list(input.tools or [])
 
 
-def _latest_user_text(messages: list[Any]) -> str:
-    """Newest user message rendered to text (content may be str or content parts)."""
-    for msg in reversed(messages or []):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-        if role != "user":
-            continue
-        content = getattr(msg, "content", None)
-        if content is None and isinstance(msg, dict):
-            content = msg.get("content")
-        return _coerce_content(content)
-    return ""
-
-
-def _render_transcript(messages: list[Any]) -> str:
-    """Flatten the whole conversation into a prompt — used only on the first turn
-    of a thread (no SDK session to `resume` from yet)."""
-    lines: list[str] = []
-    for msg in messages or []:
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-        content = getattr(msg, "content", None)
-        if content is None and isinstance(msg, dict):
-            content = msg.get("content")
-        text = _coerce_content(content)
-        if text:
-            lines.append(f"{role}: {text}")
-    return "\n\n".join(lines)
-
-
-def _coerce_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for p in content:
-            if isinstance(p, str):
-                parts.append(p)
-            elif isinstance(p, dict) and isinstance(p.get("text"), str):
-                parts.append(p["text"])
-            elif getattr(p, "text", None):
-                parts.append(p.text)
-        return "\n".join(parts)
-    return "" if content is None else str(content)
-
-
-def _msg_content(msg: Any) -> Any:
-    if msg is None:
-        return None
-    content = getattr(msg, "content", None)
-    if content is None and isinstance(msg, dict):
-        content = msg.get("content")
-    return content
-
-
-def _latest_user_message(messages: list[Any]) -> Any:
-    for msg in reversed(messages or []):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-        if role == "user":
-            return msg
-    return None
-
-
 def _image_block(part: Any) -> dict[str, Any] | None:
     """AG-UI image part -> Anthropic image content block, or None if unusable.
 
@@ -268,66 +217,6 @@ def _image_blocks(content: Any) -> list[dict[str, Any]]:
             if block is not None:
                 blocks.append(block)
     return blocks
-
-
-def _canonical_json(text: str) -> str:
-    """Re-serialise a JSON payload with sorted keys; pass anything else through.
-
-    The client builds these payloads from Swift `Dictionary`s, whose iteration
-    order is randomised — so the same canvas/skills/type snapshot arrives with
-    its keys shuffled on every turn. The bytes differ, the meaning doesn't, and
-    since this block lands in the **system** prompt (which precedes `messages` in
-    the cache prefix) each reshuffle re-cached the entire transcript behind it.
-
-    Normalising here fixes it for every client, including builds already shipped
-    that will never carry the client-side `.sortedKeys`. Array order is left
-    alone — only object keys are sorted — and a value that isn't a JSON object or
-    array is returned untouched.
-    """
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
-        return text
-    if not isinstance(parsed, (dict, list)):
-        return text
-    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def _context_pairs(context: list[Any] | None) -> list[tuple[str, str]]:
-    """AG-UI `input.context` as ordered `(description, value)` string pairs.
-
-    Tolerates both the pydantic `Context` model and a plain dict. Shared by
-    `_render_context` and the cache fingerprint, so the diagnosis hashes exactly
-    the text that reaches the prompt. Values are canonicalised (see
-    `_canonical_json`) so a client's key ordering can't bust the prompt cache.
-    """
-    pairs: list[tuple[str, str]] = []
-    for entry in context or []:
-        desc = getattr(entry, "description", None)
-        if desc is None and isinstance(entry, dict):
-            desc = entry.get("description")
-        val = getattr(entry, "value", None)
-        if val is None and isinstance(entry, dict):
-            val = entry.get("value")
-        pairs.append(((desc or "").strip(), _canonical_json((val or "").strip())))
-    return pairs
-
-
-def _render_context(context: list[Any] | None) -> str:
-    """Flatten AG-UI `input.context` into a text block (`description` then its
-    stringified `value`, entries blank-line separated).
-
-    The loop builds its own prompt, so — unlike the `ag_ui_langgraph` harness,
-    which dumps context into the system prompt — the ambient context the
-    frontend pushes every turn (live canvas state, memories snapshot, the MyApp
-    system prompt / AGENTS.md) only reaches the model if rendered in here.
-    """
-    blocks: list[str] = []
-    for desc, val in _context_pairs(context):
-        block = f"{desc}\n{val}".strip()
-        if block:
-            blocks.append(block)
-    return "\n\n".join(blocks)
 
 
 # Header for the ambient-context block appended to the system prompt. Placed at

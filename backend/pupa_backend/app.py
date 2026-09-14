@@ -279,6 +279,10 @@ async def lifespan(app: FastAPI):
             # builders still get their creds via `get_credential`.
             registry = build_registry()
             deps = HarnessDeps(checkpointer=checkpointer, store=store, mcp=mcp)
+            for harness in registry.enabled():
+                prepare = getattr(harness, "prepare", None)
+                if prepare is not None:
+                    await prepare(deps)
             # Every mounted run path, for `run_scope_middleware`. The routes
             # themselves can't take a scope dependency (the LangGraph one is
             # mounted by a third-party helper), so the guard keys off this set.
@@ -309,6 +313,14 @@ async def lifespan(app: FastAPI):
                 # garbage-collected while pending, and any error it raised
                 # outside its own guard would surface only at GC.
                 await asyncio.gather(sweeper, return_exceptions=True)
+                for harness in reversed(registry.enabled()):
+                    close = getattr(harness, "close", None)
+                    if close is None:
+                        continue
+                    try:
+                        await close()
+                    except Exception:  # noqa: BLE001 - shutdown is best-effort
+                        logger.exception("harness %s: shutdown failed", harness.id)
                 if screenshare_enabled():
                     from pupa_backend.screenshare.sidecar_token import revoke as _revoke_sidecar_token
                     _revoke_sidecar_token()
@@ -320,16 +332,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 # Transport-level resumable SSE: detaches every `POST /` run stream into a
 # per-thread sequenced replay log so a dropped socket (app backgrounded /
-# killed) can re-attach and catch up instead of losing the turn. Covers both
-# agent loops identically — neither loop's code knows about it. ORDER MATTERS:
+# killed) can re-attach and catch up instead of losing the turn. Covers every
+# agent harness identically — no loop-specific code knows about it. ORDER MATTERS:
 # added FIRST so it sits innermost (under the keep-alive), which keeps
 # heartbeat comments out of the replay log while idle re-attached streams
 # still receive them. See sse_replay.py.
 app.add_middleware(SSEReplayMiddleware)
 # Transport-level SSE keep-alive: emits `: keep-alive` comments on any idle
 # `text/event-stream` response so a long silent turn doesn't trip the client's
-# per-request idle timeout. Decoupled from the agent loop — covers both `POST /`
-# handlers (Claude Code loop + LangGraph) and any future SSE route.
+# per-request idle timeout. Decoupled from the agent loop — covers every
+# harness run route and any future SSE route.
 app.add_middleware(SSEKeepAliveMiddleware)
 # Inner to `api_key_middleware` (added after it here = added earlier = inner):
 # it reads the `request.state.auth` that auth puts there.

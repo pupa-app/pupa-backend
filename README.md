@@ -4,16 +4,16 @@
 
 # Pupa backend
 
-[![pupa-backend](https://img.shields.io/badge/backend-0.0.97-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
+[![pupa-backend](https://img.shields.io/badge/backend-0.0.98-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
 [![screenshare](https://img.shields.io/badge/screenshare-0.0.6-f05138?logo=swift&logoColor=white)](screenshare-sidecar/Sources/PupaScreenshare/Version.swift)
 
 Your own server for the [Pupa](https://pupa-app.com) app. Install it on your
 laptop, or in the cloud, pair your phone **once**, and the agent runs on your
 machine, with your files, under your control.
 
-Two agents are built in: **Claude Code**, billed to your Claude subscription, or
-a **model of your choice** from any provider you have an API key for. Pick one
-when you connect.
+Three agents are built in: **Claude Code** and **Codex**, billed to their
+respective subscriptions, plus a **model of your choice** from any provider you
+have an API key for. Pick one when you connect.
 
 ## Contents
 
@@ -107,46 +107,69 @@ already paired keep working either way, and you can revoke any of them.
 ## Pick your agent
 
 Everything around the agent is the same whichever one you choose: the same app,
-the same pairing, and most of all **your app's own tools**. The app
-tells the backend what it can do, the agent decides when to use it, and the work
-happens on your device.
+pairing, MCP connections, and your app's own tools. The app tells the backend
+what it can do, the agent decides when to use it, and the work happens on your
+device.
 
-What differs is who answers and how it's billed.
+### Claude Code
 
-### Claude Code, what most people will want
+Runs the full Claude Code agent inside the backend and bills your Claude
+subscription. Install the `claude` command and run `claude auth login` first.
+Claude's native file, shell, and web tools are available alongside Pupa tools.
 
-Runs the full Claude Code agent inside the backend. Billed to **your Claude
-subscription**, never per token. It refuses to start if per-token API keys are
-lying around, so it can't quietly charge you twice. You get Claude's own
-abilities (reading files, running commands, searching the web) shown live in the
-app, plus your app's tools. Nothing to configure beyond being logged into the
-`claude` command.
+### Codex
+
+Runs the Codex CLI through its embeddable App Server and bills your ChatGPT
+subscription. Install the [`codex` CLI](https://github.com/openai/codex), run
+`codex login`, then enable the harness. Pupa streams Codex activity and
+forwards frontend tools; full-access command/file approvals are presented in
+chat. The default `workspace` permission confines writes to the configured
+workspace with network access disabled; `read` and `full` are also available.
+
+The Codex child never receives `OPENAI_API_KEY` or `CODEX_API_KEY`, and startup
+requires App Server to report a ChatGPT login, so the harness cannot silently
+fall back to per-token API billing. Dynamic frontend tools use Codex App
+Server's experimental API and are capability-checked at startup.
 
 ### Bring your own model
 
-The other agent talks to **any provider you have a key for** (AWS Bedrock,
-Anthropic, or anything OpenAI-compatible) and is billed per token by that
-provider. It can swap models per request, keeps its own conversation history,
-and adds a few server-side tools of its own: web search, a shell tool, delegation
-to sub-agents, and skills. Reach for it when you want a specific model, or don't
-have a Claude subscription.
+The Deep Agents harness talks to any provider you have a key for (AWS Bedrock,
+Anthropic, or an OpenAI-compatible endpoint) and is billed per token by that
+provider. It can swap models per request and adds server-side web search, shell,
+sub-agents, and skills.
 
-| | **Claude Code** | **Your own model** |
-|---|---|---|
-| Billing | Your Claude subscription | Per token, by your provider |
-| Setup | Log into the `claude` command | A provider API key |
-| Models | Claude | Any model, switchable per chat |
-| Built-in tools | Claude's own (files, shell, web) | Web search, shell, sub-agents, skills |
-| Your app's tools | ✅ | ✅ |
-| MCP servers | ✅ | ✅ |
+| | **Claude Code** | **Codex** | **Your own model** |
+|---|---|---|---|
+| Billing | Claude subscription | ChatGPT subscription | Per token, by your provider |
+| Setup | `claude auth login` | `codex login` | A provider API key |
+| Models | Claude aliases | Discovered from Codex | Any configured model |
+| Native tools | Claude files, shell, web | Codex files, shell, web | Pupa server tools |
+| Your app's tools | ✅ | ✅ | ✅ |
+| Pupa MCP servers | ✅ | ✅ | ✅ |
 
-Turn either on in `config.yml`'s `harnesses:` block. Enable both and the app
-lets you choose per connection. Anything else, like MCP servers, tracing and screen
-sharing, works the same with both.
+Enable any combination in `~/.pupa-backend/config.yml`. Pupa lists Sol first
+by default; set `default_model` to choose another initial model:
 
-These two are just the ones that ship. The agent slot is pluggable, and a third
-can be added without touching the app: see
-[CONTRIBUTING.md](CONTRIBUTING.md#adding-an-agent) if you want to write one.
+```yaml
+default_model: gpt-5.6-sol
+
+harnesses:
+  deepagents:
+    enabled: true
+    default: true
+  claude_code:
+    enabled: true
+  codex:
+    enabled: true
+    native: workspace       # read | workspace | full
+    auto_approve: false
+    # workspace: /path/to/project
+    # model: account-model-id
+```
+
+The default harness is also served at `POST /`; every enabled harness is served
+at `POST /harnesses/{id}` and is selectable by the app. The slot is pluggable;
+see [CONTRIBUTING.md](CONTRIBUTING.md#adding-an-agent) to add another harness.
 
 ## Optional extras
 
@@ -157,7 +180,7 @@ environment wins when both are set.
 | Feature | In `config.yml` | Environment | What it does |
 |---|---|---|---|
 | **Web search** | `tavily_api_key: tvly-…` | `TAVILY_API_KEY` | Lets your own model search the web. Get a key at [app.tavily.com](https://app.tavily.com). Without it the agent answers from what it already knows. |
-| **MCP servers** | `mcp_servers:` (e.g. `pupa-backend mcp add --playwright`) | `PUPA_MCP_SERVERS` | Plug in any MCP server (browser control, issue trackers, your own). Shared by both agents. Playwright also needs Node.js. |
+| **MCP servers** | `mcp_servers:` (e.g. `pupa-backend mcp add --playwright`) | `PUPA_MCP_SERVERS` | Plug in any MCP server (browser control, issue trackers, your own). Shared by all enabled agents. Playwright also needs Node.js. |
 | **Screen sharing** (macOS) | `screenshare: true` | `PUPA_SCREENSHARE` | Lets the app watch a window on your Mac. See [below](#screen-sharing). |
 | **Shell access** | `shell_tool_enabled: true` | `SHELL_TOOL_ENABLED` | Lets your own model run commands on this machine, asking you first each time. Machines you trust only. |
 | **Tracing** | `langfuse:` with `public_key` / `secret_key` | `LANGFUSE_PUBLIC_KEY` · `LANGFUSE_SECRET_KEY` · `PUPA_LANGFUSE_DISABLED=1` | Records every request to [Langfuse](https://langfuse.com) so you can see what the agent did. On as soon as keys are present. |
@@ -215,6 +238,7 @@ the app and this backend share. Everything else plugs into it:
 |---|---|
 | **[AG-UI](https://github.com/ag-ui-protocol/ag-ui)** | **The key dependency**: the agent ↔ app event protocol. |
 | **[Claude Code](https://github.com/anthropics/claude-code)** + **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)** | The Claude Code agent, billed to your subscription. |
+| **[Codex CLI](https://github.com/openai/codex)** + **[Codex App Server](https://learn.chatgpt.com/docs/app-server)** | The Codex agent, streamed and controlled through its JSON-RPC embedding protocol. |
 | **[CopilotKit](https://github.com/CopilotKit/CopilotKit)** | Bridges the graph-based agent to AG-UI. |
 | **[deepagents](https://github.com/langchain-ai/deepagents)** | The bring-your-own-model agent: sub-agents, skills, files. |
 | **[LangGraph](https://github.com/langchain-ai/langgraph)** / **[LangChain](https://github.com/langchain-ai/langchain)** | The agent loop and its saved history underneath it. |

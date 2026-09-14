@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from pupa_backend.harnesses.routes import ordered_models
 from pupa_backend.harnesses.routes import router as harnesses_router
 
 
@@ -15,6 +16,20 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app = FastAPI()
     app.include_router(harnesses_router, prefix="/harnesses")
     return TestClient(app)
+
+
+def test_model_discovery_prefers_sol_and_honours_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = [
+        {"provider": "codex", "modelId": "gpt-6-astra", "label": "Astra"},
+        {"provider": "codex", "modelId": "gpt-5.6-sol", "label": "Sol"},
+    ]
+    monkeypatch.delenv("PUPA_DEFAULT_MODEL", raising=False)
+    assert ordered_models(models)[0]["modelId"] == "gpt-5.6-sol"
+
+    monkeypatch.setenv("PUPA_DEFAULT_MODEL", "gpt-6-astra")
+    assert ordered_models(models)[0]["modelId"] == "gpt-6-astra"
 
 
 def test_discovery_lists_langgraph_by_default(

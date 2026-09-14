@@ -2582,7 +2582,7 @@ wheels = [
 
 [[package]]
 name = "pupa-backend"
-version = "0.0.95"
+version = "0.0.98"
 source = { editable = "." }
 dependencies = [
     { name = "ag-ui-langgraph" },
@@ -2619,7 +2619,7 @@ dev = [
 requires-dist = [
     { name = "ag-ui-langgraph", specifier = ">=0.0.42" },
     { name = "boto3", specifier = ">=1.34.0" },
-    { name = "claude-agent-sdk", specifier = ">=0.2.106" },
+    { name = "claude-agent-sdk", specifier = ">=0.2.143" },
     { name = "copilotkit", specifier = ">=0.1.88" },
     { name = "cryptography", specifier = ">=49.0.0" },
     { name = "deepagents", specifier = ">=0.6.0" },

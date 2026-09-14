@@ -19,6 +19,8 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from pupa_backend.agui.tools import descriptor_fields
+
 from .registry import LiveSession, wait_timeout_for
 
 logger = logging.getLogger("uvicorn.error")
@@ -39,24 +41,7 @@ def bare_name(qualified: str) -> str:
     return qualified[len(TOOL_PREFIX):] if qualified.startswith(TOOL_PREFIX) else qualified
 
 
-def _descriptor_fields(descriptor: Any) -> tuple[str | None, str, dict[str, Any]]:
-    """Pull (name, description, json-schema) out of an AG-UI tool descriptor.
-
-    Tolerates both the `ag_ui.core.Tool` pydantic model and a plain dict, and the
-    OpenAI-style ``{"function": {...}}`` nesting some clients use.
-    """
-    get = (lambda k: getattr(descriptor, k, None)) if not isinstance(descriptor, dict) else descriptor.get
-    name = get("name")
-    description = get("description") or ""
-    schema = get("parameters") or get("input_schema") or get("inputSchema")
-    if name is None and isinstance(descriptor, dict) and isinstance(descriptor.get("function"), dict):
-        fn = descriptor["function"]
-        name = fn.get("name")
-        description = fn.get("description") or description
-        schema = fn.get("parameters") or schema
-    if not isinstance(schema, dict):
-        schema = {"type": "object", "properties": {}}
-    return name, description, schema
+_descriptor_fields = descriptor_fields
 
 
 def build_frontend_mcp(tools: list[Any], session: LiveSession) -> tuple[Any, set[str]]:

@@ -159,8 +159,8 @@ sit around the harness and are identical whichever one is active.
 
    Agent harness  (chosen per connection):
      • Claude Code loop         →  your Claude subscription
+     • Codex App Server         →  your ChatGPT subscription
      • Deepagents (LangGraph)   →  Bedrock / Anthropic / OpenAI-compatible
-     • … more to come
 
    Harness-independent:  pair-once auth · forwarded client tools · MCP servers ·
    persistence (SQLite / Postgres / in-memory) · /screenshare/ws
@@ -173,15 +173,14 @@ screenshare broker, tool gating — in [docs/architecture.md](docs/architecture.
 
 An **agent harness** is a self-contained agent loop owning an AG-UI SSE handler.
 Every *enabled* harness is mounted at once at `POST /harnesses/{id}` (the default
-one is also aliased at `POST /`), and the client picks one per connection. Two
-ship today: the Claude Code loop (`claude_code`,
-[`harnesses/claude/`](backend/pupa_backend/harnesses/claude/)) and deepagents
-(`deepagents`, [`harnesses/langgraph/`](backend/pupa_backend/harnesses/langgraph/) —
-the directory name is about the library, the id about the loop).
+one is also aliased at `POST /`), and the client picks one per connection.
+Three ship today: Claude Code (`claude_code`, `harnesses/claude/`), Codex
+(`codex`, `harnesses/codex/`), and Deep Agents (`deepagents`,
+`harnesses/langgraph/`).
 
-Adding a third means adding an adapter to the registry in
+Adding another means adding an adapter to the registry in
 [`harnesses/__init__.py`](backend/pupa_backend/harnesses/__init__.py) — implement the
-`AgentHarness` protocol (`register(app, path, deps)`), and the config.yml
+`AgentHarness` protocol (`prepare`/`register`/`close` lifecycle), and the config.yml
 `harnesses:` block (or the `PUPA_HARNESSES` JSON override) enables it. A public
 plugin entry point is deferred until that surface settles. Rules that matter:
 
