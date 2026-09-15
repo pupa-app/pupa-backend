@@ -16,6 +16,8 @@ logger = logging.getLogger("uvicorn.error")
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
+APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+
 
 class AppServerError(RuntimeError):
     """The Codex child or its JSON-RPC protocol failed."""
@@ -55,6 +57,7 @@ class AppServerClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=APP_SERVER_STREAM_LIMIT,
                 cwd=self.cwd,
                 env=self.env,
             )

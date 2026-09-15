@@ -4,6 +4,14 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.99] — 2026-09-15
+
+### Fixed
+
+- Codex App Server messages larger than Python's 64 KiB subprocess-stream
+  default no longer kill the stdout reader and leave a resumed thread timing
+  out while starting its fallback thread.
+
 ## [0.0.98] — 2026-09-14
 
 ### Added

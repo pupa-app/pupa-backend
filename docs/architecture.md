@@ -671,7 +671,9 @@ The `codex` harness (`backend/pupa_backend/harnesses/codex/`) embeds the local
 Codex CLI over newline-delimited JSON-RPC using `codex app-server`. A short-lived
 startup probe initializes the experimental API, requires `account/read` to
 report `type: chatgpt`, verifies dynamic-tool thread creation, and caches the
-visible `model/list` result for `GET /harnesses`.
+visible `model/list` result for `GET /harnesses`. The subprocess streams allow
+JSON-RPC lines up to 16 MiB because thread-resume responses and tool payloads
+can exceed asyncio's 64 KiB default.
 
 Each live Pupa thread owns one App Server child. Its Codex thread id and dynamic
 tool-surface fingerprint survive idle child eviction, so a later turn resumes
