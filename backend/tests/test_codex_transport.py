@@ -53,3 +53,28 @@ for line in sys.stdin:
         assert notifications == [("notice", {"ok": True})]
     finally:
         await client.close()
+
+
+async def test_transport_accepts_json_lines_larger_than_asyncio_default(tmp_path) -> None:
+    binary = tmp_path / "fake-codex"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" in msg:
+        print(json.dumps({"id": msg["id"], "result": {"payload": "x" * 131072}}), flush=True)
+"""
+    )
+    binary.chmod(0o755)
+
+    client = AppServerClient(
+        str(binary),
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+    )
+    try:
+        result = await client.connect()
+        assert result["payload"] == "x" * 131072
+    finally:
+        await client.close()
