@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Self
 
 from ag_ui.core.events import EventType, RunErrorEvent
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
@@ -66,6 +66,20 @@ class CustomLangGraphAGUIAgent(LangGraphAGUIAgent):
     by ``_request_overrides``, so concurrent requests on the same agent instance
     don't bleed state into each other.
     """
+
+    def clone(self) -> Self:
+        """Copy the bridge with the constructor contract CopilotKit supports.
+
+        ``ag-ui-langgraph`` 0.0.43 adds clone options that CopilotKit 0.1.95
+        does not accept. The endpoint clones this object for every request, so
+        forwarding those options prevents every Deep Agents run from starting.
+        """
+        return type(self)(
+            name=self.name,
+            graph=self.graph,
+            description=self.description,
+            config=dict(self.config) if self.config else None,
+        )
 
     async def _handle_stream_events(  # type: ignore[override]
         self, input: Any

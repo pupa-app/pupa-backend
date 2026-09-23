@@ -4,6 +4,14 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.101] — 2026-09-23
+
+### Fixed
+
+- Restore Deep Agents requests under `ag-ui-langgraph` 0.0.43. Its per-request
+  clone passes options unsupported by CopilotKit, so Pupa now clones its bridge
+  with the supported constructor contract instead.
+
 ## [0.0.100] — 2026-09-23
 
 ### Fixed
