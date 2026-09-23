@@ -4,6 +4,7 @@
 import json
 
 import pytest
+from langgraph.graph import END, START, StateGraph
 
 from pupa_backend.harnesses import (
     ClaudeCodeHarness,
@@ -139,6 +140,25 @@ async def test_persistence_lifespan_opens_db_for_langgraph(
 def test_claude_harness_permission_schema() -> None:
     keys = {c["key"] for c in ClaudeCodeHarness().permission_schema()}
     assert keys == {"claude_loop_native", "claude_loop_auto_approve"}
+
+
+def test_langgraph_agent_clone_preserves_pupa_subclass() -> None:
+    """The AG-UI endpoint clones this bridge for every agent request.
+
+    A dependency upgrade must not pass constructor options that the CopilotKit
+    bridge cannot accept, or every streamed run fails before it responds.
+    """
+    from pupa_backend.harnesses.langgraph.harness import CustomLangGraphAGUIAgent
+
+    builder = StateGraph(dict)
+    builder.add_node("noop", lambda state: {})
+    builder.add_edge(START, "noop")
+    builder.add_edge("noop", END)
+    agent = CustomLangGraphAGUIAgent(name="clone-test", graph=builder.compile())
+
+    clone = agent.clone()
+
+    assert isinstance(clone, CustomLangGraphAGUIAgent)
 
 
 # --------------------------------------------------------------------------- #

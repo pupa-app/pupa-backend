@@ -20,6 +20,11 @@ Dockerfile, Railway `startCommand`, and the generated launchd/systemd unit in
 [`service.py`](../backend/pupa_backend/scripts/service.py)); `pupa-backend run`
 calls the same `pupa_backend.app:main`.
 
+The Deep Agents bridge pins `ag-ui-langgraph` to 0.0.43. Its per-request clone
+passes options unsupported by the current CopilotKit bridge, so Pupa's bridge
+overrides `clone()` with the supported constructor contract. Upgrade the adapter
+only with a compatibility test for that boundary.
+
 The launch methods differ in **environment**. `run` is a child of your shell and inherits
 its exports; the service inherits nothing and reads `~/.pupa-backend/config.yml`
 itself (`app.py` calls `load_pupa_config()` at import). The generated unit
