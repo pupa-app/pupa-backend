@@ -76,7 +76,8 @@ Routers mounted on the app:
 | `/db/*`             | [`backend/pupa_backend/harnesses/langgraph/db/routes.py`](../backend/pupa_backend/harnesses/langgraph/db/routes.py) | Transcript loader, per-thread usage, thread deletion. Mounted only when the deepagents harness is enabled. |
 | `/screenshare/ws`   | [`backend/pupa_backend/screenshare/routes.py`](../backend/pupa_backend/screenshare/routes.py) | WebRTC signalling broker (opt-in, see env).                        |
 
-Healthcheck path for Railway: `GET /auth/config`.
+Healthcheck path for Railway: `GET /health`. Railway reaches the container over
+plain HTTP, and this is the one probe route exempt from `PUPA_REQUIRE_HTTPS`.
 
 **SSE keep-alive.**
 [`SSEKeepAliveMiddleware`](../backend/pupa_backend/sse_keepalive.py) wraps every
