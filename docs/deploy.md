@@ -163,7 +163,8 @@ plaintext hop was TLS.
 
 When set, a non-TLS request gets `403 HTTPS required` and the screen-share
 socket closes with 4403. Health probes are exempt so platform checks still
-pass. There is **no** loopback exemption: every tunnel mode terminates in
+pass; Railway must therefore probe `GET /health`, because its internal probe
+reaches the container over plain HTTP. There is **no** loopback exemption: every tunnel mode terminates in
 front of a loopback-bound listener, so "it came from 127.0.0.1" is true of
 every remote caller. For local development, leave the flag unset rather than
 looking for a carve-out — `http://localhost:8004` then works exactly as before.

@@ -4,6 +4,14 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.100] — 2026-09-23
+
+### Fixed
+
+- Railway now probes `GET /health`, the route intentionally exempt from HTTPS
+  enforcement for its internal plain-HTTP health check, instead of
+  `GET /auth/config`, which the transport guard correctly rejects with 403.
+
 ## [0.0.99] — 2026-09-15
 
 ### Fixed
