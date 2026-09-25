@@ -4,6 +4,14 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.102] — 2026-09-25
+
+### Fixed
+
+- Codex frontend-tool resumes now tolerate App Server completing the old turn
+  before Pupa's `turn/interrupt` request reaches it. The harmless `no active
+  turn to interrupt` race no longer aborts the resumed request.
+
 ## [0.0.101] — 2026-09-23
 
 ### Fixed

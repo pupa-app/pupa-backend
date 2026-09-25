@@ -342,11 +342,18 @@ class LiveSession:
                         {"threadId": self.codex_thread_id, "turnId": self.current_turn_id},
                         timeout=10.0,
                     )
-                except AppServerError:
+                except AppServerError as exc:
+                    # Resolving the frontend tool can let a short turn finish
+                    # inside App Server before its `turn/completed` notification
+                    # reaches this process. In that race, interrupt is rejected
+                    # with -32600 even though there is nothing left to interrupt.
+                    if "no active turn to interrupt" in str(exc):
+                        self.turn_active = False
+                        self._turn_done.set()
                     # The tool result can finish a short turn while the
                     # interrupt request is in flight. Its completion event is
                     # authoritative; other failures still surface.
-                    if not self._turn_done.is_set():
+                    elif not self._turn_done.is_set():
                         raise
                 await asyncio.wait_for(self._turn_done.wait(), timeout=10.0)
             self._continuing = False

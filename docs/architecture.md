@@ -699,6 +699,10 @@ round changes the advertised surface, Pupa interrupts the narrow turn, starts a
 fresh Codex thread with the wider surface, and continues with the original
 conversation transcript, current images, and completed frontend-tool results.
 No completed call is repeated solely because the surface changed.
+If the resolved tool result lets the narrow turn finish before App Server
+processes Pupa's interrupt request, App Server may return `no active turn to
+interrupt`; the harness treats that as the already-completed turn and continues
+the surface refresh.
 
 App Server agent-message deltas map to AG-UI text frames. Native command, file,
 MCP, web, and collaboration items are display-only tool frames. Full-scope
