@@ -397,6 +397,42 @@ async def test_surface_continuation_survives_fast_old_turn_completion() -> None:
     assert "unlock_probe" in started["text"]
 
 
+async def test_surface_continuation_tolerates_turn_already_completed() -> None:
+    class Client:
+        async def request(self, method, params, **kwargs):
+            assert method == "turn/interrupt"
+            raise registry.AppServerError(
+                "Codex App Server error -32600: no active turn to interrupt"
+            )
+
+    session = LiveSession("thread", None)
+    session.client = Client()
+    session.codex_thread_id = "codex-thread"
+    session.current_turn_id = "old-turn"
+    session.turn_active = True
+    session.surface = build_tool_surface([{"name": "old_tool"}], {}, None)
+
+    started = {}
+
+    async def reload_surface(_surface):
+        return True
+
+    async def start_turn(**kwargs):
+        started.update(kwargs)
+
+    session.reload_surface = reload_surface
+    session.start_turn = start_turn
+    await session.continue_with_surface(
+        build_tool_surface([{"name": "new_tool"}], {}, None),
+        model="codex-a",
+        effort="medium",
+        state=None,
+    )
+
+    assert session._continuing is False
+    assert started["preserve_request"] is True
+
+
 async def test_text_notifications_finish_an_agui_run() -> None:
     session = LiveSession("thread", None)
     session.open_run("run")
