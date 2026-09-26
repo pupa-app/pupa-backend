@@ -4,7 +4,7 @@
 
 # Pupa backend
 
-[![pupa-backend](https://img.shields.io/badge/backend-0.0.102-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
+[![pupa-backend](https://img.shields.io/badge/backend-0.0.103-3776ab?logo=python&logoColor=white)](backend/pyproject.toml)
 [![screenshare](https://img.shields.io/badge/screenshare-0.0.6-f05138?logo=swift&logoColor=white)](screenshare-sidecar/Sources/PupaScreenshare/Version.swift)
 
 Your own server for the [Pupa](https://pupa-app.com) app. Install it on your
@@ -113,8 +113,11 @@ device.
 
 ### Claude Code
 
-Runs the full Claude Code agent inside the backend and bills your Claude
-subscription. Install the `claude` command and run `claude auth login` first.
+Runs the full Claude Code agent inside the backend. By default it bills your
+Claude subscription: install the `claude` command and run `claude auth login`.
+To use API, Bedrock, or Vertex billing instead, explicitly set
+`PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` alongside the matching provider
+credentials; it is billed per token and does not require a Claude subscription.
 Claude's native file, shell, and web tools are available alongside Pupa tools.
 
 ### Codex
@@ -140,8 +143,8 @@ sub-agents, and skills.
 
 | | **Claude Code** | **Codex** | **Your own model** |
 |---|---|---|---|
-| Billing | Claude subscription | ChatGPT subscription | Per token, by your provider |
-| Setup | `claude auth login` | `codex login` | A provider API key |
+| Billing | Claude subscription, or API with opt-in | ChatGPT subscription | Per token, by your provider |
+| Setup | `claude auth login`, or provider credentials + opt-in | `codex login` | A provider API key |
 | Models | Claude aliases | Discovered from Codex | Any configured model |
 | Native tools | Claude files, shell, web | Codex files, shell, web | Pupa server tools |
 | Your app's tools | ✅ | ✅ | ✅ |
@@ -159,6 +162,7 @@ harnesses:
     default: true
   claude_code:
     enabled: true
+    # allow_api_billing: true  # API/Bedrock/Vertex billing; default false
   codex:
     enabled: true
     native: workspace       # read | workspace | full

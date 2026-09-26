@@ -47,6 +47,19 @@ def test_stash_moves_present_vars_out_of_env(monkeypatch: pytest.MonkeyPatch) ->
     assert credentials.get_credential("AWS_ACCESS_KEY_ID") == "AKIA-test"
 
 
+def test_stash_keeps_vars_when_claude_api_billing_is_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PUPA_CLAUDE_LOOP_ALLOW_API_BILLING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-api-billed")
+
+    moved = credentials.stash_forbidden_credentials()
+
+    assert moved == []
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-api-billed"
+    assert credentials.get_credential("ANTHROPIC_API_KEY") == "sk-api-billed"
+
+
 def test_stash_skips_absent_and_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in FORBIDDEN_ENV_VARS:
         monkeypatch.delenv(name, raising=False)

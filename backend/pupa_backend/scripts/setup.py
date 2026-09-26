@@ -544,8 +544,9 @@ def main() -> None:
     # ---- Backend agent harnesses ----
     # Several harnesses run at once, each mounted at POST /harnesses/{id} (the
     # default one also at POST /); the app picks which to talk to per backend
-    # connection. claude_code is subscription-only and fail-closed, but the
-    # credential stash lets it coexist with langgraph (which needs API keys).
+    # connection. claude_code defaults to subscription billing and is
+    # fail-closed; the credential stash lets it coexist with langgraph (which
+    # needs API keys) unless the operator explicitly opts into API billing.
     existing_harnesses: dict = existing_yaml.get("harnesses") or {}
 
     def _was_enabled(harness_id: str, default_on: bool) -> bool:
@@ -563,7 +564,7 @@ def main() -> None:
         default=_was_enabled("deepagents", True),
     )
     claude_enabled = _yesno(
-        "Enable the Claude Code harness (subscription-only, Claude Pro/Max)?",
+        "Enable the Claude Code harness (Claude subscription by default; API opt-in available)?",
         default=_was_enabled("claude_code", False),
     )
     codex_enabled = _yesno(
@@ -891,8 +892,8 @@ def main() -> None:
     print(f"  {_R}│{_X}  Service: {_C}pupa-backend service-install{_X}          {_R}│{_X}")
     if claude_enabled:
         print(f"  {_R}├───────────────────────────────────────────────────────┤{_X}")
-        print(f"  {_R}│{_X}  Harness: {_Y}claude_code{_X} (subscription-only)             {_R}│{_X}")
-        print(f"  {_R}│{_X}  Needs: {_C}claude auth login{_X} (Pro/Max)                  {_R}│{_X}")
+        print(f"  {_R}│{_X}  Harness: {_Y}claude_code{_X} (subscription default)         {_R}│{_X}")
+        print(f"  {_R}│{_X}  Needs: {_C}claude auth login{_X} (Pro/Max) or API opt-in    {_R}│{_X}")
     if codex_enabled:
         print(f"  {_R}├───────────────────────────────────────────────────────┤{_X}")
         print(f"  {_R}│{_X}  Harness: {_Y}codex{_X} (subscription-only)                   {_R}│{_X}")

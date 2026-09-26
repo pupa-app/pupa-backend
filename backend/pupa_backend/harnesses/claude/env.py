@@ -1,11 +1,12 @@
-"""Subscription-only, fail-closed billing controls for the Claude Code agent loop.
+"""Fail-closed billing controls for the Claude Code agent loop.
 
 This module is load-bearing. The loop drives the `claude` CLI (the Agent SDK
-spawns the binary), so it inherits Claude Code's auth/billing resolution. We must
-bill **only** against the Claude Code subscription (Pro/Max OAuth — interactive
-host login or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`). If
-subscription billing can't be guaranteed, we **refuse to run**; we never silently
-fall back to per-token API credits.
+spawns the binary), so it inherits Claude Code's auth/billing resolution. The
+default is Claude Code subscription billing (Pro/Max OAuth — interactive host
+login or a `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`). Setting
+`PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` explicitly opts into the CLI's API,
+Bedrock, or Vertex credential modes instead. If the selected billing mode can't
+be verified, we refuse to run.
 
 ## Why detect-and-refuse, not silent-scrub
 
@@ -36,9 +37,8 @@ quiet scrub: if any forbidden credential var is present in the parent env we rai
    env and assert `loggedIn=true`, `apiProvider=firstParty`, and
    `authMethod ∈ {claudeai, oauth_token}`. Anything else (api_key, third_party,
    none, or unrecognised) → refuse. Ambiguous == failure.
-4. No silent alternate-billing mode. Subscription is the only supported path for
-   v1. An api-billing path would have to be double-gated and is intentionally not
-   implemented here.
+4. API/Bedrock/Vertex billing needs an explicit, positive opt-in via
+   `PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1`; it is never a fallback.
 """
 
 from __future__ import annotations
@@ -185,6 +185,13 @@ _ALLOWLIST_ENV_VARS: tuple[str, ...] = (
 #   oauth_token  — long-lived token from `claude setup-token` (subscription-gated)
 # Everything else (api_key, third_party=Bedrock/Vertex, none, unknown) is refused.
 _SUBSCRIPTION_AUTH_METHODS: frozenset[str] = frozenset({"claude.ai", "claudeai", "oauth_token"})
+_API_AUTH_METHODS: frozenset[str] = frozenset({"api_key", "third_party"})
+
+
+def api_billing_enabled() -> bool:
+    """Whether the operator explicitly permits non-subscription Claude billing."""
+    raw = os.getenv("PUPA_CLAUDE_LOOP_ALLOW_API_BILLING")
+    return raw is not None and raw.strip().lower() not in ("", "0", "false", "no")
 
 
 def controlled_config_dir() -> str | None:
@@ -212,7 +219,10 @@ def build_sdk_env() -> dict[str, str]:
     the parent env is enforced separately by `assert_no_forbidden_env()`.
     """
     env: dict[str, str] = {}
-    for key in _ALLOWLIST_ENV_VARS:
+    keys = _ALLOWLIST_ENV_VARS
+    if api_billing_enabled():
+        keys += FORBIDDEN_ENV_VARS
+    for key in keys:
         val = os.getenv(key)
         if val is not None:
             env[key] = val
@@ -285,22 +295,25 @@ def probe_auth_status(env: dict[str, str] | None = None) -> dict[str, object]:
 
 
 def assert_subscription_billing() -> dict[str, object]:
-    """Fail-closed pre-flight: subscription billing must be guaranteed or we refuse.
+    """Fail-closed pre-flight: the selected billing mode must be verified.
 
     Combines the three controls and returns the parsed auth-status dict on success
     (handy for logging the resolved auth method). Raises
     `SubscriptionBillingUnavailable` on any failure.
     """
-    # Control 4: the api-billing path is not implemented; loudly refuse if asked.
+    # Keep the retired billing selector fail-closed; the positive, scoped opt-in
+    # below is the only supported way to enable API billing.
     billing = (os.getenv("PUPA_CLAUDE_LOOP_BILLING") or "subscription").strip().lower()
     if billing != "subscription":
         raise SubscriptionBillingUnavailable(
             f"PUPA_CLAUDE_LOOP_BILLING={billing!r} is not supported. The Claude Code "
-            "agent loop is subscription-only in this build; remove the override."
+            "agent loop uses PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1 for explicit API billing."
         )
 
-    # Control 1: no forbidden credential vars in the parent env.
-    assert_no_forbidden_env()
+    api_billing = api_billing_enabled()
+    if not api_billing:
+        # Control 1: no forbidden credential vars in the parent env.
+        assert_no_forbidden_env()
 
     # Control 3: probe the resolved auth source and require subscription/OAuth.
     env = build_sdk_env()
@@ -309,13 +322,34 @@ def assert_subscription_billing() -> dict[str, object]:
     auth_method = str(data.get("authMethod") or "")
     api_provider = str(data.get("apiProvider") or "")
 
-    allowed = _allowed_auth_methods()
     if not logged_in:
         raise SubscriptionBillingUnavailable(
             "Refusing to start the Claude Code agent loop: not logged in. Run "
-            "`claude auth login` (Pro/Max) or set CLAUDE_CODE_OAUTH_TOKEN from "
-            "`claude setup-token`."
+            "`claude auth login` (Pro/Max), set CLAUDE_CODE_OAUTH_TOKEN from "
+            "`claude setup-token`, or configure an API/Bedrock/Vertex credential."
         )
+    if api_billing:
+        allowed = _allowed_auth_methods() | _API_AUTH_METHODS
+        if auth_method not in allowed:
+            raise SubscriptionBillingUnavailable(
+                "Refusing to start the Claude Code agent loop: auth method "
+                f"{auth_method!r} is not a recognised subscription or API credential "
+                f"(expected one of {sorted(allowed)})."
+            )
+        if not api_provider:
+            raise SubscriptionBillingUnavailable(
+                "Refusing to start the Claude Code agent loop: auth status did not "
+                "report an API provider."
+            )
+        logger.info(
+            "claude_code loop: explicit API billing confirmed (authMethod=%s, "
+            "apiProvider=%s).",
+            auth_method,
+            api_provider,
+        )
+        return data
+
+    allowed = _allowed_auth_methods()
     if api_provider != "firstParty":
         raise SubscriptionBillingUnavailable(
             "Refusing to start the Claude Code agent loop: auth resolves to "

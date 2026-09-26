@@ -52,8 +52,8 @@ _YAML_TO_ENV: dict[str, str] = {
     # Claude Code harness knobs. STRING values (not booleans) must be quoted in
     # YAML — `claude_loop_native: "off"`. An unquoted `off`/`no` parses to YAML
     # False and would be omitted; always quote the literal string.
-    # `claude_loop_allow_api_billing` is the only boolean here (omit ⇒ off; the
-    # api-billing path is not implemented anyway). These are legacy flat keys;
+    # `claude_loop_allow_api_billing` is the only boolean here (omit ⇒ off).
+    # These are legacy flat keys;
     # the preferred spelling now nests them under `harnesses.claude_code.*`
     # (mapped by `_resolve_harnesses`), but the flat keys still work.
     "claude_loop_native":            "PUPA_CLAUDE_LOOP_NATIVE",
