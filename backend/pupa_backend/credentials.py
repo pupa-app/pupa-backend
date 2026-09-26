@@ -5,10 +5,10 @@ coexist in one server.
 
 The Claude Code harness drives the `claude` CLI (the Agent SDK spawns the
 binary), which inherits the parent `os.environ`. Its billing guard
-(`claude_loop/env.py`) is subscription-only and **refuses to start** if any
-billing-diverting credential var (`ANTHROPIC_API_KEY`, `AWS_*`, …) is present in
-the parent env — the SDK can't strip an inherited var, so a stray key would
-silently bill per-token API credits.
+(`claude_loop/env.py`) defaults to subscription billing and **refuses to start**
+if any billing-diverting credential var (`ANTHROPIC_API_KEY`, `AWS_*`, …) is
+present in the parent env — the SDK can't strip an inherited var, so a stray key
+would silently bill per-token API credits.
 
 But the deepagents harness *needs* exactly those vars. To run both harnesses in
 one process we move the credentials **out of `os.environ`** into this private
@@ -18,9 +18,10 @@ in-process dict at startup: the LangGraph model builders read them via
 `assert_no_forbidden_env()` then passes honestly — the invariant it enforces
 (the subprocess never inherits a diverting credential) genuinely holds.
 
-Scrubbing runs **only** when the Claude Code harness is enabled; otherwise the
-vars stay in `os.environ` untouched and `get_credential` simply reads through to
-`os.getenv`.
+Scrubbing runs **only** when the Claude Code harness is enabled and
+`PUPA_CLAUDE_LOOP_ALLOW_API_BILLING` is off. Opting into API billing deliberately
+leaves the vars available to the CLI; otherwise they stay in `os.environ`
+untouched and `get_credential` simply reads through to `os.getenv`.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from __future__ import annotations
 import logging
 import os
 
-from pupa_backend.harnesses.claude.env import FORBIDDEN_ENV_VARS
+from pupa_backend.harnesses.claude.env import FORBIDDEN_ENV_VARS, api_billing_enabled
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -43,8 +44,12 @@ def stash_forbidden_credentials() -> list[str]:
     `os.environ`. Returns the names moved (for logging). Idempotent.
 
     Call once at startup, right after config load, when the Claude Code harness
-    is enabled. After this, the `claude` subprocess cannot inherit these vars.
+    is enabled. API-billing mode deliberately leaves credentials in the
+    environment; otherwise the `claude` subprocess cannot inherit them.
     """
+    if api_billing_enabled():
+        return []
+
     moved: list[str] = []
     for name in FORBIDDEN_ENV_VARS:
         val = os.environ.get(name)

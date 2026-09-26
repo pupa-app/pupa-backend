@@ -11,12 +11,12 @@ contract — **iOS is unchanged**.
 
 - **Wraps the `claude` CLI** — `ClaudeSDKClient` spawns the `claude` binary
   (`shutil.which("claude")` / known paths) over stdio, so it inherits Claude
-  Code's auth/billing resolution. This is what makes subscription billing
-  possible (and what `env.py` must defend — see below).
+  Code's auth/billing resolution. Subscription billing is the default and
+  `PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` explicitly permits API billing.
 - **Subprocess env**: the transport builds the child env as
   ``{**os.environ (minus CLAUDECODE), **options.env}``. `options.env` is an
   **overlay** — it cannot *delete* a var already in the parent env. There is no
-  "don't inherit" switch. ⇒ enforcement of subscription-only billing is
+  "don't inherit" switch. ⇒ default subscription billing is enforced by
   **detect-forbidden-var-and-refuse**, not silent scrub (`env.assert_*`).
 - `ClaudeAgentOptions(system_prompt, mcp_servers={name: cfg}, allowed_tools,
   disallowed_tools, can_use_tool, env, permission_mode, cwd, model, resume,
@@ -43,7 +43,8 @@ contract — **iOS is unchanged**.
 - **Auth probe**: `claude auth status --json` →
   ``{loggedIn, authMethod, apiProvider, apiKeySource?}``. Subscription methods
   are `authMethod ∈ {"claude.ai", "oauth_token"}` with `apiProvider=="firstParty"`;
-  `api_key` / `third_party` / `none` / unknown ⇒ refuse (`env.py`).
+  `api_key` / `third_party` additionally require the explicit API-billing flag;
+  `none` / unknown ⇒ refuse (`env.py`).
 """
 
 from __future__ import annotations

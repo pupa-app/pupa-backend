@@ -281,14 +281,18 @@ without coupling that policy to the Codex adapter. `PUPA_DEFAULT_MODEL`
 overrides the preference.
 
 **Coexistence of deepagents + Claude Code.** The Claude loop drives the `claude`
-CLI, which inherits `os.environ`; its billing guard is subscription-only and
-refuses to start if `ANTHROPIC_API_KEY` / `AWS_*` are present (the subprocess
-would inherit them and bill per-token API credits). But the deepagents harness
-*needs* those keys. So when the Claude harness is enabled, a **credential stash**
+CLI, which inherits `os.environ`; by default its billing guard is
+subscription-only and refuses to start if `ANTHROPIC_API_KEY` / `AWS_*` are
+present (the subprocess would inherit them and bill per-token API credits). But
+the deepagents harness *needs* those keys. So, unless
+`PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` explicitly opts into API billing, when
+the Claude harness is enabled a **credential stash**
 ([`credentials.py`](../backend/pupa_backend/credentials.py)) moves those vars out of
 `os.environ` into an in-process dict at startup — the `claude` subprocess can't
 inherit them, the guard passes honestly, and the deepagents model builders read
-them via `get_credential`. Previously the two were mutually exclusive.
+them via `get_credential`. API-billing mode leaves the credentials in the
+environment so the CLI can use the selected Anthropic, Bedrock, or Vertex
+provider; the explicit flag is never inferred from the credential's presence.
 
 In this mode the **Claude Agent SDK** (`claude-agent-sdk`) runs in-process as
 the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
@@ -651,18 +655,22 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
   reports the level menu under `thinking` for the `claude_code` harness
   (deepagents omits it → `[]`).
 
-**Billing is subscription-only and fail-closed**
+**Billing is fail-closed, with subscription billing by default**
 ([`env.py`](../backend/pupa_backend/harnesses/claude/env.py)). The SDK wraps the `claude` CLI and
 inherits its auth/billing resolution; because its subprocess **inherits the
 parent env** (`options.env` only overlays, can't delete), and the CLI puts
-`ANTHROPIC_API_KEY` ahead of the subscription token, the loop enforces by
-**detect-and-refuse**: at registration it asserts no forbidden credential var is
-present (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, Bedrock/Vertex,
+`ANTHROPIC_API_KEY` ahead of the subscription token, the default loop enforces
+by **detect-and-refuse**: at registration it asserts no forbidden credential var
+is present (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AWS_*`, Bedrock/Vertex,
 …) and probes `claude auth status --json`, requiring `loggedIn=true`,
-`apiProvider=firstParty`, and `authMethod ∈ {claude.ai, oauth_token}`. Anything
-else (api_key, third_party, none, unknown) raises `SubscriptionBillingUnavailable`
-at startup rather than silently billing per-token API credits. There is no
-api-billing fallback in this build.
+`apiProvider=firstParty`, and `authMethod ∈ {claude.ai, oauth_token}`.
+
+`PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` is the explicit exception: it forwards
+the provider credentials to the status probe and SDK child, and accepts the
+CLI's recognised `api_key` / `third_party` auth modes (as well as a valid
+subscription mode). A malformed, missing, or unrecognised auth status still
+raises `SubscriptionBillingUnavailable` at startup. The flag opts into
+per-token provider charges; merely exporting a provider credential never does.
 
 **Caveats.** The live-session registry pins a thread to one backend instance, so
 the loop is single-instance / self-hosted only (no horizontal scale without
@@ -1150,6 +1158,10 @@ at startup. Shell env always wins. The schema covers:
   and external service creds.
 - `claude_code_disabled` (opt-out), `claude_code_model`,
   `claude_code_workspace` — the `claude_code` tool's gate and config.
+  `claude_loop_allow_api_billing: true` (or
+  `harnesses.claude_code.allow_api_billing: true`) maps to
+  `PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` and explicitly opts the Claude Code
+  harness into API, Bedrock, or Vertex billing.
 - `harnesses` — nested block of enabled [agent harnesses](#agent-harnesses-multiple-mounted-together),
   e.g. `{deepagents: {enabled: true, default: true}, claude_code: {enabled: true},
   codex: {enabled: true, native: "workspace"}}`. Serialised to `PUPA_HARNESSES`
@@ -1167,7 +1179,9 @@ The setup wizard ([`backend/pupa_backend/scripts/setup.py`](../backend/pupa_back
 the LLM providers as usual; enabling `claude_code` runs a soft `claude auth
 status` preflight, and enabling `codex` checks `codex login status` for a ChatGPT
 login. Any combination can be enabled together; the Claude credential stash and
-the Codex child environment keep subscription and API-provider credentials isolated. The **connectivity** question offers a full-auto
+the Codex child environment keep subscription credentials isolated from API
+provider credentials unless the operator explicitly opts the Claude loop into
+API billing. The **connectivity** question offers a full-auto
 Cloudflare *named* tunnel: pick `cloudflared` + "I have a domain" and the wizard
 creates the tunnel, routes DNS, and writes `~/.cloudflared/config.yml` for a
 stable URL on the operator's domain (falling back to the quick tunnel if

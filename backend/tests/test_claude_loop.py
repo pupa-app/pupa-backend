@@ -1,9 +1,9 @@
 """Tests for the optional Claude Code agent loop (`backend/claude_loop/`).
 
-No test spawns a real `claude` process: the SDK client is faked and the
-subscription pre-flight / auth probe is monkeypatched. The billing tests assert
-the **fail-closed** posture — a present `ANTHROPIC_API_KEY` must cause a
-refuse-to-start, never an API-billed run.
+No test spawns a real `claude` process: the SDK client is faked and the billing
+pre-flight / auth probe is monkeypatched. The billing tests assert the
+**fail-closed** posture — an API key only runs when the operator explicitly opts
+into API billing.
 """
 
 from __future__ import annotations
@@ -47,6 +47,18 @@ def test_build_sdk_env_excludes_forbidden_vars(monkeypatch: pytest.MonkeyPatch) 
     assert built.get("PATH") == "/usr/bin"
 
 
+def test_build_sdk_env_includes_api_credentials_when_api_billing_is_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("PUPA_CLAUDE_LOOP_ALLOW_API_BILLING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-billed")
+
+    built = cl_env.build_sdk_env()
+
+    assert built["ANTHROPIC_API_KEY"] == "sk-ant-api-billed"
+
+
 def test_assert_no_forbidden_env_raises_on_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     _clear_cred_env(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real-looking")
@@ -66,6 +78,23 @@ def test_assert_subscription_billing_refuses_with_api_key(monkeypatch: pytest.Mo
     )
     with pytest.raises(SubscriptionBillingUnavailable):
         cl_env.assert_subscription_billing()
+
+
+def test_assert_subscription_billing_allows_api_key_when_api_billing_is_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_cred_env(monkeypatch)
+    monkeypatch.setenv("PUPA_CLAUDE_LOOP_ALLOW_API_BILLING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-billed")
+    monkeypatch.setattr(
+        cl_env,
+        "probe_auth_status",
+        lambda env=None: {"loggedIn": True, "authMethod": "api_key", "apiProvider": "firstParty"},
+    )
+
+    data = cl_env.assert_subscription_billing()
+
+    assert data["authMethod"] == "api_key"
 
 
 @pytest.mark.parametrize(

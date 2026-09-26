@@ -16,8 +16,8 @@ Lifecycle of one user turn:
      with the on-device results and re-attach a fresh SSE to the same queue; the
      pump continues until the next interrupt or the final `ResultMessage`.
 
-Subscription-only billing is asserted at registration time (fail-closed) — see
-`env.assert_subscription_billing`.
+The configured billing mode is asserted at registration time (fail-closed) —
+see `env.assert_subscription_billing`.
 """
 
 from __future__ import annotations

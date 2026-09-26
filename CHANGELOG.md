@@ -4,6 +4,14 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.103] — 2026-09-26
+
+### Added
+
+- The `claude_code` harness can now use Anthropic API, Bedrock, or Vertex
+  billing without a Claude subscription when
+  `PUPA_CLAUDE_LOOP_ALLOW_API_BILLING=1` is explicitly set.
+
 ## [0.0.102] — 2026-09-25
 
 ### Fixed
