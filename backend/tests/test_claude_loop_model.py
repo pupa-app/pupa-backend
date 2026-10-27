@@ -5,7 +5,7 @@ Claude models. The iOS client picks one per turn via `forwardedProps.llm.model`
 (stable claude-code aliases: `opus`/`sonnet`/`haiku`/`fable`); a non-Claude pick
 falls back to the default Claude model (so imported `.pupa` bundles that remember
 a model this backend can't run still work). Backwards-compat: no `llm` block → the
-`CLAUDE_CODE_MODEL` / Opus 4.8 default, exactly as before.
+`CLAUDE_CODE_MODEL` / Opus 5.5 default, exactly as before.
 """
 
 from __future__ import annotations
@@ -51,10 +51,10 @@ def test_full_claude_id_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_no_llm_block_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Back-compat: no `llm` block and no env → Opus 4.8."""
+    """Back-compat: no `llm` block and no env → Opus 5.5."""
     monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
-    assert _resolve_loop_model(_mk_input({})) == "claude-opus-4-8"
-    assert _resolve_loop_model(_mk_input(None)) == "claude-opus-4-8"
+    assert _resolve_loop_model(_mk_input({})) == "claude-opus-5-5"
+    assert _resolve_loop_model(_mk_input(None)) == "claude-opus-5-5"
 
 
 def test_env_default_used_when_no_per_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -75,7 +75,7 @@ def test_non_claude_pick_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) 
     default Claude model instead of raising."""
     monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
     inp = _mk_input({"llm": {"provider": "openrouter", "model": "glm-5.1"}})
-    assert _resolve_loop_model(inp) == "claude-opus-4-8"
+    assert _resolve_loop_model(inp) == "claude-opus-5-5"
 
 
 def test_non_claude_pick_falls_back_to_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,7 +89,7 @@ def test_empty_model_string_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty model value is treated as 'no selection', not an error."""
     monkeypatch.delenv("CLAUDE_CODE_MODEL", raising=False)
     inp = _mk_input({"llm": {"provider": "claude_code", "model": ""}})
-    assert _resolve_loop_model(inp) == "claude-opus-4-8"
+    assert _resolve_loop_model(inp) == "claude-opus-5-5"
 
 
 # --------------------------------------------------------------------------- #
