@@ -18,7 +18,7 @@ from __future__ import annotations
 
 # (alias, label) in menu order. Aliases — not pinned ids — so the menu stays
 # current as new model versions ship. `opus` leads because the loop default
-# (Opus 4.8) is an Opus-tier model.
+# (Opus 5.5) is an Opus-tier model.
 LOOP_MODEL_ALIASES: list[tuple[str, str]] = [
     ("opus", "Opus"),
     ("sonnet", "Sonnet"),

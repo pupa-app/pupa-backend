@@ -110,13 +110,13 @@ _TASK_MESSAGES = (
 
 
 def _default_loop_model() -> str:
-    """The loop's fallback model: `CLAUDE_CODE_MODEL` else Opus 4.8."""
-    return os.getenv("CLAUDE_CODE_MODEL") or "claude-opus-4-8"
+    """The loop's fallback model: `CLAUDE_CODE_MODEL` else Opus 5.5."""
+    return os.getenv("CLAUDE_CODE_MODEL") or "claude-opus-5-5"
 
 
 def _resolve_loop_model(input: RunAgentInput) -> str:
     """Pick the model for this turn: per-request `forwardedProps.llm.model`
-    (wins), else `CLAUDE_CODE_MODEL`, else Opus 4.8.
+    (wins), else `CLAUDE_CODE_MODEL`, else Opus 5.5.
 
     The loop reads `input.forwarded_props` raw (no `ag_ui_langgraph` snake_case
     normalisation — same as the `command`/`resume` reads below), so the lowercase
@@ -392,7 +392,7 @@ def _options_for(
         setting_sources=loop_setting_sources(),
         cwd=cwd,
         # Per-request model (iOS `forwardedProps.llm.model`) wins, else the
-        # `CLAUDE_CODE_MODEL` config/env default, else Opus 4.8. See
+        # `CLAUDE_CODE_MODEL` config/env default, else Opus 5.5. See
         # `_resolve_loop_model`.
         model=model,
         # Per-request extended-thinking level (iOS `forwardedProps.llm.thinking`).

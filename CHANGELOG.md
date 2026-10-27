@@ -4,6 +4,16 @@ All notable changes to the Pupa backend repo are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — patch-only
 bumps (`0.0.X` → `0.0.X+1`).
 
+## [0.0.104] — 2026-10-27
+
+### Changed
+
+- `claude-agent-sdk` bumped to 0.2.174 (bundled Claude CLI 2.1.310), so the
+  `claude_code` harness's `opus` alias resolves to Claude Opus 5.5. The loop's
+  fallback model is now `claude-opus-5-5`.
+- Deep Agents (Anthropic API) gains `claude-opus-5-5` in its model menu;
+  `langchain-anthropic` floor raised to 1.7.6.
+
 ## [0.0.103] — 2026-09-26
 
 ### Added
