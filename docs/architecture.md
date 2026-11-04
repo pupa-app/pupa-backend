@@ -243,7 +243,7 @@ Providers in `MODEL_REGISTRY`:
 - **Bedrock** (`langchain_aws.ChatBedrockConverse`, EU inference
   profiles) — Claude Opus 4.8 / Sonnet 4.6 / Haiku 4.5.
 - **Anthropic** (`langchain_anthropic.ChatAnthropic`, direct API) —
-  Claude Opus 4.8 / Sonnet 4.6 / Haiku 4.5.
+  Claude Opus 5.5 / Opus 4.8 / Sonnet 4.6 / Haiku 4.5.
 - **OpenRouter** (`openrouter`) — a curated menu of popular open /
   frontier slugs (GLM, Qwen, MiniMax, Kimi, DeepSeek) served through
   OpenRouter's OpenAI-compatible endpoint. Auth is just
@@ -579,7 +579,7 @@ the sole tool-calling loop and **drives the iOS-forwarded frontend tools**:
 - **Model.** Selected per turn, same `forwardedProps.llm.model` channel the
   deepagents path uses ([`_resolve_loop_model`](../backend/pupa_backend/harnesses/claude/endpoint.py)):
   per-request wins, else `CLAUDE_CODE_MODEL` (config `claude_code_model`), else
-  `claude-opus-4-8`. The loop is Claude-only, so the menu is claude-code's stable
+  `claude-opus-5-5`. The loop is Claude-only, so the menu is claude-code's stable
   **aliases** — `opus`/`sonnet`/`haiku`/`fable`
   ([`models.py`](../backend/pupa_backend/harnesses/claude/models.py)), not pinned version
   ids (the `claude` CLI has no list-models command and aliases never go stale).

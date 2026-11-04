@@ -103,6 +103,10 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # `eu.anthropic.…` inference profiles. Add new entries as new models ship.
 MODEL_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {
     # --- Anthropic (direct API) ---
+    (PROVIDER_ANTHROPIC, "claude-opus-5-5"): {
+        "model_id": "claude-opus-5-5",
+        "label": "Claude Opus 5.5",
+    },
     (PROVIDER_ANTHROPIC, "claude-opus-4-8"): {
         "model_id": "claude-opus-4-8",
         "label": "Claude Opus 4.8",
